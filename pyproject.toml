@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kalecancer"
+dynamic = ["version"]
+description = "Multimodal cancer AI for the PyKale ecosystem — CT, whole-slide pathology, and clinical tabular data, with time-to-event prediction"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "PyKale" }]
+keywords = ["pykale", "cancer", "multimodal", "survival", "pytorch"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+dependencies = [
+    "torch",
+    "numpy",
+    "pandas",
+    "scikit-learn",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+imaging = [
+    "monai",
+    "nibabel",
+    "pydicom",
+    "SimpleITK",
+]
+pathology = [
+    "openslide-python",
+    "tifffile",
+]
+interpret = [
+    "shap",
+    "captum",
+]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+    "black",
+    "isort",
+    "pre-commit",
+    "mypy",
+]
+
+[project.urls]
+Homepage = "https://github.com/pykale/cancer"
+Repository = "https://github.com/pykale/cancer"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kalecancer*"]
+
+[tool.setuptools.dynamic]
+version = { file = "kalecancer/_version.txt" }
+
+[tool.black]
+line-length = 120
+target-version = ["py310", "py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 120
+known_first_party = ["kalecancer", "tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["kalecancer", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

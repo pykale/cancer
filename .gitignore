@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+*.egg
+
+# Data and experiment outputs
+data/
+outputs/
+checkpoints/
+
+# OS
+.DS_Store
