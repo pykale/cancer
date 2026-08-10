@@ -29,9 +29,7 @@ def _check_import(node: ast.Import, path: Path) -> list[ImportViolation]:
     violations: list[ImportViolation] = []
     for alias in node.names:
         name = alias.name
-        if name == "kalecancer" or (
-            name.startswith("kalecancer.") and not _is_allowed_kalecancer_module(name)
-        ):
+        if name == "kalecancer" or (name.startswith("kalecancer.") and not _is_allowed_kalecancer_module(name)):
             violations.append(ImportViolation(path, node.lineno, name))
     return violations
 
@@ -48,9 +46,7 @@ def _check_import_from(node: ast.ImportFrom, path: Path) -> list[ImportViolation
 
     if node.level == 0 and node.module is not None:
         module = node.module
-        if module == "kalecancer" or (
-            module.startswith("kalecancer.") and not _is_allowed_kalecancer_module(module)
-        ):
+        if module == "kalecancer" or (module.startswith("kalecancer.") and not _is_allowed_kalecancer_module(module)):
             violations.append(ImportViolation(path, node.lineno, module))
 
     return violations

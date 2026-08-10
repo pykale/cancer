@@ -1,1 +1,1 @@
-"""Embed and predict: modality encoders, fusion, and task heads."""
+"""Model stage: encoders, fusion, task heads, and shared layers."""

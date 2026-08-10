@@ -8,8 +8,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-import kalecancer
 import pytest
+
+import kalecancer
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+[a-zA-Z0-9]*$")

@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "kalecancer"
 dynamic = ["version"]
 description = "Multimodal cancer AI for the PyKale ecosystem — CT, whole-slide pathology, and clinical tabular data, with time-to-event prediction"
+readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 authors = [{ name = "PyKale" }]
@@ -52,15 +53,30 @@ dev = [
     "isort",
     "pre-commit",
     "mypy",
+    "build",
+    "twine",
 ]
 
 [project.urls]
 Homepage = "https://github.com/pykale/cancer"
 Repository = "https://github.com/pykale/cancer"
+Issues = "https://github.com/pykale/cancer/issues"
+
+[tool.setuptools]
+include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["kalecancer*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+kalecancer = [
+    "_version.txt",
+    "**/*.json",
+    "**/*.yaml",
+    "**/*.yml",
+]
 
 [tool.setuptools.dynamic]
 version = { file = "kalecancer/_version.txt" }
