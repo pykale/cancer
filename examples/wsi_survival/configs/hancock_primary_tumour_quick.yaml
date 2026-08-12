@@ -1,0 +1,29 @@
+# Fast configuration for checking the pipeline end to end on real data.
+# Heavily subsampled patches and few epochs: useful for validating wiring and
+# outputs, not for reporting results.
+DATASET:
+  FEATURE_ROOT: "E:/WSI_UNI_encodings/WSI_PrimaryTumor"
+  CLINICAL_PATH: "E:/StructuredData/StructuredData/clinical_data.json"
+  MAX_PATCHES: 256
+  NUM_WORKERS: 4
+  VALIDATE_FEATURES: False
+
+MODEL:
+  INPUT_DIM: 1024
+  HIDDEN_DIM: 128
+  ATTENTION_DIM: 64
+  DROPOUT: 0.25
+
+SOLVER:
+  SEED: 2026
+  BASE_LR: 0.0003
+  MAX_EPOCHS: 3
+  BATCH_SIZE: 32
+  EARLY_STOP: 0
+
+SURVIVAL:
+  ENDPOINT: "OS"
+  EVAL_TIMES: [365.0, 1095.0, 1825.0]
+
+OUTPUT:
+  OUT_DIR: "outputs/wsi_survival_quick"

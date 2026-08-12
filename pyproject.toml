@@ -28,9 +28,17 @@ dependencies = [
     "pandas",
     "scikit-learn",
     "pyyaml",
+    "yacs",
+    "h5py",
+    "pykale",
+    "pytorch-lightning",
 ]
 
 [project.optional-dependencies]
+survival = [
+    # 0.2.0 requires torch>=2.8, which conflicts with pykale's torch<=2.6.0.
+    "torchsurv>=0.1.6,<0.2",
+]
 imaging = [
     "monai",
     "nibabel",

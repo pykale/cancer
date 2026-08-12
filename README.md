@@ -42,13 +42,14 @@ Survival analysis is the main research driver for this package: jointly modellin
 ```
 kalecancer/
 ├── auto/          High-level selection and construction (AutoCancer* classes) — planned
-├── loaddata/      Datasets and records: DICOM/CT, WSI, tabular clinical — planned
+├── loaddata/      Datasets and records: WSI patch features, clinical survival labels, cohort matching, splitting
 ├── prepdata/      Reusable transforms: CT windowing, WSI tiling, stain normalisation — planned
-├── model/         Modality encoders, fusion, and task heads — planned
-├── survival/      Cox head, losses, and metrics — planned (cancer-agnostic; destined for PyKale core)
-├── evaluate/      Performance metrics — planned
-├── interpret/     SHAP, Grad-CAM, modality contribution — planned
-└── utils/         Shared helpers — planned
+├── model/         Modality encoders, fusion, and task heads (attention MIL)
+├── pipeline/      End-to-end trainers combining the stages for a task
+├── survival/      Cox head, losses, and metrics (cancer-agnostic; destined for PyKale core)
+├── evaluate/      Performance metrics and prediction reports
+├── interpret/     Attention export; SHAP, Grad-CAM, modality contribution — planned
+└── utils/         Shared helpers: seeding and artefact writing
 ```
 
 The **`survival`** submodule is intentionally **cancer-agnostic**: it must not import from other `kalecancer` modules, so it can later move into PyKale core. This boundary is enforced in CI (`tests/test_survival_boundary.py`).
@@ -69,6 +70,7 @@ Install only what you need — heavy imaging and pathology libraries are kept ou
 
 | Extra | Packages | When to use |
 | --- | --- | --- |
+| `survival` | torchsurv | Time-to-event losses and metrics |
 | `imaging` | monai, nibabel, pydicom, SimpleITK | DICOM / NIfTI radiology workflows |
 | `pathology` | openslide-python, tifffile | Whole-slide image reading |
 | `interpret` | shap, captum | Model explanation and attribution |
@@ -80,9 +82,31 @@ pip install -e ".[imaging,pathology]"          # radiology + pathology
 pip install -e ".[imaging,pathology,interpret,dev]"  # everything
 ```
 
+## Available pipelines
+
+### WSI survival prediction
+
+Time-to-event prediction from precomputed whole-slide patch features, via attention
+multiple-instance learning and a Cox proportional-hazards head.
+
+```bash
+pip install -e ".[survival]"
+python examples/wsi_survival/main.py --cfg examples/wsi_survival/configs/hancock_primary_tumour.yaml
+```
+
+See [`examples/wsi_survival/`](examples/wsi_survival/) for input requirements, configuration, outputs, and attention interpretation.
+
+### Multimodal fusion (model APIs)
+
+Early, late, and hybrid fusion strategies, with `concat` / `poe` / `lowrank` latent
+fusion, built on `kale.embed.multimodal_fusion`. Staged ahead of the tabular merge —
+the WSI pipeline above is still unimodal.
+
+See [`docs/multimodal_fusion.md`](docs/multimodal_fusion.md).
+
 ## Planned API (not yet implemented)
 
-The following illustrates the intended high-level workflow. **None of this is available yet** — it documents the design direction only.
+The following illustrates the intended high-level workflow for the `auto` stage. **This is not available yet** — it documents the design direction only.
 
 ```python
 # Planned API — subject to change
@@ -96,7 +120,7 @@ pipeline.interpret(modality="clinical")
 
 ## Status
 
-**Early development.** The package skeleton, CI, and architectural boundaries are in place; loaders, transforms, models, and metrics are not yet implemented.
+**Early development.** The package skeleton, CI, and architectural boundaries are in place. The unimodal WSI survival pipeline (loading, attention MIL, Cox head, survival metrics, attention interpretation) is implemented; CT/MRI and tabular loaders, transforms, and multimodal fusion are not.
 
 A **preliminary version** is targeted for **31 August 2026**.
 
