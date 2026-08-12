@@ -78,8 +78,6 @@ def test_weights_correlate_with_truth() -> None:
 
     with torch.no_grad():
         learned_weights = model.linear.weight.squeeze(0)
-        cosine_similarity = torch.dot(learned_weights, data.weights) / (
-            learned_weights.norm() * data.weights.norm()
-        )
+        cosine_similarity = torch.dot(learned_weights, data.weights) / (learned_weights.norm() * data.weights.norm())
 
     assert cosine_similarity.item() > 0.8
