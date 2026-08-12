@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Literal, get_args
 
 import torch
+from torch import nn
 
 Reduction = Literal["mean", "sum", "none"]
 _VALID_REDUCTIONS = get_args(Reduction)
@@ -134,3 +135,34 @@ def neg_partial_log_likelihood(
     if reduction == "sum":
         return per_event_nll.sum()
     return per_event_nll.mean()
+
+
+class CoxHead(nn.Module):
+    """Linear Cox proportional-hazards head.
+
+    Maps a fixed-width embedding to a single log-hazard score. Bias-free:
+    the Cox partial likelihood is invariant to an additive shift in
+    log-hazard, so a bias term would be unidentifiable and untrained.
+    """
+
+    def __init__(self, in_features: int) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.linear = nn.Linear(in_features, 1, bias=False)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """Compute log-hazard scores.
+
+        Args:
+            z: Embeddings, shape ``(B, D)`` with ``D == self.in_features``.
+
+        Returns:
+            Log-hazard, shape ``(B, 1)``.
+
+        Raises:
+            ValueError: If ``z`` is not 2-D or its last dimension does not
+                match ``in_features``.
+        """
+        if z.dim() != 2 or z.shape[1] != self.in_features:
+            raise ValueError(f"CoxHead expects input of shape (B, {self.in_features}), got {tuple(z.shape)}")
+        return self.linear(z)
