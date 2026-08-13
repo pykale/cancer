@@ -27,6 +27,7 @@ dependencies = [
     "numpy",
     "pandas",
     "scikit-learn",
+    "scikit-survival",
     "pyyaml",
 ]
 
@@ -53,6 +54,7 @@ dev = [
     "mypy",
     "build",
     "twine",
+    "lifelines",
 ]
 
 [project.urls]
