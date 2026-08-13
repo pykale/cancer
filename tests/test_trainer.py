@@ -94,9 +94,7 @@ def test_same_seed_gives_identical_final_loss() -> None:
     def run() -> float:
         torch.manual_seed(123)
         model = CoxHead(in_features=10)
-        history = fit_survival_model(
-            model, data.embeddings, data.times, data.events, max_epochs=50, lr=1e-2, seed=123
-        )
+        history = fit_survival_model(model, data.embeddings, data.times, data.events, max_epochs=50, lr=1e-2, seed=123)
         return history["train_loss"][-1]
 
     assert run() == run()
