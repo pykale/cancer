@@ -35,7 +35,9 @@ def test_time_dependent_auc_true_risk_beats_random() -> None:
     rng = np.random.default_rng(0)
     random_risk_test = rng.standard_normal(test_times.shape[0])
 
-    _, mean_auc_true = time_dependent_auc(train_times, train_events, test_times, test_events, true_risk_test, eval_times)
+    _, mean_auc_true = time_dependent_auc(
+        train_times, train_events, test_times, test_events, true_risk_test, eval_times
+    )
     _, mean_auc_random = time_dependent_auc(
         train_times, train_events, test_times, test_events, random_risk_test, eval_times
     )
@@ -67,9 +69,7 @@ def test_integrated_brier_true_risk_beats_random() -> None:
     )
 
     ibs_true = integrated_brier(train_times, train_events, test_times, test_events, survival_probs_true, eval_times)
-    ibs_random = integrated_brier(
-        train_times, train_events, test_times, test_events, survival_probs_random, eval_times
-    )
+    ibs_random = integrated_brier(train_times, train_events, test_times, test_events, survival_probs_random, eval_times)
 
     assert ibs_true < ibs_random
 
