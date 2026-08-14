@@ -249,10 +249,18 @@ def test_empty_subset_is_valid(toy):
     assert list(empty.identifiers) == []
 
 
-def test_fit_on_is_a_subset_when_there_is_nothing_to_fit(toy):
-    fitted = toy.fit_on([1, 2])
+def test_fit_transform_returns_a_new_instance_when_there_is_nothing_to_fit(toy):
+    """Even with no state to fit, the caller's object must come back untouched."""
+    fitted = toy.fit_transform()
     assert fitted is not toy
+    assert fitted.identifiers == toy.identifiers
+
+
+def test_restricting_before_fitting_scopes_the_fit_to_those_rows(toy):
+    """The fold idiom: ``subset`` owns the positional indices, ``fit_transform`` the state."""
+    fitted = toy.subset([1, 2]).fit_transform()
     assert fitted.identifiers == ["20", "30"]
+    assert toy.identifiers == ["10", "20", "30", "40", "50"], "the parent is untouched"
 
 
 def test_transform_passes_other_through_when_fitted(toy):
@@ -262,7 +270,7 @@ def test_transform_passes_other_through_when_fitted(toy):
 
 def test_transform_raises_when_unfitted(index_path):
     dataset = UnfittedToyDataset(path=index_path)
-    with pytest.raises(NotFittedError, match="fit_on"):
+    with pytest.raises(NotFittedError, match="fit_transform"):
         dataset.transform(dataset)
 
 

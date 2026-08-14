@@ -327,7 +327,7 @@ def test_one_role_may_pass_through_while_the_other_is_transformed(frame, make_da
     )
     assert dataset.is_fitted is False, "the categorical role still has something to fit"
 
-    fitted = dataset.fit_on(range(len(dataset)))
+    fitted = dataset.fit_transform()
     assert fitted.feature_names == ["biomarker", "sex_female", "sex_male"]
     np.testing.assert_allclose(matrix_of(fitted)[:, 0], frame["biomarker"].to_numpy(dtype=float), rtol=1e-6)
 
@@ -363,7 +363,7 @@ def test_unfitted_dataset_refuses_to_serve_values(cohort):
         cohort[0]
     message = str(excinfo.value)
     assert "SimpleImputer" in message and "StandardScaler" in message, "name what is pending"
-    assert "fit_on" in message, "and say how to fix it"
+    assert "fit_transform" in message, "and say how to fix it"
 
 
 def test_the_exploration_hatch_works_while_unfitted(cohort, frame):
@@ -372,8 +372,8 @@ def test_the_exploration_hatch_works_while_unfitted(cohort, frame):
     assert cohort.frame["age"].isna().sum() == len(MISSING_AGE_ROWS)
 
 
-def test_fit_on_returns_a_new_instance_and_leaves_the_original_unfitted(cohort):
-    fitted = cohort.fit_on(range(len(cohort)))
+def test_fit_transform_returns_a_new_instance_and_leaves_the_original_unfitted(cohort):
+    fitted = cohort.fit_transform()
 
     assert fitted is not cohort
     assert fitted.is_fitted is True
@@ -388,10 +388,10 @@ def test_folds_fitted_from_one_parent_are_independent(cohort):
     Fitting a second fold must not disturb the first, and neither may reach back
     into the shared parent -- which stays unfitted throughout.
     """
-    fold_a = cohort.fit_on(range(0, 40))
+    fold_a = cohort.subset(range(0, 40)).fit_transform()
     before = matrix_of(fold_a).copy()
 
-    fold_b = cohort.fit_on(range(40, 80))
+    fold_b = cohort.subset(range(40, 80)).fit_transform()
 
     np.testing.assert_array_equal(matrix_of(fold_a), before)
     assert cohort.is_fitted is False
@@ -406,13 +406,13 @@ def test_folds_fitted_from_one_parent_are_independent(cohort):
 
 def test_transform_before_fitting_raises(cohort):
     train, test = cohort.split(test_size=0.25, random_state=0)
-    with pytest.raises(NotFittedError, match="call fit_on"):
+    with pytest.raises(NotFittedError, match="call fit_transform"):
         train.transform(test)
 
 
 def test_transform_does_not_mutate_the_held_out_dataset(cohort):
     train, test = cohort.split(test_size=0.25, random_state=0)
-    fitted_test = train.fit_on(range(len(train))).transform(test)
+    fitted_test = train.fit_transform().transform(test)
 
     assert fitted_test is not test
     assert fitted_test.is_fitted is True
@@ -443,7 +443,7 @@ def test_held_out_rows_use_train_statistics_exactly(cohort):
     an exact match. Any statistic computed from the test rows breaks it.
     """
     train, test = cohort.split(test_size=0.25, random_state=0)
-    fitted_train = train.fit_on(range(len(train)))
+    fitted_train = train.fit_transform()
     fitted_test = fitted_train.transform(test)
 
     assert fitted_train.feature_names[: len(CONTINUOUS)] == CONTINUOUS
@@ -466,7 +466,7 @@ def test_the_standardised_test_mean_is_not_zero(cohort):
     half also reads zero, its own statistics were used to standardise it.
     """
     train, test = cohort.split(test_size=0.25, random_state=0)
-    fitted_train = train.fit_on(range(len(train)))
+    fitted_train = train.fit_transform()
     fitted_test = fitted_train.transform(test)
 
     assert matrix_of(fitted_train)[:, 0].mean() == pytest.approx(0.0, abs=1e-5)
@@ -480,7 +480,7 @@ def test_a_held_out_missing_value_is_filled_with_the_training_median(cohort):
     missing ``age`` are guaranteed to land in the held-out half.
     """
     train_rows = [i for i in range(len(cohort)) if i not in MISSING_AGE_ROWS]
-    fitted_train = cohort.fit_on(train_rows)
+    fitted_train = cohort.subset(train_rows).fit_transform()
     held_out = fitted_train.transform(cohort.subset(MISSING_AGE_ROWS))
 
     train_median = cohort.frame.iloc[train_rows]["age"].median()
@@ -494,7 +494,7 @@ def test_a_held_out_missing_value_is_filled_with_the_training_median(cohort):
 
 def test_split_on_a_fitted_dataset_raises(cohort):
     """Both halves would inherit statistics fitted across all rows. Silently."""
-    fitted = cohort.fit_on(range(len(cohort)))
+    fitted = cohort.fit_transform()
     with pytest.raises(RuntimeError, match="leaking the held-out half"):
         fitted.split(test_size=0.25, random_state=0)
 
@@ -507,7 +507,7 @@ def test_an_unseen_category_at_test_time_does_not_crash(cohort, frame):
     transform time.
     """
     train_rows = [i for i in range(len(cohort)) if i not in RARE_STAGE_ROWS]
-    fitted_train = cohort.fit_on(train_rows)
+    fitted_train = cohort.subset(train_rows).fit_transform()
     held_out = fitted_train.transform(cohort.subset(RARE_STAGE_ROWS))
 
     assert "stage_IV" not in fitted_train.feature_names
@@ -593,7 +593,7 @@ def test_subsetting_a_fitted_dataset_keeps_each_patients_own_row(cohort):
     A composite reaches into components by identifier precisely so that a subset,
     a reorder or a fold boundary can never re-pair features with the wrong patient.
     """
-    fitted = cohort.fit_on(range(len(cohort)))
+    fitted = cohort.fit_transform()
     scattered = [11, 2, 79, 40, 0]
     sub = fitted.subset(scattered)
 
@@ -603,13 +603,13 @@ def test_subsetting_a_fitted_dataset_keeps_each_patients_own_row(cohort):
 
 
 def test_get_by_id_rejects_an_unknown_identifier(cohort):
-    fitted = cohort.fit_on(range(len(cohort)))
+    fitted = cohort.fit_transform()
     with pytest.raises(KeyError):
         fitted.get_by_id("no-such-patient")
 
 
 def test_membership_follows_the_subset(cohort):
-    fitted = cohort.fit_on(range(len(cohort)))
+    fitted = cohort.fit_transform()
     sub = fitted.subset([0, 1])
     assert "001" in sub
     assert "050" in fitted
@@ -622,12 +622,12 @@ def test_membership_follows_the_subset(cohort):
 
 
 def test_item_dict_has_exactly_the_documented_keys(cohort):
-    fitted = cohort.fit_on(range(len(cohort)))
+    fitted = cohort.fit_transform()
     assert set(fitted[0]) == {"clinical", "patient_id", "time", "event"}
 
 
 def test_feature_tensor_is_float32_and_one_dimensional(cohort):
-    fitted = cohort.fit_on(range(len(cohort)))
+    fitted = cohort.fit_transform()
     features = fitted[0]["clinical"]
 
     assert features.dtype is torch.float32
@@ -636,7 +636,7 @@ def test_feature_tensor_is_float32_and_one_dimensional(cohort):
 
 def test_the_modality_name_is_the_feature_key(make_dataset):
     dataset = make_dataset(name="covariates")
-    fitted = dataset.fit_on(range(len(dataset)))
+    fitted = dataset.fit_transform()
     assert "covariates" in fitted[0]
     assert "clinical" not in fitted[0]
 
@@ -646,7 +646,7 @@ def test_default_modality_name_is_clinical(cohort):
 
 
 def test_item_matches_the_row_it_claims(cohort, frame):
-    fitted = cohort.fit_on(range(len(cohort)))
+    fitted = cohort.fit_transform()
     item = fitted[5]
     row = frame.loc[frame["patient_id"] == item["patient_id"]].iloc[0]
 
@@ -655,7 +655,7 @@ def test_item_matches_the_row_it_claims(cohort, frame):
 
 
 def test_dataloader_collates_without_a_custom_collate_fn(cohort):
-    fitted = cohort.fit_on(range(len(cohort)))
+    fitted = cohort.fit_transform()
     batch = next(iter(DataLoader(fitted, batch_size=8, shuffle=False)))
 
     assert batch["clinical"].shape == (8, fitted.n_features)
@@ -672,14 +672,14 @@ def test_dataloader_collates_without_a_custom_collate_fn(cohort):
 def test_n_features_counts_declared_columns_before_fitting_and_encoded_after(cohort):
     assert cohort.n_features == len(CONTINUOUS + CATEGORICAL)
 
-    fitted = cohort.fit_on(range(len(cohort)))
+    fitted = cohort.fit_transform()
     assert fitted.n_features > cohort.n_features, "one-hot expands the categoricals"
     assert fitted.n_features == len(fitted.feature_names)
     assert fitted.n_features == matrix_of(fitted).shape[1]
 
 
 def test_feature_names_are_readable(cohort):
-    fitted = cohort.fit_on(range(len(cohort)))
+    fitted = cohort.fit_transform()
     assert fitted.feature_names[: len(CONTINUOUS)] == CONTINUOUS
     assert "sex_male" in fitted.feature_names
     assert all("__" not in name for name in fitted.feature_names), "no transformer prefixes"
@@ -696,7 +696,7 @@ def test_describe_transforms_reports_the_chain_and_the_status(cohort):
     assert "SimpleImputer -> OneHotEncoder" in description
     assert "unfitted - fitted per fold" in description
 
-    assert "fitted" in cohort.fit_on(range(len(cohort))).describe_transforms()
+    assert "fitted" in cohort.fit_transform().describe_transforms()
 
 
 def test_describe_transforms_says_when_nothing_is_declared(make_dataset):
@@ -720,7 +720,7 @@ def test_repr_surfaces_the_event_rate(cohort, frame):
 
 
 def test_repr_reports_encoded_width_once_fitted(cohort):
-    fitted = cohort.fit_on(range(len(cohort)))
+    fitted = cohort.fit_transform()
     text = repr(fitted)
     assert f"{fitted.n_features} features" in text
     assert "unfitted" not in text
@@ -761,7 +761,7 @@ def test_columns_used_as_supervision_are_not_silently_also_features(cohort):
     Nothing stops a caller doing it deliberately, but it must never happen by
     default: only explicitly declared columns become features.
     """
-    fitted = cohort.fit_on(range(len(cohort)))
+    fitted = cohort.fit_transform()
     assert TIME_COLUMN not in fitted.feature_names
     assert EVENT_COLUMN not in fitted.feature_names
     assert not any(name.startswith(EVENT_COLUMN) for name in fitted.feature_names)

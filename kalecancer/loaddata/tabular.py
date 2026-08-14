@@ -54,9 +54,10 @@ class TabularDataset(BaseDataset):
 
     Column roles are declared, and preprocessing is declared per role using plain
     scikit-learn transformers. Nothing is fitted at construction: transforms are
-    fitted per cross-validation fold via :meth:`fit_on`, which returns a new
-    instance rather than mutating this one, so a fold can never see statistics
-    computed on data outside it.
+    fitted via :meth:`fit_transform`, which returns a new instance rather than
+    mutating this one. Fitting is scoped to the rows a dataset holds, so a fold is
+    fitted by restricting first -- ``cohort.subset(train_idx).fit_transform()`` --
+    and can never see statistics computed on data outside it.
 
     Args:
         source (str | Path | pd.DataFrame): A table to read (``.csv``, ``.tsv``,
@@ -95,7 +96,7 @@ class TabularDataset(BaseDataset):
         ...                                         sparse_output=False),
         ... )
         >>> train, test = cohort.split(test_size=0.2, random_state=0)
-        >>> fitted_train = train.fit_on(range(len(train)))
+        >>> fitted_train = train.fit_transform()
         >>> fitted_test = fitted_train.transform(test)
 
         Passing a frame is the seam for anything that has to happen between reading
@@ -246,17 +247,17 @@ class TabularDataset(BaseDataset):
         clone._matrix = None if self._matrix is None else self._matrix[list(indices)]
         return clone
 
-    def fit_on(self, indices: Sequence[int]) -> TabularDataset:
-        """Fit transforms on ``indices`` and return a new dataset over them.
+    def fit_transform(self) -> TabularDataset:
+        """Fit transforms on this dataset's rows and return a fitted copy.
 
-        Args:
-            indices (Sequence[int]): Positional indices of the training rows.
+        Fitting is scoped to the rows this dataset holds, so restrict first to fit
+        one fold: ``cohort.subset(train_idx).fit_transform()``.
 
         Returns:
             TabularDataset: A new, fitted instance. ``self`` is untouched, so folds
             stay independent and can be fitted in parallel.
         """
-        clone = self.subset(indices)
+        clone = copy.copy(self)
         if self._preprocessor_spec is not None:
             clone._preprocessor = sk_clone(self._preprocessor_spec)
             clone._preprocessor.fit(clone._frame[self.feature_columns])
@@ -277,7 +278,7 @@ class TabularDataset(BaseDataset):
             NotFittedError: If ``self`` has unfitted transforms.
         """
         if not self.is_fitted:
-            raise NotFittedError(f"{type(self).__name__} has unfitted transforms; call fit_on() first.")
+            raise NotFittedError(f"{type(self).__name__} has unfitted transforms; call fit_transform() first.")
         clone = copy.copy(other)
         clone._preprocessor = self._preprocessor
         clone._materialise()
@@ -359,8 +360,9 @@ class TabularDataset(BaseDataset):
         if self._matrix is None:
             raise NotFittedError(
                 f"{type(self).__name__} has {len(self._pending())} unfitted transform(s) "
-                f"({', '.join(self._pending())}). Use cross_validate(), or fit_on(indices) "
-                f"to fit explicitly. For untransformed values, use .frame"
+                f"({', '.join(self._pending())}). Call fit_transform() to fit them on these "
+                f"rows, or subset(indices).fit_transform() to fit one fold. For the "
+                f"untransformed values, use .frame"
             )
         return self._matrix[self._row_of[identifier]]
 
@@ -401,7 +403,7 @@ class TabularDataset(BaseDataset):
             raise RuntimeError(
                 "split() on a fitted dataset would give both halves transforms fitted "
                 "across all rows, leaking the held-out half into its own preprocessing. "
-                "Split first, then fit_on() the training half and transform() the rest."
+                "Split first, then fit_transform() the training half and transform() the rest."
             )
         stratify = None if self.target is None else self.target.events_for(self.identifiers)
         train_idx, test_idx = train_test_split(

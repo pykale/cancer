@@ -10,13 +10,16 @@ same base class serve a 400-row clinical table and a cohort of gigapixel slides:
 2. **Payload** -- read per sample by :meth:`get_by_id`. This is where a slide's
    feature bag is actually pulled off disk.
 
-Stateful preprocessing sits between the two. :meth:`fit_on` fits transforms on a
-set of indices and returns a *new* instance; the original is never mutated, so
-cross-validation folds cannot share fitted state or contaminate one another.
+Stateful preprocessing sits between the two. :meth:`fit_transform` fits transforms
+on the rows a dataset currently holds and returns a *new* instance; the original is
+never mutated, so cross-validation folds cannot share fitted state or contaminate
+one another. A fold is prepared by restricting first --
+``data.subset(train_idx).fit_transform()`` -- which keeps positional indices
+confined to :meth:`subset`, the one method whose contract is positional.
 
 Subclasses implement :meth:`_load_index` and :meth:`get_by_id`. Those with
 fitted state (scalers, imputers, in-context example sets) also override
-:meth:`fit_on`, :meth:`transform` and :attr:`is_fitted`.
+:meth:`fit_transform`, :meth:`transform` and :attr:`is_fitted`.
 """
 
 from __future__ import annotations
@@ -193,25 +196,29 @@ class BaseDataset(TorchDataset, ABC):
         clone._reindex()
         return clone
 
-    def fit_on(self, indices: Sequence[int]) -> BaseDataset:
-        """Fit stateful transforms on ``indices`` and return a new dataset over them.
+    def fit_transform(self) -> BaseDataset:
+        """Fit stateful transforms on this dataset's rows and return a fitted copy.
 
-        The base implementation has nothing to fit and just subsets. Override in
+        The base implementation has nothing to fit and just copies. Override in
         subclasses that hold scalers, imputers, or in-context example sets.
 
-        Args:
-            indices (Sequence[int]): Positional indices of the training rows.
+        Fitting is scoped to whatever rows this dataset currently holds, so a
+        cross-validation fold is prepared by restricting first::
+
+            fold_train = data.subset(train_idx).fit_transform()
+            fold_val   = fold_train.transform(data.subset(val_idx))
 
         Returns:
-            BaseDataset: A new, fitted instance restricted to ``indices``.
+            BaseDataset: A new, fitted instance. ``self`` is unchanged.
         """
-        return self.subset(indices)
+        return copy.copy(self)
 
     def transform(self, other: BaseDataset) -> BaseDataset:
         """Apply this dataset's fitted transforms to another dataset's samples.
 
-        This is how held-out data is prepared: fit on the training fold, then
-        transform the validation fold or the test split with those statistics.
+        This is how held-out data is prepared: fit on the training fold with
+        :meth:`fit_transform`, then transform the validation fold or the test split
+        with those statistics.
 
         Args:
             other (BaseDataset): Dataset whose samples should be transformed.
@@ -224,7 +231,7 @@ class BaseDataset(TorchDataset, ABC):
             NotFittedError: If ``self`` has unfitted transforms.
         """
         if not self.is_fitted:
-            raise NotFittedError(f"{type(self).__name__} has unfitted transforms; call fit_on() first.")
+            raise NotFittedError(f"{type(self).__name__} has unfitted transforms; call fit_transform() first.")
         return other
 
     @property
