@@ -34,11 +34,22 @@ but for the same reason it must never be ranked or fed into a metric
 across its full length; :func:`bootstrap_ci` is provided for computing a
 proper confidence interval on scores that do share one model's scale
 (e.g. within a single fold, or for one final production model).
+
+Per-modality model input may be a per-patient list of tensors instead of
+one stacked tensor: HANCOCK WSI tile bags range from 86 to 8,674 tiles per
+patient, so imaging input cannot always be stacked into a single ``(N,
+tiles, features)`` tensor. Fold indexing (:func:`_index_inputs`) supports
+both -- a stacked tensor is indexed on dim 0 as usual, a list/tuple is
+indexed per-patient (``[value[i] for i in idx]``) -- but consuming a list
+of variable-length bags (padding, masking, or iterating sample by sample)
+is entirely the model's ``forward``'s responsibility; the harness never
+pads or stacks them itself.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from typing import TypeAlias
 
 import numpy as np
 import torch
@@ -52,6 +63,11 @@ from kalecancer.survival.trainer import fit_survival_model
 from .survival_metrics import integrated_brier, kaplan_meier_groups, time_dependent_auc
 
 _DAYS_PER_YEAR = 365.25
+
+#: A model's input: either one stacked tensor, or a mapping from name to
+#: per-modality input, where each per-modality input is either a stacked
+#: tensor or a per-patient list of tensors (variable-length bags).
+SurvivalInputs: TypeAlias = torch.Tensor | Mapping[str, "torch.Tensor | Sequence[torch.Tensor]"]
 
 
 def patient_stratified_splits(
@@ -145,23 +161,40 @@ def bootstrap_ci(
     return point_estimate, float(lower), float(upper)
 
 
-def _call_model(model: nn.Module, inputs: torch.Tensor | Mapping[str, torch.Tensor]) -> torch.Tensor:
+def _call_model(model: nn.Module, inputs: SurvivalInputs) -> torch.Tensor:
     if isinstance(inputs, Mapping):
         return model(**inputs)
     return model(inputs)
 
 
-def _index_inputs(
-    inputs: torch.Tensor | Mapping[str, torch.Tensor], idx: torch.Tensor
-) -> torch.Tensor | dict[str, torch.Tensor]:
-    if isinstance(inputs, Mapping):
-        return {key: value[idx] for key, value in inputs.items()}
-    return inputs[idx]
+def _index_inputs(inputs: SurvivalInputs, idx: torch.Tensor) -> torch.Tensor | dict[str, torch.Tensor | list]:
+    """Select a fold's patients from a model input.
+
+    A stacked tensor is indexed on dim 0 as usual. A list/tuple value (a
+    per-patient variable-length bag, e.g. a WSI tile bag that cannot be
+    stacked) is indexed one patient at a time, preserving each patient's
+    own tensor unchanged.
+    """
+    if not isinstance(inputs, Mapping):
+        return inputs[idx]
+
+    indexed: dict[str, torch.Tensor | list] = {}
+    for key, value in inputs.items():
+        if isinstance(value, torch.Tensor):
+            indexed[key] = value[idx]
+        elif isinstance(value, list | tuple):
+            indexed[key] = [value[int(i)] for i in idx]
+        else:
+            raise TypeError(
+                f"inputs[{key!r}] must be a torch.Tensor or a Sequence (list/tuple) of per-patient "
+                f"tensors, got {type(value).__name__}"
+            )
+    return indexed
 
 
 def cross_validate_survival(
     model_factory: Callable[[], nn.Module],
-    inputs: torch.Tensor | Mapping[str, torch.Tensor],
+    inputs: SurvivalInputs,
     times: torch.Tensor,
     events: torch.Tensor,
     *,
@@ -188,7 +221,9 @@ def cross_validate_survival(
         model_factory: Zero-argument callable returning a fresh, untrained
             ``nn.Module`` (called once per fold).
         inputs: Model input for the full cohort; a tensor, or a
-            ``Mapping`` of tensors (one key per modality/branch), matching
+            ``Mapping`` (one key per modality/branch) whose values are
+            each either a stacked tensor or a per-patient list/tuple of
+            tensors (variable-length bags), matching
             :func:`~kalecancer.survival.trainer.fit_survival_model`'s convention.
         times: Observed times for the full cohort, shape ``(N,)``.
         events: Event indicators for the full cohort, shape ``(N,)``.
@@ -312,7 +347,7 @@ def cross_validate_survival(
 
 def compare_models(
     named_factories: Mapping[str, Callable[[], nn.Module]],
-    inputs_per_model: Mapping[str, torch.Tensor | Mapping[str, torch.Tensor]],
+    inputs_per_model: Mapping[str, SurvivalInputs],
     times: torch.Tensor,
     events: torch.Tensor,
     *,
