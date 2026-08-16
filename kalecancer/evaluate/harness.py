@@ -16,7 +16,16 @@ some fold's range even though the full-cohort range covers it fine. Each
 fold therefore clamps ``eval_years`` down to whichever years actually fall
 strictly inside *that fold's* ``(test_times.min(), test_times.max())``,
 records which ones survived as ``"eval_years_used"`` in the fold result,
-and raises a clear, fold-identifying error if none do.
+and raises a clear, fold-identifying error if fewer than two do --
+``sksurv``'s ``integrated_brier_score`` itself requires at least two time
+points ("At least two time points must be given").
+
+``sksurv``'s IPCW machinery can separately fail with "censoring survival
+function is zero at one or more time points" on a fold whose censoring
+distribution is too sparse to support the requested ``eval_years`` (small
+folds, or folds with few censored subjects). That is caught per fold too
+and re-raised naming the fold and its event/censoring counts, rather than
+surfacing as a bare ``sksurv`` error partway through a run.
 
 For each fold, the baseline hazard (:func:`~kalecancer.survival.baseline.breslow_baseline_hazard`)
 is fitted on the TRAIN fold only and applied to the TEST fold -- fitting
@@ -249,8 +258,12 @@ def cross_validate_survival(
         see module docstring for why it must not be ranked across folds).
 
     Raises:
-        ValueError: If, for some fold, none of ``eval_years`` fall
-            strictly inside that fold's test-set follow-up range.
+        ValueError: If, for some fold, fewer than two of ``eval_years``
+            fall strictly inside that fold's test-set follow-up range
+            (``integrated_brier_score`` requires at least two time
+            points); or if a fold's censoring distribution is too sparse
+            for ``sksurv`` to estimate IPCW weights at the requested
+            ``eval_years`` (message names the fold and its event/censoring counts).
     """
     times_np = times.numpy()
     events_np = events.numpy()
@@ -298,10 +311,11 @@ def cross_validate_survival(
 
         test_time_lo, test_time_hi = float(test_times.min()), float(test_times.max())
         in_range = (eval_days_all > test_time_lo) & (eval_days_all < test_time_hi)
-        if not np.any(in_range):
+        if np.count_nonzero(in_range) < 2:
             raise ValueError(
-                f"fold {fold_idx}: none of eval_years={tuple(eval_years)} fall strictly inside "
-                f"this fold's test-set follow-up range ({test_time_lo:.1f}, {test_time_hi:.1f}) days; "
+                f"fold {fold_idx}: fewer than two of eval_years={tuple(eval_years)} fall strictly inside "
+                f"this fold's test-set follow-up range ({test_time_lo:.1f}, {test_time_hi:.1f}) days, but "
+                "integrated_brier_score requires at least two time points; "
                 "pass a coarser eval_years or increase n_splits"
             )
         eval_years_used = tuple(eval_years_arr[in_range].tolist())
@@ -311,11 +325,21 @@ def cross_validate_survival(
         survival_probs = predict_survival_function(
             test_log_hazard, event_times, cumulative_baseline_hazard, eval_days_fold
         )
-        ibs = integrated_brier(train_times, train_events, test_times, test_events, survival_probs, eval_days_fold)
-
-        td_auc_per_time, td_auc_mean = time_dependent_auc(
-            train_times, train_events, test_times, test_events, test_log_hazard, eval_days_fold
-        )
+        try:
+            ibs = integrated_brier(train_times, train_events, test_times, test_events, survival_probs, eval_days_fold)
+            td_auc_per_time, td_auc_mean = time_dependent_auc(
+                train_times, train_events, test_times, test_events, test_log_hazard, eval_days_fold
+            )
+        except ValueError as exc:
+            if "censoring survival function is zero" not in str(exc):
+                raise
+            raise ValueError(
+                f"fold {fold_idx}: sksurv could not estimate IPCW censoring weights at eval_years="
+                f"{eval_years_used} (censoring survival function hit zero) -- this fold's censoring "
+                f"distribution is too sparse to support them. train: {int(train_events.sum())} events / "
+                f"{int((~train_events).sum())} censored; test: {int(test_events.sum())} events / "
+                f"{int((~test_events).sum())} censored; try coarser eval_years or increase n_splits"
+            ) from exc
 
         km_result = kaplan_meier_groups(test_log_hazard, test_times, test_events, n_groups=2)
 
