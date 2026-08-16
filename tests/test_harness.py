@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
+from torch import nn
 
 from kalecancer.evaluate.harness import (
+    _index_inputs,
     bootstrap_ci,
     compare_models,
     cross_validate_survival,
@@ -14,6 +17,22 @@ from kalecancer.evaluate.harness import (
 from kalecancer.survival.cox import CoxHead
 from kalecancer.survival.metrics import concordance_index
 from kalecancer.survival.synthetic import make_synthetic_survival
+
+
+class _BagModel(nn.Module):
+    """Toy multimodal model: tabular branch + mean-pooled variable-length bag branch."""
+
+    def __init__(self, tabular_dim: int, bag_feature_dim: int, hidden: int) -> None:
+        super().__init__()
+        self.tabular_branch = nn.Linear(tabular_dim, hidden)
+        self.bag_branch = nn.Linear(bag_feature_dim, hidden)
+        self.head = CoxHead(in_features=hidden * 2)
+
+    def forward(self, tabular: torch.Tensor, bags: list[torch.Tensor]) -> torch.Tensor:
+        tabular_z = self.tabular_branch(tabular)
+        pooled = torch.stack([self.bag_branch(bag).mean(dim=0) for bag in bags])
+        z = torch.cat([tabular_z, pooled], dim=-1)
+        return self.head(z)
 
 
 def test_every_fold_has_at_least_one_event() -> None:
@@ -128,3 +147,93 @@ def test_compare_models_ranks_true_risk_above_random_risk() -> None:
     assert "c_index_std" in by_name["true_risk"]
     assert by_name["true_risk"]["c_index_std"] >= 0
     assert "c_index_ci_lower" not in by_name["true_risk"]
+
+
+def test_index_inputs_handles_variable_length_bag_lists() -> None:
+    tabular = torch.randn(5, 4)
+    bag_lengths = [10, 3, 7, 1, 20]
+    bags = [torch.randn(n, 2) for n in bag_lengths]
+
+    idx = torch.tensor([4, 1, 0])
+    indexed = _index_inputs({"tabular": tabular, "bags": bags}, idx)
+
+    assert torch.equal(indexed["tabular"], tabular[idx])
+    assert isinstance(indexed["bags"], list)
+    assert len(indexed["bags"]) == len(idx)
+    for out_bag, original_i in zip(indexed["bags"], idx.tolist(), strict=True):
+        assert torch.equal(out_bag, bags[original_i])
+        assert out_bag.shape == bags[original_i].shape
+
+
+def test_cross_validate_survival_with_variable_length_bags() -> None:
+    torch.manual_seed(0)
+    data = make_synthetic_survival(n_samples=300, n_features=6, seed=5)
+    bag_feature_dim = 4
+    # Variable-length per-patient bags (HANCOCK-style WSI tile bags), each
+    # with a different number of tiles -- cannot be stacked into one tensor.
+    bags = [torch.randn(int(torch.randint(5, 50, (1,)).item()), bag_feature_dim) for _ in range(300)]
+
+    result = cross_validate_survival(
+        lambda: _BagModel(tabular_dim=6, bag_feature_dim=bag_feature_dim, hidden=8),
+        {"tabular": data.embeddings, "bags": bags},
+        data.times,
+        data.events,
+        eval_years=(1, 2),
+        n_splits=3,
+        seed=0,
+        max_epochs=30,
+        lr=1e-2,
+    )
+
+    assert len(result["folds"]) == 3
+    for fold in result["folds"]:
+        assert isinstance(fold["c_index"], float)
+        assert 0.0 <= fold["c_index"] <= 1.0
+
+
+def test_eval_years_are_clamped_per_fold() -> None:
+    # Regression test for per-fold eval_years clamping: without it, sksurv
+    # raises ValueError as soon as an eval time exceeds a fold's test-set
+    # follow-up range. 50 years (~18,263 days) is deliberately far beyond
+    # this synthetic cohort's max time (a few thousand days), so this must
+    # get clamped out of every fold while 1/3/5 years survive. Every other
+    # test in this file only uses eval_years that already fit comfortably
+    # inside range, so none of them would catch a regression here.
+    data = make_synthetic_survival(n_samples=800, n_features=8, seed=11)
+
+    result = cross_validate_survival(
+        lambda: CoxHead(in_features=8),
+        data.embeddings,
+        data.times,
+        data.events,
+        eval_years=(1, 3, 5, 50),
+        n_splits=5,
+        seed=0,
+        max_epochs=80,
+    )
+
+    for fold in result["folds"]:
+        assert 1 in fold["eval_years_used"]
+        assert 3 in fold["eval_years_used"]
+        assert 5 in fold["eval_years_used"]
+        assert 50 not in fold["eval_years_used"]
+
+
+def test_single_surviving_eval_year_raises_clear_error() -> None:
+    # sksurv's integrated_brier_score needs at least two time points, so a
+    # fold retaining only one eval_year after clamping must raise OUR
+    # fold-identifying error, not sksurv's bare "At least two time points
+    # must be given".
+    data = make_synthetic_survival(n_samples=800, n_features=8, seed=11)
+
+    with pytest.raises(ValueError, match=r"fold \d+: fewer than two of eval_years"):
+        cross_validate_survival(
+            lambda: CoxHead(in_features=8),
+            data.embeddings,
+            data.times,
+            data.events,
+            eval_years=(1,),
+            n_splits=5,
+            seed=0,
+            max_epochs=20,
+        )
