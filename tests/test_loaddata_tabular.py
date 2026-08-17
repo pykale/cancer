@@ -726,6 +726,22 @@ def test_repr_reports_encoded_width_once_fitted(cohort):
     assert "unfitted" not in text
 
 
+def test_repr_distinguishes_nothing_to_fit_from_not_yet_fitted(make_dataset):
+    """``unfitted`` must not cover both: one of these serves values, the other raises.
+
+    Reporting them alike also contradicts ``is_fitted``, which is ``True`` here --
+    the state a reader is most likely to check the repr for in the first place.
+    """
+    passthrough = make_dataset(
+        continuous=["biomarker"], continuous_transform=None, categorical=[], categorical_transform=None
+    )
+    text = repr(passthrough)
+
+    assert "no transforms" in text
+    assert "unfitted" not in text
+    assert passthrough.is_fitted
+
+
 def test_repr_without_a_target_omits_survival_summary(make_dataset):
     assert "events" not in repr(make_dataset(target=None))
 

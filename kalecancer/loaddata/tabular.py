@@ -411,6 +411,26 @@ class TabularDataset(BaseDataset):
         )
         return self.subset(sorted(train_idx)), self.subset(sorted(test_idx))
 
+    @property
+    def _fit_status(self) -> str:
+        """Which of the three transform states this dataset is in.
+
+        Three, not two: having nothing to fit is not the same as not having fitted
+        yet. Both leave ``_preprocessor`` as ``None``, but the first serves values
+        immediately and the second raises, so a two-way test reports them alike and
+        contradicts :attr:`is_fitted`.
+        """
+        if self._preprocessor is not None:
+            return "fitted"
+        return "no transforms" if self._preprocessor_spec is None else "unfitted"
+
+    #: Longer phrasing for :meth:`describe_transforms`, which has room to say what to do
+    #: next. Keyed by :attr:`_fit_status`; anything absent is used as-is.
+    _STATUS_DETAIL = {
+        "no transforms": "none declared",
+        "unfitted": "unfitted - fitted per fold",
+    }
+
     def describe_transforms(self) -> str:
         """Human-readable summary of the resolved transforms and their fitted status."""
         lines = []
@@ -420,11 +440,7 @@ class TabularDataset(BaseDataset):
             steps = self._resolve(spec)
             rendered = " -> ".join(type(s).__name__ for s in steps) if steps else "passthrough"
             lines.append(f"{label:<12}({len(columns)} cols): {rendered}")
-        status = (
-            "fitted"
-            if self._preprocessor is not None
-            else ("none declared" if self._preprocessor_spec is None else "unfitted - fitted per fold")
-        )
+        status = self._STATUS_DETAIL.get(self._fit_status, self._fit_status)
         lines.append(f"{'status':<12}: {status}")
         return "\n".join(lines)
 
@@ -445,5 +461,5 @@ class TabularDataset(BaseDataset):
             parts.append(f"{len(self.feature_names)} features")
         if self.target is not None:
             parts.append(self.target.summarise(self.identifiers))
-        parts.append("fitted" if self._preprocessor is not None else "unfitted")
+        parts.append(self._fit_status)
         return f"{type(self).__name__}({' | '.join(parts)})"
