@@ -1,40 +1,38 @@
-"""TabICL row embeddings for the HANCOCK clinical table.
+# # `TabICLEncoder` — row embeddings for a clinical table
+#
+# TabICL is a pretrained tabular foundation model. This wrapper uses it **frozen**: no
+# gradients, no fine-tuning, one 512-d vector per patient, ready to feed to a head.
+#
+# Needs the optional extra — `pip install 'kalecancer[tabular]'`. The checkpoint is
+# downloaded from Hugging Face on first use.
+#
+# ```python
+# encoder = TabICLEncoder().fit(fitted_train)   # absorb the training fold as context
+# Z_test = encoder.encode(fitted_test)          # (n_test, 512)
+# ```
+#
+# `fit` and `encode` are separate because **the context is fitted state** — in exactly
+# the sense a `StandardScaler`'s mean is. Sections 3 and 4 measure that, and measure the
+# property that makes encoding safe to do in batches.
 
-Run from the repo root: python examples/HANCOCK_tabular/encoder_demo.py
-Needs the optional extra: pip install 'kalecancer[tabular]'
-
-Covers the ordinary path -- split, fit the fold, encode -- and then measures the
-two properties the unit tests cannot, because they are properties of the
-pretrained weights rather than of the wrapper:
-
-* the context is fitted state (a different context moves the embeddings);
-* the context does not see what is encoded against it (no leak).
-
-Both print a number. If the first ever reads 0.0000, the encoder has stopped
-conditioning on its context; if the second ever reads anything but 0.00000000,
-held-out rows are reaching the representations of the rows used to train on.
-"""
 
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from kalecancer.loaddata.base import NotFittedError
 from kalecancer.loaddata.tabular import TabularDataset
 from kalecancer.model.embed import TabICLEncoder
 from kalecancer.survival.survival_target import SurvivalTarget
 
+DATA = "data/StructuredData/clinical_data.json"
 SEED = 0
 
-
-def rule(title):
-    print(f"\n{'=' * 70}\n{title}\n{'=' * 70}")
-
-
-# ---------------------------------------------------------------- 1. load
-rule("1. load and split -- nothing here is new")
+# ## 1. The usual data preparation
+#
+# Nothing here is specific to the encoder — see `detailed_loading_demo.py` for what each
+# argument does. Split, fit the training fold, transform the held-out fold.
 
 cohort = TabularDataset(
-    "data/clinical_data.json",
+    DATA,
     identifier="patient_id",
     target=SurvivalTarget(
         time="days_to_last_information",
@@ -50,74 +48,83 @@ cohort = TabularDataset(
         OneHotEncoder(handle_unknown="ignore", sparse_output=False),
     ],
 )
-print(cohort)
 
 train, test = cohort.split(test_size=0.2, random_state=SEED)
 fitted_train = train.fit_transform()
 fitted_test = fitted_train.transform(test)
+
 print("train:", fitted_train)
 print("test: ", fitted_test)
 
+# ## 2. Fit the context, then encode
+#
+# `fit` takes no gradient step — TabICL predicts by conditioning on labelled context
+# rows, so "fitting" means storing them. It needs a dataset that carries a target,
+# because TabICL's column embedder is label-aware.
+#
+# Like `TabularDataset.fit_transform`, it returns a **new** encoder and leaves the
+# original alone. That is what keeps cross-validation folds from sharing a context — and
+# it is the one thing to watch, because the sklearn reflex of writing
+# `encoder.fit(train)` on its own line silently does nothing.
 
-# ------------------------------------------------------------- 2. guards
-rule("2. the encoder refuses to guess")
+base = TabICLEncoder(random_state=SEED)
+encoder = base.fit(fitted_train)  # a NEW encoder; `base` is untouched
 
-unfitted = TabICLEncoder()
-print("repr:", unfitted)
-
-try:
-    unfitted.encode(fitted_test)
-except NotFittedError as exc:
-    print(f"\nencode() before fit() -> NotFittedError:\n  {exc}")
-
-try:
-    TabICLEncoder().fit(train)  # dataset transforms not fitted
-except NotFittedError as exc:
-    print(f"\nfit() on an unfitted dataset -> NotFittedError:\n  {str(exc)[:110]}...")
-
-
-# ------------------------------------------------------- 3. fit and encode
-rule("3. fit the context on the training fold, then encode")
-
-encoder = TabICLEncoder(random_state=SEED).fit(fitted_train)
-print("repr:", encoder)
+print("base:   ", base)
+print("encoder:", encoder)
 print("out_dim:", encoder.out_dim)
 
 Z_train = encoder.encode(fitted_train)
 Z_test = encoder.encode(fitted_test)
-print(f"\nZ_train {tuple(Z_train.shape)}")
+
+print(f"Z_train {tuple(Z_train.shape)}")
 print(f"Z_test  {tuple(Z_test.shape)}")
-print(f"\nfit() returned a new object, the original is untouched: {not unfitted.is_fitted}")
 
+# ## 3. The context is fold state
+#
+# Encode the *same* test rows against two different contexts and the embeddings move.
+# That is the whole reason `fit` exists as a separate step: fit the context on the full
+# cohort and every embedding — including the held-out ones — carries information from
+# rows the model should never have seen. No error, no warning, and correct
+# `ColumnTransformer` handling does not save you.
+#
+# If the number below ever reads `0.0000`, the encoder has stopped conditioning on its
+# context at all.
 
-rule("4. the context is fold state, exactly like a scaler's mean")
 
 half = fitted_train.subset(range(len(fitted_train) // 2))
-encoder_half = TabICLEncoder(random_state=SEED).fit(half)
-Z_test_half = encoder_half.encode(fitted_test)
+Z_test_half = TabICLEncoder(random_state=SEED).fit(half).encode(fitted_test)
 
 drift = (Z_test - Z_test_half).abs().mean().item()
-print(f"same {len(fitted_test)} test rows, encoded against two different contexts")
+print(f"{len(fitted_test)} test rows, encoded against two different contexts:")
 print(f"  context = {len(fitted_train)} rows  vs  context = {len(half)} rows")
 print(f"  mean |difference| per dimension: {drift:.4f}")
-print(
-    "\nThis is why the context must come from the training fold. Fit it on the whole\n"
-    "cohort and every embedding carries information from the held-out rows -- with no\n"
-    "error, and no help from correct ColumnTransformer handling."
-)
+
+# ## 4. ...but encoding is batch-invariant
+#
+# The converse property: context rows do not attend to the rows being encoded, so a
+# row's embedding does not depend on what else was in the call. You can chunk `encode`
+# however you like and get identical answers.
+#
+# Anything but `0.00000000` below would mean held-out rows are reaching each other's
+# representations.
 
 
-# --------------------------------------------- 5. the context does not leak
-rule("5. ...but the context itself is not disturbed by what is encoded")
+Z_alone = encoder.encode(fitted_test.subset(range(10)))
 
-Z_ctx_all = encoder.encode(fitted_test)
-Z_ctx_few = encoder.encode(fitted_test.subset(range(10)))
+leak = (Z_test[:10] - Z_alone).abs().max().item()
+print(f"same encoder, same 10 rows, alongside {len(fitted_test) - 10} others vs on their own:")
+print(f"  max |difference| over all dimensions: {leak:.8f}")
 
-leak = (Z_ctx_all[:10] - Z_ctx_few).abs().mean().item()
-print("same encoder, same 10 rows, encoded alongside 153 others vs alone")
-print(f"  mean |difference| per dimension: {leak:.8f}")
-print(
-    "\nExactly zero, because TabICL's inducing points attend only to context rows\n"
-    "(embed_with_test=False, hard-coded). Encoding is therefore batch-invariant:\n"
-    "you get the same answer however you chunk the calls."
-)
+# ## Next
+#
+# `Z_train` and `Z_test` are ordinary tensors, aligned with `fitted_train.identifiers`
+# and `fitted_test.identifiers`. `../main.py` puts a Cox head on top of them and trains
+# it, driven by a YAML config.
+#
+# One caveat worth knowing: rows that are *in* the context see their own label when
+# encoded, so `encode(fitted_train)` is optimistic relative to `encode(fitted_test)`.
+# That is inherent to in-context learning rather than a defect here, but a head fitted
+# on training representations and applied to held-out ones is crossing a distribution
+# boundary. Removing it properly needs cross-fitted contexts, which this class does not
+# do.
