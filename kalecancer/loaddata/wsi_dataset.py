@@ -72,6 +72,9 @@ class WSIFeatureBagDataset(Dataset[BagSample]):
         max_patches: int | None = None,
         seed: int = 0,
     ) -> None:
+        if max_patches is not None and max_patches < 1:
+            raise ValueError(f"max_patches must be a positive number of patches or None, got {max_patches}")
+
         self.bags = list(bags)
         self.expected_dim = expected_dim
         self.max_patches = max_patches

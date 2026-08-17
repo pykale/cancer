@@ -89,7 +89,9 @@ class WSISurvivalTrainer(BaseNNTrainer):
         risk, _ = self.forward(bags)
         loss = cox_ph_loss(risk, event, duration, ties_method=self.ties_method)
 
-        self._accumulate(split_name, risk, event, duration)
+        # Only the evaluation splits report an epoch-level C-index.
+        if split_name != "train":
+            self._accumulate(split_name, risk, event, duration)
         return loss, {f"{split_name}_loss": loss}
 
     def training_step(self, batch: BagBatch, batch_idx: int) -> torch.Tensor | None:
@@ -113,11 +115,19 @@ class WSISurvivalTrainer(BaseNNTrainer):
         self._log_concordance("test")
 
     def predict_risk(self, batch: BagBatch) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Risk scores and attention weights for a batch, without tracking gradients."""
+        """Risk scores and attention weights for a batch, without tracking gradients.
+
+        The training/evaluation mode is restored on return, so calling this during
+        training does not silently disable dropout for subsequent steps.
+        """
+        was_training = self.training
         self.eval()
-        with torch.no_grad():
-            bags = [sample.features.to(self.device) for sample in batch.samples]
-            return self.forward(bags)
+        try:
+            with torch.no_grad():
+                bags = [sample.features.to(self.device) for sample in batch.samples]
+                return self.forward(bags)
+        finally:
+            self.train(was_training)
 
     def _evaluation_step(self, batch: BagBatch, split_name: str) -> None:
         loss, log_metrics = self.compute_loss(batch, split_name=split_name)
@@ -141,6 +151,3 @@ class WSISurvivalTrainer(BaseNNTrainer):
             return
 
         self.log(f"{split_name}_c_index", concordance_index(risk, event, duration), prog_bar=True)
-
-    def on_train_epoch_end(self) -> None:
-        self._epoch_outputs.pop("train", None)

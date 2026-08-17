@@ -1,13 +1,20 @@
 """Early, late, and hybrid multimodal fusion for survival prediction.
 
-The three strategies differ in *where* modalities meet:
+The three strategies differ in *what* is combined:
 
-======  =========================================================  ==================
-early   features concatenated at the input, one joint encoder      narrow use
-late    independent per-modality models, predictions combined      baseline to beat
-hybrid  per-modality encoders, latent fusion, plus auxiliary       richest supervision
-        per-modality heads
-======  =========================================================  ==================
+======  ==========================================================================
+early   **features**: each modality is encoded, the features are fused, and a
+        single shared head predicts from the fused representation
+late    **decisions**: each modality is encoded and predicts independently, and
+        the risks are combined
+hybrid  **both**: an early-fusion trunk supplies the prediction while late-style
+        per-modality heads keep each encoder supervised and interpretable
+======  ==========================================================================
+
+Early fusion is feature-level, not raw-input-level: modalities are encoded first,
+because a gigapixel slide and a clinical table share no common input space. What
+makes it *early* is that the fusion happens before any prediction is made, so the
+shared head learns from cross-modal structure rather than from separate verdicts.
 
 All three share one interface and emit a patient-level log partial hazard, so the
 strategy is swappable from configuration. Encoders are injected rather than built
@@ -60,8 +67,10 @@ def modality_dropout(mask: torch.Tensor, probability: float, generator: torch.Ge
     if probability <= 0:
         return mask
 
-    keep = (torch.rand(mask.shape, device=mask.device, generator=generator) >= probability).float()
-    dropped = mask * keep
+    # A generator is bound to its own device, so draw there and move the result.
+    device = mask.device if generator is None else generator.device
+    keep = (torch.rand(mask.shape, device=device, generator=generator) >= probability).float()
+    dropped = mask * keep.to(mask.device)
     # Restore one modality wherever dropout removed them all.
     empty = dropped.sum(dim=1) == 0
     if bool(empty.any()):
@@ -110,49 +119,58 @@ class MultimodalSurvivalModel(nn.Module):
 
 
 class EarlyFusionSurvival(MultimodalSurvivalModel):
-    """Concatenate modality features at the input, then encode jointly.
+    """Encode each modality, fuse the features, then predict once.
 
-    The joint encoder can model raw cross-modal interactions, but every modality must
-    already be a fixed-length vector of comparable scale - a gigapixel slide has to be
-    pooled first. This is why early fusion suits commensurable inputs and is a narrow
-    choice for imaging plus tabular data.
+    Fusion happens before any prediction, so the shared head learns from cross-modal
+    structure. The fusion operator is swappable - ``"concat"`` for a plain
+    feature-level baseline, ``"poe"`` when modalities may be missing, ``"lowrank"``
+    for multiplicative interactions.
+
+    Encoders are trained end to end with the survival loss. To reproduce strict early
+    fusion over pre-extracted features, freeze the encoders; this is already the case
+    for WSI features, which come from a frozen foundation model.
 
     Args:
-        input_dims: Feature width of each modality, keyed by name.
-        hidden_dim: Width of the joint encoder.
-        dropout: Dropout inside the joint encoder.
+        encoders: One encoder per modality, each mapping its input to ``(batch, dim)``.
+        latent_dims: Output width of each encoder, keyed by modality.
+        fusion: Fusion method name, see
+            :data:`~kalecancer.model.embed.multimodal_fusion.FUSION_METHODS`, or a
+            prebuilt :class:`~kalecancer.model.embed.multimodal_fusion.FusionBlock`.
+        fused_dim: Width of the fused representation.
         modality_dropout: Probability of dropping each present modality in training.
+        **fusion_kwargs: Method-specific fusion options, e.g. ``rank``.
     """
 
     def __init__(
         self,
-        input_dims: Mapping[str, int],
-        hidden_dim: int = 128,
-        dropout: float = 0.25,
+        encoders: Mapping[str, nn.Module],
+        latent_dims: Mapping[str, int],
+        fusion: str | FusionBlock = "concat",
+        fused_dim: int = 64,
         modality_dropout: float = 0.0,
+        **fusion_kwargs,
     ) -> None:
-        super().__init__(list(input_dims), modality_dropout)
-        self.input_dims = dict(input_dims)
-        self.placeholders = nn.ParameterList(
-            [nn.Parameter(torch.zeros(self.input_dims[name])) for name in self.modalities]
+        super().__init__(list(encoders), modality_dropout)
+        self.encoders = nn.ModuleDict(dict(encoders))
+
+        ordered_dims = [latent_dims[name] for name in self.modalities]
+        self.fusion = (
+            fusion
+            if isinstance(fusion, FusionBlock)
+            else build_fusion(fusion, ordered_dims, fused_dim, **fusion_kwargs)
         )
-        self.encoder = nn.Sequential(
-            nn.Linear(sum(self.input_dims.values()), hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
-        self.head = CoxHead(hidden_dim)
+        self.head = CoxHead(self.fusion.output_dim)
+
+    def _encode(
+        self, inputs: Mapping[str, torch.Tensor], mask: torch.Tensor | None
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        self._ordered(inputs)
+        latents = [self.encoders[name](inputs[name]) for name in self.modalities]
+        return latents, self._resolve_mask(latents[0].shape[0], mask, latents[0].device)
 
     def forward(self, inputs: Mapping[str, torch.Tensor], mask: torch.Tensor | None = None) -> MultimodalOutput:
-        features = self._ordered(inputs)
-        mask = self._resolve_mask(features[0].shape[0], mask, features[0].device)
-
-        present = mask.unsqueeze(-1)
-        filled = [
-            feature * present[:, index] + placeholder * (1.0 - present[:, index])
-            for index, (feature, placeholder) in enumerate(zip(features, self.placeholders, strict=True))
-        ]
-        return MultimodalOutput(risk=self.head(self.encoder(torch.cat(filled, dim=1))))
+        latents, mask = self._encode(inputs, mask)
+        return MultimodalOutput(risk=self.head(self.fusion(latents, mask)))
 
 
 class LateFusionSurvival(MultimodalSurvivalModel):
@@ -196,22 +214,28 @@ class LateFusionSurvival(MultimodalSurvivalModel):
         return MultimodalOutput(risk=(risks * weights).sum(dim=1), modality_risk=modality_risk)
 
 
-class HybridFusionSurvival(MultimodalSurvivalModel):
-    """Fuse per-modality latents, and keep an auxiliary head on each modality.
+class HybridFusionSurvival(EarlyFusionSurvival):
+    """Combine early and late fusion: a fused trunk plus per-modality heads.
 
-    The shared head sees a fused representation, so cross-modal interactions are
-    learned; the auxiliary heads keep each encoder individually supervised, which
-    both stabilises training when one modality is much easier and preserves a
+    Extends :class:`EarlyFusionSurvival` with the late-fusion ingredient - a Cox head
+    on every modality latent. The fused trunk learns cross-modal structure while the
+    per-modality heads keep each encoder directly supervised, which stabilises
+    training when one modality is much easier to learn from and preserves a
     per-modality risk for interpretation.
+
+    By default the fused trunk alone makes the prediction and the per-modality heads
+    act as auxiliary supervision via
+    :func:`multimodal_cox_loss`. Set ``combine_risks`` to also merge the decisions,
+    giving a combination at both the feature and the decision level.
 
     Args:
         encoders: One encoder per modality, each mapping its input to ``(batch, dim)``.
         latent_dims: Output width of each encoder, keyed by modality.
-        fusion: Fusion method name, see
-            :data:`~kalecancer.model.embed.multimodal_fusion.FUSION_METHODS`, or a
-            prebuilt :class:`~kalecancer.model.embed.multimodal_fusion.FusionBlock`.
+        fusion: Fusion method name or a prebuilt fusion block.
         fused_dim: Width of the fused representation.
         auxiliary_heads: Attach a Cox head to each modality latent.
+        combine_risks: Blend the fused risk with the per-modality risks instead of
+            using the fused risk alone. Requires ``auxiliary_heads``.
         modality_dropout: Probability of dropping each present modality in training.
         **fusion_kwargs: Method-specific fusion options, e.g. ``rank``.
     """
@@ -223,35 +247,47 @@ class HybridFusionSurvival(MultimodalSurvivalModel):
         fusion: str | FusionBlock = "concat",
         fused_dim: int = 64,
         auxiliary_heads: bool = True,
+        combine_risks: bool = False,
         modality_dropout: float = 0.0,
         **fusion_kwargs,
     ) -> None:
-        super().__init__(list(encoders), modality_dropout)
-        self.encoders = nn.ModuleDict(dict(encoders))
-
-        ordered_dims = [latent_dims[name] for name in self.modalities]
-        self.fusion = (
-            fusion
-            if isinstance(fusion, FusionBlock)
-            else build_fusion(fusion, ordered_dims, fused_dim, **fusion_kwargs)
+        super().__init__(
+            encoders,
+            latent_dims,
+            fusion=fusion,
+            fused_dim=fused_dim,
+            modality_dropout=modality_dropout,
+            **fusion_kwargs,
         )
-        self.head = CoxHead(self.fusion.output_dim)
+        if combine_risks and not auxiliary_heads:
+            raise ValueError("combine_risks needs auxiliary_heads to produce per-modality risks")
+
+        self.combine_risks = combine_risks
         self.auxiliary = (
             nn.ModuleDict({name: CoxHead(latent_dims[name]) for name in self.modalities}) if auxiliary_heads else None
         )
+        # One weight for the fused trunk, then one per modality.
+        self.risk_weights = nn.Parameter(torch.zeros(1 + len(self.modalities)))
 
     def forward(self, inputs: Mapping[str, torch.Tensor], mask: torch.Tensor | None = None) -> MultimodalOutput:
-        self._ordered(inputs)
-        latents = [self.encoders[name](inputs[name]) for name in self.modalities]
-        mask = self._resolve_mask(latents[0].shape[0], mask, latents[0].device)
+        latents, mask = self._encode(inputs, mask)
+        fused_risk = self.head(self.fusion(latents, mask))
 
-        risk = self.head(self.fusion(latents, mask))
-        modality_risk = (
-            {name: self.auxiliary[name](latent) for name, latent in zip(self.modalities, latents, strict=True)}
-            if self.auxiliary is not None
-            else {}
-        )
-        return MultimodalOutput(risk=risk, modality_risk=modality_risk)
+        if self.auxiliary is None:
+            return MultimodalOutput(risk=fused_risk)
+
+        modality_risk = {
+            name: self.auxiliary[name](latent) for name, latent in zip(self.modalities, latents, strict=True)
+        }
+        if not self.combine_risks:
+            return MultimodalOutput(risk=fused_risk, modality_risk=modality_risk)
+
+        risks = torch.stack([fused_risk] + [modality_risk[name] for name in self.modalities], dim=1)
+        # The fused trunk always votes; each modality votes only when present.
+        available = torch.cat([torch.ones(mask.shape[0], 1, device=mask.device), mask], dim=1)
+        weights = torch.softmax(self.risk_weights, dim=0).unsqueeze(0) * available
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(torch.finfo(weights.dtype).eps)
+        return MultimodalOutput(risk=(risks * weights).sum(dim=1), modality_risk=modality_risk)
 
 
 def multimodal_cox_loss(

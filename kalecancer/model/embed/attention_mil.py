@@ -134,5 +134,8 @@ class BagEncoder(nn.Module):
         self.last_attention: list[torch.Tensor] = []
 
     def forward(self, bags: list[torch.Tensor]) -> torch.Tensor:
-        embeddings, self.last_attention = self.mil.forward_bags(bags)
+        embeddings, attention = self.mil.forward_bags(bags)
+        # Detached: holding these on the module would otherwise keep each bag's
+        # activations alive between forward passes.
+        self.last_attention = [weights.detach() for weights in attention]
         return embeddings

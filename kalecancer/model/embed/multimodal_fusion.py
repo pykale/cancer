@@ -7,14 +7,6 @@ touching the encoders or the task head.
 
 Absent modalities are first-class: a boolean modality mask is carried through, and
 each block degrades in a way appropriate to its mechanism.
-
-PyKale's :class:`~kale.embed.multimodal_fusion.Concat` and
-:class:`~kale.embed.multimodal_fusion.ProductOfExperts` are reused directly.
-:class:`LowRankFusion` re-implements low-rank tensor fusion rather than reusing
-PyKale's ``LowRankTensorFusion``, which stores its factors in a plain list of
-device-moved tensors: they are consequently not registered as module parameters
-(``.parameters()`` is empty, so an optimiser never trains them) and its device is
-hardcoded to ``cuda:0``.
 """
 
 from __future__ import annotations
@@ -158,6 +150,11 @@ class LowRankFusion(FusionBlock, _PlaceholderMixin):
 
     Models multiplicative interactions between modalities while keeping the parameter
     count linear in the number of modalities, by factorising the interaction tensor.
+
+    Implemented here rather than reusing ``kale.embed.multimodal_fusion.LowRankTensorFusion``,
+    whose factors are held in a plain list of device-moved tensors: they are not
+    registered as module parameters, so ``.parameters()`` is empty and an optimiser
+    never updates them, and its device is fixed to ``cuda:0``.
 
     Args:
         input_dims: Latent dimension of each modality.

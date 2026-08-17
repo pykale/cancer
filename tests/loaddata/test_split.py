@@ -122,3 +122,9 @@ def test_folds_are_deterministic_for_a_given_seed() -> None:
 def test_too_few_patients_for_the_requested_folds_is_rejected() -> None:
     with pytest.raises(SplitError, match="at least 5 patients"):
         stratified_patient_folds(make_bags(4), num_folds=5)
+
+
+def test_a_cohort_too_small_for_three_splits_raises_split_error() -> None:
+    """Surface a clear error rather than leaking one from the splitting backend."""
+    with pytest.raises(SplitError, match="cannot split 3 patients"):
+        split_patients(make_bags(3), seed=1)

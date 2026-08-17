@@ -28,6 +28,7 @@ dependencies = [
     "pandas",
     "scikit-learn",
     "pyyaml",
+    "certifi",
     "yacs",
     "h5py",
     "pykale",
@@ -64,6 +65,9 @@ dev = [
     "build",
     "twine",
 ]
+
+[project.scripts]
+kalecancer = "kalecancer.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/pykale/cancer"

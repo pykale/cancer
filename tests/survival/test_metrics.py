@@ -115,3 +115,48 @@ def test_horizons_beyond_follow_up_are_skipped_entirely(cohort) -> None:
     )
 
     assert "auc" not in metrics
+
+
+def test_split_without_events_reports_undefined_instead_of_raising(cohort) -> None:
+    """A cross-validation fold can land with no events; that must not kill the run."""
+    risk, _, time = cohort
+    censored = torch.zeros(len(risk), dtype=torch.int)
+
+    metrics = survival_metrics(risk, censored, time)
+
+    assert metrics["num_events"] == 0.0
+    assert "c_index" not in metrics
+
+
+def test_training_split_without_events_skips_weighted_metrics(cohort) -> None:
+    risk, event, time = cohort
+    train, test = slice(0, 40), slice(40, None)
+
+    metrics = survival_metrics(
+        risk[test],
+        event[test],
+        time[test],
+        train_event=torch.zeros(40, dtype=torch.int),
+        train_time=time[train],
+        eval_times=torch.tensor([365.0]),
+    )
+
+    assert "c_index" in metrics
+    assert "c_index_ipcw" not in metrics
+
+
+def test_unusable_horizons_are_reported(cohort, caplog) -> None:
+    risk, event, time = cohort
+    train, test = slice(0, 40), slice(40, None)
+
+    with caplog.at_level("WARNING"):
+        survival_metrics(
+            risk[test],
+            event[test],
+            time[test],
+            train_event=event[train],
+            train_time=time[train],
+            eval_times=torch.tensor([99999.0]),
+        )
+
+    assert "evaluation horizons" in caplog.text

@@ -41,8 +41,7 @@ def outcome() -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def build(strategy: str, encoders: dict[str, nn.Module], **kwargs):
-    if strategy == "early":
-        return build_multimodal_survival("early", input_dims=RAW_DIMS, **kwargs)
+    """Every strategy takes the same encoders and latent widths."""
     return build_multimodal_survival(strategy, encoders=encoders, latent_dims=LATENT_DIMS, **kwargs)
 
 
@@ -78,9 +77,9 @@ def test_registry_covers_the_documented_strategies() -> None:
     assert set(FUSION_STRATEGIES) == {"early", "late", "hybrid"}
 
 
-def test_registry_rejects_an_unknown_strategy() -> None:
+def test_registry_rejects_an_unknown_strategy(encoders) -> None:
     with pytest.raises(KeyError, match="unknown fusion strategy"):
-        build_multimodal_survival("mid", input_dims=RAW_DIMS)
+        build_multimodal_survival("mid", encoders=encoders, latent_dims=LATENT_DIMS)
 
 
 @pytest.mark.parametrize("strategy", ["early", "late", "hybrid"])
@@ -89,16 +88,39 @@ def test_missing_modality_input_is_rejected(strategy: str, encoders, inputs) -> 
         build(strategy, encoders)({"wsi": inputs["wsi"]})
 
 
-def test_a_single_modality_is_rejected() -> None:
+def test_a_single_modality_is_rejected(encoders) -> None:
     with pytest.raises(ValueError, match="at least two modalities"):
-        EarlyFusionSurvival(input_dims={"wsi": 64})
+        EarlyFusionSurvival({"wsi": encoders["wsi"]}, {"wsi": LATENT_DIMS["wsi"]})
 
 
-def test_early_fusion_has_no_per_modality_prediction(encoders, inputs) -> None:
-    """Early fusion mixes modalities before encoding, so no modality has its own risk."""
+def test_early_fusion_encodes_each_modality_before_fusing(encoders, inputs) -> None:
+    """Features come from the per-modality encoders, not from raw concatenation."""
+    model = build("early", encoders)
+
+    assert set(model.encoders) == set(RAW_DIMS)
+    assert model.fusion.input_dims == [LATENT_DIMS["wsi"], LATENT_DIMS["tab"]]
+
+
+def test_early_fusion_predicts_once_from_the_fused_features(encoders, inputs) -> None:
+    """Fusion precedes prediction, so no modality has a decision of its own."""
     output = build("early", encoders)(inputs)
 
+    assert output.risk.shape == (BATCH,)
     assert output.modality_risk == {}
+
+
+def test_early_fusion_head_reads_the_fused_representation(encoders) -> None:
+    model = build("early", encoders, fused_dim=48)
+
+    assert model.fusion.output_dim == 48
+    assert model.head.risk.in_features == 48
+
+
+@pytest.mark.parametrize(("method", "kwargs"), [("concat", {}), ("poe", {}), ("lowrank", {"rank": 3})])
+def test_early_fusion_method_is_swappable(method: str, kwargs: dict, encoders, inputs) -> None:
+    model = build("early", encoders, fusion=method, fused_dim=24, **kwargs)
+
+    assert model(inputs).risk.shape == (BATCH,)
 
 
 def test_early_fusion_uses_every_modality(encoders, inputs) -> None:
@@ -108,6 +130,18 @@ def test_early_fusion_uses_every_modality(encoders, inputs) -> None:
     changed["tab"] = torch.randn(BATCH, RAW_DIMS["tab"])
 
     assert not torch.allclose(model(inputs).risk, model(changed).risk)
+
+
+def test_early_fusion_gradients_reach_both_encoders(encoders, inputs, outcome) -> None:
+    """End-to-end training: the survival loss must update every modality encoder."""
+    model = build("early", encoders)
+    event, duration = outcome
+
+    multimodal_cox_loss(model(inputs), event, duration).backward()
+
+    for name in RAW_DIMS:
+        gradient = model.encoders[name].weight.grad
+        assert gradient is not None and float(gradient.abs().sum()) > 0
 
 
 def test_late_fusion_exposes_an_independent_risk_per_modality(encoders, inputs) -> None:
@@ -142,10 +176,52 @@ def test_late_fusion_weights_are_frozen_when_not_learned(encoders) -> None:
     assert not model.weights.requires_grad
 
 
+def test_hybrid_is_early_fusion_plus_late_heads(encoders) -> None:
+    """Hybrid combines both strategies, so it carries an early trunk and late heads."""
+    model = build("hybrid", encoders)
+
+    assert isinstance(model, EarlyFusionSurvival)
+    assert hasattr(model, "fusion") and hasattr(model, "head")
+    assert set(model.auxiliary) == set(RAW_DIMS)
+
+
 def test_hybrid_fusion_supervises_each_modality(encoders, inputs) -> None:
     output = build("hybrid", encoders)(inputs)
 
     assert set(output.modality_risk) == set(RAW_DIMS)
+
+
+def test_hybrid_defaults_to_the_fused_trunk_for_its_prediction(encoders, inputs) -> None:
+    """Without combine_risks the late heads are auxiliary supervision only."""
+    early = build("early", encoders).eval()
+    hybrid = build("hybrid", encoders).eval()
+    hybrid.fusion.load_state_dict(early.fusion.state_dict())
+    hybrid.head.load_state_dict(early.head.state_dict())
+
+    assert torch.allclose(hybrid(inputs).risk, early(inputs).risk, atol=1e-5)
+
+
+def test_hybrid_can_combine_decisions_as_well_as_features(encoders, inputs) -> None:
+    fused_only = build("hybrid", encoders, combine_risks=False).eval()
+    combined = build("hybrid", encoders, combine_risks=True).eval()
+    combined.load_state_dict(fused_only.state_dict(), strict=False)
+
+    assert not torch.allclose(combined(inputs).risk, fused_only(inputs).risk)
+
+
+def test_hybrid_combined_risk_ignores_absent_modalities(encoders, inputs) -> None:
+    model = build("hybrid", encoders, combine_risks=True).eval()
+    mask = torch.tensor([[1.0, 0.0]] * BATCH)
+
+    changed = dict(inputs)
+    changed["tab"] = torch.randn(BATCH, RAW_DIMS["tab"])
+
+    assert torch.allclose(model(inputs, mask).risk, model(changed, mask).risk, atol=1e-5)
+
+
+def test_hybrid_combining_decisions_requires_auxiliary_heads(encoders) -> None:
+    with pytest.raises(ValueError, match="combine_risks needs auxiliary_heads"):
+        HybridFusionSurvival(encoders, LATENT_DIMS, auxiliary_heads=False, combine_risks=True)
 
 
 def test_hybrid_auxiliary_heads_can_be_disabled(encoders, inputs) -> None:
@@ -238,3 +314,10 @@ def test_loss_is_finite_and_differentiable(encoders, inputs, outcome) -> None:
     loss.backward()
 
     assert torch.isfinite(loss)
+
+
+def test_modality_dropout_accepts_a_generator_for_reproducibility() -> None:
+    first = modality_dropout(torch.ones(20, 3), 0.5, generator=torch.Generator().manual_seed(0))
+    second = modality_dropout(torch.ones(20, 3), 0.5, generator=torch.Generator().manual_seed(0))
+
+    assert torch.equal(first, second)

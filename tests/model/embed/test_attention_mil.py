@@ -99,3 +99,12 @@ def test_bag_encoder_registers_the_wrapped_parameters(model: AttentionMIL) -> No
     encoder = BagEncoder(model)
 
     assert sum(p.numel() for p in encoder.parameters()) == sum(p.numel() for p in model.parameters())
+
+
+def test_bag_encoder_detaches_attention_from_the_graph(model: AttentionMIL) -> None:
+    """Holding graph-linked attention would retain each bag's activations."""
+    encoder = BagEncoder(model)
+
+    encoder([torch.randn(n, INPUT_DIM) for n in (5, 11)]).sum().backward()
+
+    assert all(not a.requires_grad and a.grad_fn is None for a in encoder.last_attention)

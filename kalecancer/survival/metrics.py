@@ -9,6 +9,8 @@ outcome distribution into its own evaluation.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from torchsurv.metrics.auc import Auc
 from torchsurv.metrics.brier_score import BrierScore
@@ -17,6 +19,8 @@ from torchsurv.stats.ipcw import get_ipcw
 
 from kalecancer.survival.baseline import BreslowBaselineHazard
 from kalecancer.survival.loss import as_event_mask
+
+logger = logging.getLogger(__name__)
 
 
 def censoring_weights(
@@ -154,13 +158,24 @@ def survival_metrics(
     Returns:
         Metric names mapped to values; time-dependent entries are keyed by horizon.
     """
+    num_events = int(as_event_mask(event).sum())
     metrics: dict[str, float | dict[str, float]] = {
-        "c_index": concordance_index(risk, event, time),
         "num_patients": float(len(risk)),
-        "num_events": float(as_event_mask(event).sum()),
+        "num_events": float(num_events),
     }
 
+    # Every metric here is defined by comparisons against observed events, so a split
+    # without any is reported as undefined rather than raising.
+    if num_events == 0:
+        logger.warning("no observed events in this split; survival metrics are undefined")
+        return metrics
+
+    metrics["c_index"] = concordance_index(risk, event, time)
+
     if train_event is None or train_time is None:
+        return metrics
+    if not bool(as_event_mask(train_event).any()):
+        logger.warning("no observed events in the training split; skipping censoring-weighted metrics")
         return metrics
 
     weight = censoring_weights(train_event, train_time, new_time=time)
@@ -171,6 +186,13 @@ def survival_metrics(
 
     horizons = usable_eval_times(eval_times, time)
     if horizons.numel() == 0:
+        logger.warning(
+            "none of the evaluation horizons %s fall inside the observed follow-up (%.0f to %.0f); "
+            "skipping the time-dependent metrics",
+            [float(t) for t in eval_times.flatten()],
+            float(time.min()),
+            float(time.max()),
+        )
         return metrics
 
     weight_horizons = censoring_weights(train_event, train_time, new_time=horizons)

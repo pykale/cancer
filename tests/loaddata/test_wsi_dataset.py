@@ -85,3 +85,9 @@ def test_dataset_rejects_unexpected_feature_dimension(cohort_bags) -> None:
 
     with pytest.raises(InvalidFeatureFileError, match="expected feature dimension 1024"):
         _ = dataset[0]
+
+
+def test_non_positive_max_patches_is_rejected(cohort_bags) -> None:
+    """0 would otherwise subsample every bag to nothing; use None to disable the cap."""
+    with pytest.raises(ValueError, match="must be a positive number of patches or None"):
+        WSIFeatureBagDataset(cohort_bags, expected_dim=FEATURE_DIM, max_patches=0)

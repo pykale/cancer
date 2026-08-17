@@ -70,23 +70,28 @@ def split_patients(
         raise SplitError(f"need at least 3 patients to build three splits, got {len(bags)}")
 
     labels = _stratify_labels(bags)
-    train_bags, holdout = train_test_split(
-        bags,
-        train_size=train_ratio,
-        random_state=seed,
-        shuffle=True,
-        stratify=labels if _can_stratify(labels, 2) else None,
-    )
+    try:
+        train_bags, holdout = train_test_split(
+            bags,
+            train_size=train_ratio,
+            random_state=seed,
+            shuffle=True,
+            stratify=labels if _can_stratify(labels, 2) else None,
+        )
 
-    holdout_labels = _stratify_labels(holdout)
-    val_share = val_ratio / (val_ratio + test_ratio)
-    val_bags, test_bags = train_test_split(
-        holdout,
-        train_size=val_share,
-        random_state=seed,
-        shuffle=True,
-        stratify=holdout_labels if _can_stratify(holdout_labels, 2) else None,
-    )
+        holdout_labels = _stratify_labels(holdout)
+        val_share = val_ratio / (val_ratio + test_ratio)
+        val_bags, test_bags = train_test_split(
+            holdout,
+            train_size=val_share,
+            random_state=seed,
+            shuffle=True,
+            stratify=holdout_labels if _can_stratify(holdout_labels, 2) else None,
+        )
+    except ValueError as error:
+        raise SplitError(
+            f"cannot split {len(bags)} patients into {train_ratio}/{val_ratio}/{test_ratio}: {error}"
+        ) from error
 
     split = CohortSplit(train=train_bags, val=val_bags, test=test_bags)
     empty = [name for name, size in split.sizes().items() if size == 0]
