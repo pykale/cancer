@@ -1,0 +1,60 @@
+# Run a different config with:  python examples/HANCOCK_tabular/main.py --config my_config.yaml
+#
+# Paths are relative to the directory you run main.py from (the repo root, for
+# the defaults below).
+
+seed: 0
+
+data:
+  source: data/StructuredData/clinical_data.json
+  identifier: patient_id
+
+# Right-censored survival supervision. event_value is the value in `event` that
+# means the event was observed, everything else recorded is treated as censored.
+target:
+  time: days_to_last_information
+  event: survival_status
+  event_value: deceased
+  unit: days
+
+# Column roles, and the transforms applied to each role IN ORDER.
+# A transforms factory exists in pipeline.py, so you can add any
+# sklearn compatible transform there and reference them here.
+features:
+  continuous:
+    columns:
+      - age_at_initial_diagnosis
+      - year_of_initial_diagnosis
+    transform:
+      - SimpleImputer: {strategy: median}
+      - StandardScaler: {}
+
+  categorical:
+    columns:
+      - sex
+      - smoking_status
+      - primarily_metastasis
+    transform:
+      - SimpleImputer: {strategy: most_frequent}
+      - OrdinalEncoder: {handle_unknown: use_encoded_value, unknown_value: -1}
+
+split:
+  test_size: 0.2
+  random_state: null    # null -> use `seed`
+
+# Frozen TabICL row representations. The checkpoint is downloaded from Hugging
+# Face on first use.
+encoder:
+  context_label: event  # which supervision value conditions the representation
+  checkpoint: null      # null -> TabICL's own default checkpoint
+  n_estimators: 1
+  device: null          # null -> let TabICL choose
+  random_state: null    # null -> use `seed`
+
+# Demo only: the Cox head (linear layer with ).
+head:
+  hidden_dim: 32
+  epochs: 200
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  log_every: 50

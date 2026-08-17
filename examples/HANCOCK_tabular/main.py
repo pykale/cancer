@@ -7,8 +7,10 @@ from kalecancer.survival.survival_target import SurvivalTarget
 
 SEED = 0
 
+DATA_LOC = "data/StructuredData/clinical_data.json"
+
 cohort = TabularDataset(
-    "data/clinical_data.json",
+    source=DATA_LOC,
     identifier="patient_id",
     target=SurvivalTarget(
         time="days_to_last_information",
