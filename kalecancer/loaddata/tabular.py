@@ -34,13 +34,10 @@ def _read_table(path: Path, id_column: str) -> pd.DataFrame:
 def _prepare_frame(frame: pd.DataFrame, id_column: str) -> pd.DataFrame:
     """Normalise a freshly-sourced table: fresh row index, identifiers as strings.
 
-    The identifier is forced to string because pandas infers ``"001"`` as the
-    integer ``1`` and the leading zeros are gone -- invisible until a slide manifest
-    keyed on ``"001"`` joins against it and silently matches nothing.
-
-    Note that this can only *keep* an identifier a string, never recover one: by the
-    time an in-memory frame arrives here, a caller who read it without
-    ``dtype={id_column: str}`` has already lost the padding.
+    Identifiers are forced to string because pandas reads ``"001"`` as ``1``, which a
+    slide manifest keyed on ``"001"`` then silently fails to match. This can only
+    *keep* padding, never recover it -- a frame read without ``dtype={id: str}`` has
+    already lost it.
     """
     frame = frame.reset_index(drop=True)
     if id_column in frame.columns:
@@ -51,33 +48,28 @@ def _prepare_frame(frame: pd.DataFrame, id_column: str) -> pd.DataFrame:
 class TabularCohort(Cohort):
     """Covariates from a flat table, keyed by a sample identifier.
 
-    Column roles are declared, and preprocessing is declared per role using plain
-    scikit-learn transformers. Nothing is fitted here and this object is never
-    mutated: :meth:`fit_preprocessor` fits on the rows you name and hands back a
-    separate artifact, and :meth:`~kalecancer.loaddata.base.Cohort.view` pairs a row
-    subset with one of those artifacts to make a dataset.
+    Column roles and their preprocessing are declared with plain scikit-learn
+    transformers. Nothing is fitted here and this object is never mutated:
+    :meth:`fit_preprocessor` fits on the rows you name and hands back a separate
+    artifact, which :meth:`~kalecancer.loaddata.base.Cohort.view` pairs with a row
+    subset to make a dataset.
 
     Args:
-        source (str | Path | pd.DataFrame): A table to read (``.csv``, ``.tsv``,
-            ``.json``), or an already-loaded ``DataFrame``. Anything pandas can read
-            but this cannot -- parquet, Excel, a database query -- goes through the
-            frame: read it yourself and pass the result. The frame is copied, so
-            later edits to the caller's object do not reach the cohort.
-            Read it with ``dtype={identifier: str}`` -- by the time a frame arrives
-            here, a zero-padded ``"001"`` inferred as ``1`` is already unrecoverable.
+        source (str | Path | pd.DataFrame): A ``.csv``, ``.tsv`` or ``.json`` file, or
+            a loaded ``DataFrame`` -- the route for anything else pandas can read.
+            Read it with ``dtype={identifier: str}`` or zero-padded ids are already
+            lost. The frame is copied.
         identifier (str): Column holding sample identifiers. Must be unique.
-        target (Target | None, optional): Supervision target. ``None`` for a pure
-            feature provider used as a component of a larger cohort.
+        target (Target | None, optional): ``None`` for a pure feature provider used as
+            a component of a larger cohort.
         continuous (Sequence[str], optional): Numeric feature columns.
         categorical (Sequence[str], optional): Categorical feature columns.
-        continuous_transform (optional): A scikit-learn transformer, or a list of
-            them applied in order, for the continuous columns. ``None`` (the default)
-            passes them through untouched. There is deliberately no default pipeline:
-            imputation and scaling are modelling decisions that belong in the
-            caller's script, where they can be read, reviewed and reported.
+        continuous_transform (optional): A scikit-learn transformer, or a list applied
+            in order. ``None`` passes the columns through. No default pipeline:
+            imputation and scaling are modelling decisions and belong in your script.
         categorical_transform (optional): As above, for the categorical columns.
-        name (str, optional): Key for this modality's features in
-            ``PatientSample.modalities``. Defaults to ``"clinical"``.
+        name (str, optional): Key for this modality in ``PatientSample.modalities``.
+            Defaults to ``"clinical"``.
 
     Example:
         >>> from sklearn.impute import SimpleImputer
@@ -93,14 +85,12 @@ class TabularCohort(Cohort):
         ...     categorical_transform=OneHotEncoder(handle_unknown="ignore",
         ...                                         sparse_output=False),
         ... )
-        >>> train_idx, test_idx = cohort.split(test_size=0.2, random_state=0)
+        >>> train_idx, test_idx = cohort.split(test_size=0.2, random_state=0, stratify=True)
         >>> prep = cohort.fit_preprocessor(train_idx)     # fitted on train rows only
         >>> train, test = cohort.view(train_idx, prep), cohort.view(test_idx, prep)
 
-        Passing a frame is the seam for anything that has to happen between reading
-        the file and binding the target -- resolving rows the target refuses to guess
-        at, or joining a second table -- so the decision stays visible in the script
-        rather than in a separately-prepared file:
+        A frame is the seam for anything between reading the file and binding the
+        target, so the decision stays visible in your script:
 
         >>> frame = pd.read_csv("data/my_cohort.csv", dtype={"patient_id": str})
         >>> frame = frame[frame.vital_status.notna()]   # 24 patients, status not recorded
@@ -125,9 +115,8 @@ class TabularCohort(Cohort):
         self.continuous_transform = continuous_transform
         self.categorical_transform = categorical_transform
 
-        # Doubles as the in-memory source: seeded here when the caller passed a frame,
-        # replaced by _load_index with the table read from self.path otherwise. The
-        # empty placeholder is never read -- _load_index overwrites it first.
+        # Seeded from a caller's frame, or overwritten by _load_index from self.path.
+        # The empty placeholder is never read.
         self._frame: pd.DataFrame = source.copy() if isinstance(source, pd.DataFrame) else pd.DataFrame()
         self._spec: ColumnTransformer | None = None
 
@@ -144,9 +133,8 @@ class TabularCohort(Cohort):
     def _load_index(self) -> None:
         """Read the table, validate the declared columns, bind the target.
 
-        Reads the whole table because a clinical table is small; for this modality
-        index and payload are the same read. The expensive-payload case that
-        motivates the split is WSI, where this would read a tile manifest only.
+        Reads everything, because a clinical table is small and index and payload are
+        the same read here. WSI is what motivates keeping the phases apart.
         """
         self._frame = (
             _prepare_frame(self._frame, self.identifier)
@@ -171,9 +159,8 @@ class TabularCohort(Cohort):
     def _bind_target(self) -> None:
         """Hand the target the columns it declared it needs, as arrays.
 
-        Checking ``required_columns`` here rather than letting ``bind`` discover a
-        missing column means the error names the target's own vocabulary and fires
-        at construction.
+        Checked here rather than inside ``bind`` so a missing column fails at
+        construction, named in the target's own vocabulary.
         """
         if self.target is None:
             return
@@ -200,11 +187,7 @@ class TabularCohort(Cohort):
             raise ValueError(f"Identifier column '{self.identifier}' cannot also be a feature.")
 
     def _build_spec(self) -> ColumnTransformer | None:
-        """Assemble an *unfitted* ColumnTransformer from the declared roles.
-
-        Returns ``None`` when no role declares a stateful transform, which is what
-        tells :meth:`fit_preprocessor` there is nothing to fit.
-        """
+        """Assemble an *unfitted* ColumnTransformer, or ``None`` if no role is stateful."""
         blocks, stateful = [], False
         for columns, spec, label in self._roles():
             if not columns:
@@ -249,13 +232,8 @@ class TabularCohort(Cohort):
     def fit_preprocessor(self, indices: Indices) -> TabularPreprocessor:
         """Fit the declared transforms on ``indices`` only, and return the artifact.
 
-        This cohort is not modified, so folds are independent and can be fitted in
-        parallel. Fitting is scoped to the rows you name, so a fold can never see
-        statistics computed outside it.
-
-        Args:
-            indices (Indices): Positional indices into ``self.identifiers``,
-                normally one fold's training rows.
+        The cohort is not modified, so folds are independent and can be fitted in
+        parallel.
 
         Returns:
             TabularPreprocessor: Fitted transforms, the resulting feature names, and
@@ -282,12 +260,10 @@ class TabularCohort(Cohort):
     # ------------------------------------------------------------------ #
 
     def payload_bulk(self, identifiers, prep) -> dict[str, Tensor]:
-        """Transform every row at once.
+        """Transform every row at once, which is what lets a view cache.
 
-        Overridden because a clinical table is small and scikit-learn's ``transform``
-        has enough per-call overhead to dominate a training loop if invoked per row.
-        This is what lets a view cache; see
-        :meth:`~kalecancer.loaddata.base.Cohort.payload_bulk`.
+        Overridden because scikit-learn's per-call overhead would dominate the loop if
+        ``transform`` ran once per row.
         """
         self._require(prep)
         rows = self.index_of(identifiers)
@@ -302,10 +278,8 @@ class TabularCohort(Cohort):
     def _require(self, prep) -> None:
         """Refuse to serve values without a preprocessor.
 
-        Refused even when nothing stateful was declared, so there is one rule rather
-        than two: :meth:`fit_preprocessor` is cheap and always returns an artifact,
-        and accepting ``None`` here would mean a cohort *with* declared transforms
-        silently serving raw values to anyone who passed it.
+        Refused even for a passthrough, so there is one rule rather than two: accepting
+        ``None`` would let a cohort *with* declared transforms serve raw values.
         """
         if prep is None:
             raise NotFittedError(
@@ -327,14 +301,10 @@ class TabularCohort(Cohort):
     def _check_untransformed_roles(self) -> None:
         """Refuse to build a cohort whose features no transform was declared to clean up.
 
-        Checked **per role**, at construction, because declaring a transform for one
-        role does nothing for the other. Checking the feature block as a whole would
-        let a half-declared spec through -- scaled continuous columns alongside raw
-        string categoricals -- which then dies much later, inside the numeric cast,
-        as ``could not convert string to float: 'F'``.
-
-        Both failures are silent or opaque otherwise: non-numeric columns reach that
-        cast, and missing values sail through as NaN into the model.
+        Checked **per role**, because a transform on one role does nothing for the
+        other. A half-declared spec -- scaled numbers beside raw strings -- would
+        otherwise die much later as ``could not convert string to float: 'F'``, and
+        missing values would sail through as NaN into the model.
         """
         for columns, spec, label in self._roles():
             if not columns or self._resolve(spec):
@@ -379,10 +349,7 @@ class TabularCohort(Cohort):
     def describe_transforms(self) -> str:
         """Summary of the transforms this cohort *declares*.
 
-        What a given fold actually *applied* is a question for that fold's
-        :class:`~kalecancer.prepdata.tabular.TabularPreprocessor`, which is a
-        different object and knows the answer -- including the encoded feature
-        names, which depend on the rows it saw.
+        What a fold actually applied is its ``TabularPreprocessor``'s to answer.
         """
         lines = []
         for columns, spec, label in self._roles():

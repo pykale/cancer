@@ -1,20 +1,12 @@
 """The item type: one patient in, one batch out.
 
-A :class:`PatientSample` is what a :class:`~kalecancer.loaddata.view.CohortView`
-yields, and :class:`PatientBatch` is what :func:`collate_samples` turns a list of
-them into. Keeping the two types distinct is deliberate -- a batch of samples is
-not itself a sample, and the fields that only exist once things are batched
-(padding) have nowhere sensible to live on a single patient.
+A :class:`CohortView` yields :class:`PatientSample`; :func:`collate_samples` turns a
+list of them into a :class:`PatientBatch`. Two types because padding only exists
+once things are batched.
 
-Two measured facts shape this module:
-
-* ``torch.utils.data.default_collate`` **rejects dataclasses** outright, so
-  :func:`collate_samples` is mandatory rather than an optimisation. That cost is
-  already unavoidable -- variable-length slide bags cannot be stacked without
-  padding -- and one named function owning it beats scattering padding logic.
-* Lightning's ``apply_to_collection`` *is* dataclass-aware, so
-  ``transfer_batch_to_device`` moves a :class:`PatientBatch` to the GPU with no
-  extra work from us.
+``default_collate`` rejects dataclasses, so :func:`collate_samples` is mandatory --
+no loss, since ragged slide bags need custom padding anyway. Lightning's
+``apply_to_collection`` *is* dataclass-aware, so device transfer needs no help.
 """
 
 from __future__ import annotations
@@ -29,22 +21,16 @@ from torch import Tensor
 class PatientSample:
     """One patient, every modality, ready for a model.
 
-    No paths and no lazy handles: by the time this object exists, payload loading
-    has happened. Identifiers and file paths live in a cohort's index and are
-    resolved inside ``payload()``, which runs in the DataLoader worker where the
-    parallelism already is.
+    Tensors only -- paths are resolved inside ``payload()``, in the DataLoader worker.
 
     Attributes:
-        patient_id (str): Sample identifier. Carried through so a prediction can
-            always be traced back to a patient.
-        modalities (dict[str, Tensor]): Feature tensors by modality name, e.g.
-            ``{"clinical": (d,), "wsi_primary": (n_tiles, d)}``.
-        present (dict[str, Tensor]): 0-d bool per modality -- whether this patient
-            actually has it. A modality that is absent still appears in
-            ``modalities``, zero-filled, so that batches keep a uniform structure;
-            ``present`` is what tells a fusion layer to ignore those zeros.
-        target (dict[str, Tensor]): Supervision values, e.g. ``{"time": ...,
-            "event": ...}``. Empty for a cohort with no target.
+        patient_id (str): Sample identifier, so a prediction traces back to a patient.
+        modalities (dict[str, Tensor]): Features by modality, e.g. ``{"clinical": (d,),
+            "wsi_primary": (n_tiles, d)}``.
+        present (dict[str, Tensor]): 0-d bool per modality. An absent modality is still
+            present in ``modalities``, zero-filled, to keep batches uniform; this is
+            what tells a fusion layer to ignore those zeros.
+        target (dict[str, Tensor]): Supervision values. Empty for a cohort with no target.
     """
 
     patient_id: str
@@ -57,22 +43,17 @@ class PatientSample:
 class PatientBatch:
     """A collated batch. Same fields as :class:`PatientSample`, batched.
 
+    ``present`` and ``pad_mask`` are different axes, which is why neither is just
+    called "mask": availability per modality, versus which tiles within a bag are real.
+
     Attributes:
         patient_id (list[str]): Identifiers, in batch order.
-        modalities (dict[str, Tensor]): Leading dimension ``B``. Ragged modalities
-            are zero-padded to the batch maximum.
-        present (dict[str, Tensor]): ``(B,)`` bool per modality -- is this modality
-            available for each patient at all.
-        pad_mask (dict[str, Tensor]): ``(B, n_max)`` bool per *padded* modality --
-            which entries along the ragged axis are real. Only modalities that
-            actually needed padding appear here, so it stays empty for fixed-width
-            data such as a clinical table.
+        modalities (dict[str, Tensor]): Leading dimension ``B``, ragged modalities
+            zero-padded to the batch maximum.
+        present (dict[str, Tensor]): ``(B,)`` bool per modality.
+        pad_mask (dict[str, Tensor]): ``(B, n_max)`` bool, only for modalities that
+            needed padding -- empty for fixed-width data such as a clinical table.
         target (dict[str, Tensor]): ``(B,)`` per key.
-
-    Note:
-        ``present`` and ``pad_mask`` are different axes and are deliberately not
-        both called "mask". ``present`` is per-modality availability; ``pad_mask``
-        is per-tile within one bag and is what an attention-based aggregator needs.
     """
 
     patient_id: list[str]
@@ -88,18 +69,12 @@ class PatientBatch:
 def _stack_or_pad(tensors: list[Tensor], name: str) -> tuple[Tensor, Tensor | None]:
     """Stack same-shaped tensors, or zero-pad along axis 0 when they are ragged.
 
-    Args:
-        tensors (list[Tensor]): One per sample.
-        name (str): Modality name, for error messages.
-
-    Returns:
-        tuple[Tensor, Tensor | None]: The stacked tensor, and a ``(B, n_max)`` bool
-        mask marking real entries -- or ``None`` when no padding was needed.
+    Returns the stacked tensor and a ``(B, n_max)`` mask of real entries, or ``None``
+    when nothing needed padding.
 
     Raises:
-        ValueError: If the tensors differ in any axis other than the first. That
-            is a genuine mismatch (a feature width that changed between folds, say)
-            rather than a ragged bag, and padding it would hide the cause.
+        ValueError: If they differ in any axis but the first -- a feature-width
+            mismatch, not a ragged bag, and padding it would hide the cause.
     """
     shapes = {tuple(t.shape) for t in tensors}
     if len(shapes) == 1:
@@ -126,9 +101,8 @@ def _stack_or_pad(tensors: list[Tensor], name: str) -> tuple[Tensor, Tensor | No
 def _require_same_keys(samples: list[PatientSample], attribute: str) -> list[str]:
     """Return the shared keys of ``attribute`` across samples, or raise.
 
-    Samples disagreeing about which modalities they carry means a cohort built
-    them inconsistently. Collating anyway would silently drop a modality for the
-    whole batch.
+    Disagreement means a cohort built them inconsistently; collating anyway would
+    silently drop a modality for the whole batch.
     """
     first = list(getattr(samples[0], attribute))
     expected = set(first)
@@ -147,20 +121,11 @@ def _require_same_keys(samples: list[PatientSample], attribute: str) -> list[str
 def collate_samples(samples: list[PatientSample]) -> PatientBatch:
     """Collate samples into a :class:`PatientBatch`, padding ragged modalities.
 
-    Pass this as ``collate_fn`` to a ``DataLoader``;
-    :class:`~kalecancer.loaddata.module.CohortDataModule` does so by default.
-
-    Args:
-        samples (list[PatientSample]): One batch worth of samples.
-
-    Returns:
-        PatientBatch: Batched tensors, plus a ``pad_mask`` entry for each modality
-        that needed padding.
+    Pass as ``collate_fn`` to a ``DataLoader``; ``CohortDataModule`` does so by default.
 
     Raises:
-        ValueError: If ``samples`` is empty, if samples disagree about which
-            modalities or target keys they carry, or if a modality is ragged in
-            more than its leading axis.
+        ValueError: If ``samples`` is empty, if they disagree about which modalities
+            or target keys they carry, or if a modality is ragged beyond its first axis.
     """
     if not samples:
         raise ValueError("Cannot collate an empty list of samples.")

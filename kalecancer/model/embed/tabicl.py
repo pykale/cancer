@@ -1,31 +1,21 @@
 """TabICL as a frozen feature extractor.
 
-TabICL is an in-context tabular foundation model: it makes predictions by placing
-labelled training rows in context alongside the rows being predicted, in a single
-forward pass. Internally that is three stages -- a column-wise transformer, a
-row-wise transformer producing one fixed-width vector per row, and a dataset-wise
-transformer that does the actual in-context prediction.
+TabICL predicts by placing labelled training rows in context alongside the rows being
+predicted, in one forward pass: a column-wise transformer, a row-wise transformer
+giving one vector per row, then a dataset-wise transformer that predicts. This wrapper
+stops after the second stage and returns the row vectors. There is no public API for
+that upstream, so it reaches into ``TabICLClassifier.model_``.
 
-This wrapper stops after the second stage and returns those row vectors. There is
-no public API for it upstream, so it reaches into ``TabICLClassifier.model_``; see
-:class:`TabICLEncoder` for what that costs.
+Two measured properties shape the design (512 dims, checkpoint v2):
 
-Two properties of the architecture shape the whole design
-(``embed_dim x row_num_cls = 512`` dimensions, checkpoint v2):
-
-1. **A row's representation depends on the context it was embedded against.**
-   Embedding the same 100 rows against a 200-row context and against a 100-row
-   context gives mean absolute difference ~0.4 per dimension. The context is
-   therefore fitted state in exactly the sense a ``StandardScaler`` mean is, and
-   it must be scoped to a training fold. This is why the class splits :meth:`fit`
-   from :meth:`encode` instead of exposing a single stateless transform.
-
-2. **Context rows do not see the rows being encoded.** With ``embed_with_test``
-   left at its default of ``False``, the set transformer's inducing points attend
-   only to context rows, and a context row's representation is bit-identical
-   regardless of what is being encoded against it (measured difference: exactly
-   0.0). Flipping that flag breaks the property -- the same comparison moves to
-   ~0.27 -- so it is hard-coded here rather than exposed.
+1. **A row's representation depends on its context.** The same 100 rows embedded
+   against a 200-row and a 100-row context differ by ~0.4 per dimension. The context
+   is fitted state exactly as a ``StandardScaler`` mean is, hence :meth:`fit` and
+   :meth:`encode` rather than one stateless transform.
+2. **Context rows do not see the rows being encoded**, with ``embed_with_test=False``:
+   a context row's representation is bit-identical whatever is encoded against it
+   (difference exactly 0.0). Flipping the flag moves that to ~0.27, so it is
+   hard-coded rather than exposed.
 """
 
 from __future__ import annotations
@@ -70,19 +60,12 @@ _LOADED: dict[tuple, dict] = {}
 def _shared_load(clf, key: tuple) -> None:
     """Point ``clf`` at a shared copy of the checkpoint instead of loading its own.
 
-    The weights are 27.5M parameters -- 110MB in fp32 -- and :meth:`TabICLEncoder.fit`
-    builds a fresh estimator per fold to keep contexts independent. Loading per fold
-    would put five identical copies of the same frozen tensors in memory for a 5-fold
-    run, so the module is loaded once and every fold points at it.
+    110MB of frozen weights, and a fresh estimator is built per fold to keep contexts
+    independent -- so five folds would hold five identical copies.
 
-    This is safe only because nothing here mutates it: the encoder never fine-tunes,
-    never takes a gradient, and leaves ``kv_cache`` at its default of ``False``, so the
-    module's one piece of mutable state (``_cache``) is never populated. **Fine-tuning
-    must not use this path** -- folds would then share weights and train each other's.
-
-    Works by overriding ``_load_model`` on the instance, which ``fit`` calls; if a
-    future TabICL stops routing through it, the swap after ``fit`` still shares the
-    module and only the redundant read is lost.
+    Safe only because nothing mutates them: no fine-tuning, no gradients, and
+    ``kv_cache`` left ``False`` so the module's one mutable field stays empty.
+    **Fine-tuning must not use this path**, or folds would train each other's weights.
     """
     cached = _LOADED.get(key)
     if cached is None:
@@ -129,28 +112,21 @@ def _matrix(view: CohortView) -> np.ndarray:
 class TabICLEncoder:
     """Frozen TabICL row representations for a tabular dataset.
 
-    Not fine-tuned and not trainable: the pretrained weights are used as-is, and
-    the only fitted state is the in-context example set. That state is scoped to
-    a training fold by :meth:`fit`, which returns a **new** encoder and leaves
-    this one untouched, so folds cannot contaminate one another.
+    Not fine-tuned and not trainable: the pretrained weights are used as-is, and the
+    only fitted state is the in-context example set. :meth:`fit` returns a **new**
+    encoder and leaves this one untouched, so folds cannot contaminate one another.
 
     Args:
         context_label (str, optional): Which supervision value conditions the
-            representation, ``"event"`` (the binary event indicator) or ``"time"``.
-            TabICL's column embedder is target-aware -- context labels are embedded
-            and added to the context rows -- so this is a modelling choice with
-            visible consequences, not a formatting one, and it is shown in
-            ``repr``. Only ``"event"`` is implemented; ``"time"`` needs
-            ``TabICLRegressor`` and raises. Defaults to ``"event"``.
-        checkpoint (str | None, optional): Checkpoint version to load, e.g.
-            ``"tabicl-classifier-v2-20260212.ckpt"``. ``None`` takes the upstream
-            default and downloads it from Hugging Face on first use.
-        n_estimators (int, optional): Size of TabICL's internal ensemble over
-            normalisation methods and feature permutations. Representations are
-            averaged across members. Defaults to 1: averaging *predictions* across
-            permutations is what the ensemble was designed for, and averaging
-            *representations* is a different and unvalidated operation, so the
-            default does not do it silently.
+            representation. TabICL's column embedder is target-aware, so this is a
+            modelling choice, not a formatting one. Only ``"event"`` is implemented;
+            ``"time"`` needs ``TabICLRegressor`` and raises.
+        checkpoint (str | None, optional): Checkpoint version. ``None`` takes the
+            upstream default, downloaded from Hugging Face on first use.
+        n_estimators (int, optional): TabICL's internal ensemble over normalisations and
+            feature permutations, averaged across members. Defaults to 1, because the
+            ensemble was designed to average *predictions*; averaging *representations*
+            is a different and unvalidated operation and should not happen silently.
         device (str | None, optional): Torch device. ``None`` lets TabICL choose.
         random_state (int | None, optional): Seed for the ensemble generator.
 
@@ -158,19 +134,17 @@ class TabICLEncoder:
         out_dim (int): Representation width, known once fitted.
 
     Example:
-        >>> train, test = cohort.split(test_size=0.2, random_state=0)
+        >>> train_idx, test_idx = cohort.split(test_size=0.2, random_state=0, stratify=True)
         >>> fitted_train = train.fit_transform()
         >>> fitted_test = fitted_train.transform(test)
         >>> encoder = TabICLEncoder().fit(fitted_train)
         >>> Z_test = encoder.encode(fitted_test)      # (n_test, 512)
 
     Note:
-        Rows that are in the context see their own label when they are encoded, so
-        ``encoder.encode(train)`` -- where ``train`` is the same data the encoder
-        was fitted on -- is optimistic relative to ``encode(test)``. That is
-        inherent to in-context learning rather than a defect here, but a head
-        fitted on training representations and applied to held-out ones is
-        crossing a distribution boundary. Removing it properly needs cross-fitted
+        Context rows see their own label when encoded, so ``encode(train)`` is
+        optimistic relative to ``encode(test)``. That is inherent to in-context
+        learning, but a head fitted on training representations and applied to held-out
+        ones is crossing a distribution boundary. Fixing it properly needs cross-fitted
         or leave-one-out contexts, which this class does not do.
     """
 
@@ -214,8 +188,7 @@ class TabICLEncoder:
         """Width of the representation, read from the loaded checkpoint.
 
         Raises:
-            NotFittedError: Before :meth:`fit`. The width is a property of the
-                checkpoint, which is not loaded until then.
+            NotFittedError: Before :meth:`fit`, which is when the checkpoint loads.
         """
         self._check_fitted()
         model = self._clf.model_
@@ -224,23 +197,17 @@ class TabICLEncoder:
     def fit(self, dataset: CohortView) -> TabICLEncoder:
         """Absorb ``dataset`` as the in-context example set.
 
-        No gradient step happens here -- TabICL predicts by conditioning on context
-        rows, so "fitting" is storing them. Pass a *training fold only*: a context
-        drawn from the whole cohort leaks held-out rows into every representation,
-        and no amount of correct ``ColumnTransformer`` handling catches it.
-
-        Args:
-            dataset (CohortView): Training rows. Must carry a preprocessor (its own transforms
-                applied) and must carry a target.
+        No gradient step: TabICL conditions on context rows, so "fitting" is storing
+        them. Pass a *training fold only* -- a context drawn from the whole cohort leaks
+        held-out rows into every representation, and no amount of correct
+        ``ColumnTransformer`` handling catches it.
 
         Returns:
-            TabICLEncoder: A new, fitted encoder. ``self`` is unchanged, so folds
-            stay independent and can be fitted in parallel.
+            TabICLEncoder: A new, fitted encoder. ``self`` is unchanged.
 
         Raises:
             ValueError: If ``dataset`` has no target to draw context labels from.
             TypeError: If the target cannot supply the requested ``context_label``.
-            NotFittedError: If ``dataset``'s own transforms are unfitted.
         """
         target = dataset.cohort.target
         if target is None:
@@ -250,9 +217,8 @@ class TabICLEncoder:
                 "dataset with target=SurvivalTarget(...)."
             )
 
-        # Asked for by capability rather than by type. The Target protocol deliberately
-        # stops at bind/for_ -- event language is not universal to every target -- so a
-        # survival-specific need is checked here, where it is needed, and named in full.
+        # Asked for by capability, not type: event language is not part of the Target
+        # contract, so a survival-specific need is checked where it is needed.
         labels_for = getattr(target, "events_for", None)
         if labels_for is None:
             raise TypeError(
@@ -295,29 +261,22 @@ class TabICLEncoder:
     def encode(self, dataset: CohortView) -> Tensor:
         """Return one representation per sample, in ``dataset.identifiers`` order.
 
-        Rows are appended after the context and embedded against it in a single
-        forward pass; the context's own representations are discarded.
-
-        Args:
-            dataset (CohortView): Rows to encode. For held-out data, build the view
-                with the training fold's statistics first.
+        Rows are appended after the context and embedded against it in one forward
+        pass; the context's own representations are discarded.
 
         Returns:
             Tensor: ``(len(dataset), out_dim)``, float32.
 
         Raises:
-            NotFittedError: If :meth:`fit` has not been called, or if ``dataset``'s
-                own transforms are unfitted.
+            NotFittedError: If :meth:`fit` has not been called.
             ValueError: If ``dataset`` has a different feature width than the context.
         """
         self._check_fitted()
         X = _matrix(dataset)
 
-        # This wrapper goes straight to the model and so skips TabICL's own input
-        # validation. Width mismatches are routine -- a one-hot encoder fitted on a
-        # fold that happened to contain a rare category emits a column the next fold
-        # does not -- and would otherwise surface as a shape error inside the
-        # transformer, far from the transform that caused it.
+        # Going straight to the model skips TabICL's own input validation, and width
+        # mismatches are routine -- a one-hot encoder fitted on one fold can emit a
+        # column the next one's does not. Caught here rather than deep in the transformer.
         expected = int(self._clf.n_features_in_)
         if X.shape[1] != expected:
             raise ValueError(
@@ -339,15 +298,12 @@ class TabICLEncoder:
         clf = self._clf
         model = clf.model_
 
-        # ColEmbedding.forward branches on self.training, so the module's mode changes
-        # what comes back -- and the module is shared between every encoder using this
-        # checkpoint. Asserting eval here rather than assuming it keeps one encoder from
-        # silently altering another's output. Idempotent, and already true after fit.
+        # ColEmbedding.forward branches on self.training, and the module is shared with
+        # every other encoder on this checkpoint. Asserted, not assumed.
         model.eval()
 
-        # Reuse TabICL's own preprocessing: X_encoder_ handles dtypes and missingness,
-        # ensemble_generator_ applies the normalisation the checkpoint was trained with
-        # and re-attaches the stored context rows. mode="both" returns context+query.
+        # TabICL's own preprocessing: dtypes and missingness, then the normalisation the
+        # checkpoint was trained with, re-attaching the stored context rows.
         prepared = clf.X_encoder_.transform(X)
         data = clf.ensemble_generator_.transform(prepared, mode="both")
 
@@ -375,12 +331,10 @@ class TabICLEncoder:
     # ------------------------------------------------------------------ #
 
     def _check_fitted(self) -> None:
-        """Guard the unfitted case, naming the likeliest cause first.
+        """Guard the unfitted case, naming the likeliest cause: a *discarded* fit.
 
-        That cause is almost never a forgotten ``fit`` -- it is a *discarded* one.
-        ``fit`` returns a new encoder rather than mutating this one, so the sklearn
-        reflex of writing ``encoder.fit(train)`` on its own line leaves ``encoder``
-        unfitted and fails here instead, one call later than the mistake.
+        ``fit`` returns a new encoder, so the sklearn reflex of ``encoder.fit(train)``
+        on its own line leaves ``encoder`` unfitted and fails one call later.
         """
         if not self.is_fitted:
             raise NotFittedError(

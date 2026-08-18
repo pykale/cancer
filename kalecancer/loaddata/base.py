@@ -1,26 +1,17 @@
 """The cohort: an index over samples, built once and read by every fold.
 
-Loading happens in two distinct phases, and keeping them apart is what lets one
-base class serve a 400-row clinical table and a cohort of gigapixel slides:
+Loading is two phases, which is what lets one base class serve a 400-row clinical
+table and a cohort of gigapixel slides: :meth:`Cohort._load_index` runs once and
+populates ``identifiers`` only; :meth:`Cohort.payload` reads one sample on demand.
 
-1. **Index** -- read once at construction by :meth:`Cohort._load_index`. It
-   populates ``self.identifiers`` and nothing else. This is cheap for every
-   modality: parsing a CSV for tabular data, reading a tile manifest for WSI. It
-   must never touch payload.
-2. **Payload** -- read per sample by :meth:`Cohort.payload`. This is where a
-   slide is opened and a tile bag is actually pulled off disk.
+Fitted state belongs to neither. A cohort is never fitted --
+:meth:`Cohort.fit_preprocessor` returns a separate artifact scoped to the rows it
+was given, and :meth:`Cohort.view` pairs a row subset with one to make a
+:class:`~kalecancer.loaddata.view.CohortView`, the only ``Dataset`` in the package.
 
-Fitted state sits between the two, and belongs to neither. A cohort is never
-fitted: :meth:`Cohort.fit_preprocessor` returns a *separate*
-:class:`~kalecancer.loaddata.protocols.Preprocessor` artifact scoped to the rows
-it was given, and :meth:`Cohort.view` pairs a row subset with one of those
-artifacts to produce a :class:`~kalecancer.loaddata.view.CohortView` -- the only
-``torch.utils.data.Dataset`` in this package.
-
-That three-way split is the design. The cohort is shared and immutable; the
-preprocessor and the view live for exactly one fold and may be mutated freely,
-because nothing outside that fold can see them. You cannot build a view without
-naming a preprocessor, so "which statistics is this fold using" is never implicit.
+The cohort is shared and never mutated; preprocessors and views live for one fold.
+You cannot build a view without naming a preprocessor, so which statistics a fold
+uses is never implicit.
 """
 
 from __future__ import annotations
@@ -49,30 +40,23 @@ class NotFittedError(RuntimeError):
 
 
 class LeakageError(RuntimeError):
-    """Raised when a preprocessor's fitted rows overlap rows it is applied to as held-out data.
-
-    This is not a corner case caught defensively. It is the single most likely way
-    to produce a result that looks good, runs clean, and is wrong.
-    """
+    """Raised when a preprocessor's fitted rows overlap rows it is applied to as held out."""
 
 
 class Cohort(ABC):
     """An identifier-keyed index over samples. Built once, read by every fold.
 
-    ``self.identifiers`` is the single ordering authority. A composite cohort must
-    reach into its components by identifier and never by positional index --
-    otherwise two components can silently disagree about which sample row ``5``
-    refers to, which trains perfectly and means nothing.
+    ``self.identifiers`` is the single ordering authority. A composite must reach into
+    its components by identifier, never by position, or two components can disagree
+    about which sample row ``5`` is -- which trains perfectly and means nothing.
 
     Args:
-        path (str | Path | None, optional): Source to read the index from. ``None``
-            for composite cohorts, which take their index from their components,
-            and for subclasses given an already-loaded object instead of a file.
-        name (str, optional): Key under which this cohort's features appear in
+        path (str | Path | None, optional): Source for the index. ``None`` for
+            composites, and for subclasses given an already-loaded object.
+        name (str, optional): Key for this cohort's features in
             ``PatientSample.modalities``. Defaults to ``"features"``.
-        target (Target | None, optional): Supervision target. ``None`` for a pure
-            feature provider, such as a slide cohort that carries no labels of its
-            own. See :class:`~kalecancer.loaddata.protocols.Target`.
+        target (Target | None, optional): Supervision. ``None`` for a pure feature
+            provider, such as a slide cohort carrying no labels of its own.
 
     Raises:
         TypeError: If ``target`` does not satisfy the ``Target`` contract.
@@ -103,9 +87,8 @@ class Cohort(ABC):
     def _has_index_source(self) -> bool:
         """Whether there is anything for :meth:`_load_index` to read at construction.
 
-        A path is the usual source but not the only one: a subclass may accept an
-        already-loaded table, and a composite takes its index from its components.
-        Override wherever ``self.path`` is not the whole story.
+        Override wherever ``self.path`` is not the whole story -- a subclass given a
+        loaded table, or a composite taking its index from its components.
         """
         return self.path is not None
 
@@ -113,44 +96,35 @@ class Cohort(ABC):
     def _load_index(self) -> None:
         """Read the index and populate ``self.identifiers``.
 
-        Called once, at construction. Must not read payload: for a slide cohort
-        this reads a tile manifest, it does not open any images.
+        Called once, at construction. Must not read payload -- for a slide cohort this
+        reads a tile manifest and opens no images.
         """
 
     @abstractmethod
     def fit_preprocessor(self, indices: Indices) -> Preprocessor | None:
         """Fit transforms on the given rows only, and return them as a new artifact.
 
-        The cohort is not modified. Fitting is scoped to ``indices``, so a fold is
-        fitted by passing that fold's training indices and can never see statistics
-        computed outside it.
+        The cohort is not modified, so a fold can never see statistics from outside it.
 
         Args:
-            indices (Indices): Positional indices into ``self.identifiers``.
+            indices (Indices): Positional indices, normally one fold's training rows.
 
         Returns:
-            Preprocessor | None: The fitted artifact, or ``None`` when this cohort
-            declares nothing to fit. ``None`` is a legitimate answer, not a failure
-            -- a view built with it serves untransformed values.
+            Preprocessor | None: The fitted artifact, or ``None`` when this cohort has
+            nothing to fit. ``None`` is a legitimate answer, not a failure.
         """
 
     @abstractmethod
     def payload(self, identifier: str, prep: Preprocessor | None) -> dict[str, Tensor]:
         """Return this cohort's contribution to ``PatientSample.modalities``.
 
-        Lazy by contract. This is where a slide is opened, a memmap is read, or a
-        tile bag is sampled, and it runs inside a DataLoader worker. It **may be
-        stochastic** -- a slide cohort resamples tiles every epoch -- so nothing
-        may assume two calls with the same arguments return the same tensor.
-
-        Args:
-            identifier (str): Sample identifier, as found in ``self.identifiers``.
-            prep (Preprocessor | None): This fold's fitted state.
+        Lazy by contract, and runs inside a DataLoader worker. **May be stochastic** --
+        a slide cohort resamples tiles every epoch -- so nothing may assume two calls
+        return the same tensor.
 
         Returns:
             dict[str, Tensor]: Usually ``{self.name: tensor}``. Shapes are
-            modality-specific: ``(d,)`` for a tabular row, ``(n_tiles, d)`` for a
-            slide's feature bag.
+            modality-specific: ``(d,)`` for a tabular row, ``(n_tiles, d)`` for a bag.
         """
 
     # ------------------------------------------------------------------ #
@@ -160,39 +134,25 @@ class Cohort(ABC):
     def payload_bulk(self, identifiers: Sequence[str], prep: Preprocessor | None) -> dict[str, Tensor] | None:
         """Transform every sample in one call, for modalities cheap enough to allow it.
 
-        Returns ``None`` by default, and :class:`~kalecancer.loaddata.view.CohortView`
-        falls back to per-sample :meth:`payload`.
+        ``None`` by default, and a view falls back to per-sample :meth:`payload`.
+        Overriding it is how a cohort opts into caching. ``TabularCohort`` does, because
+        per-row scikit-learn calls would dominate the loop. **A slide cohort must not**:
+        its payload is stochastic, so a cached block would freeze one tile draw for a
+        whole run.
 
-        ``TabularCohort`` overrides this because calling scikit-learn's ``transform``
-        once per row would dominate the training loop for a table small enough to
-        transform whole. **A slide cohort must not override it**: its payload is
-        stochastic, so caching would silently freeze one tile draw for an entire
-        run, and its bags do not fit in memory anyway.
-
-        Lazy is the contract; this is the exception, and opting in is how a view
-        learns it is allowed to cache.
-
-        **Rows must come back in the order of ``identifiers``.** A view reads the
-        block positionally while taking each patient's identifier from its own
-        index, so a cohort returning rows in any other order pairs every patient
-        with someone else's features -- which trains perfectly and means nothing.
-        :class:`~kalecancer.loaddata.view.CohortView` checks the row count and spot
-        checks the first row against :meth:`payload`, but the contract is yours to
-        keep.
-
-        Implementing this also asserts that :meth:`payload` is **deterministic** for
-        this cohort: the two paths must agree, and a view will hold the cached block
-        for its whole lifetime. An empty ``identifiers`` must return empty tensors
-        rather than raising -- an empty fold is a legitimate thing to build.
+        Implementing this asserts three things. Rows come back in ``identifiers`` order
+        -- a view reads the block positionally, so any other order pairs patients with
+        the wrong features. :meth:`payload` is deterministic, since the two paths must
+        agree. An empty ``identifiers`` returns empty tensors rather than raising.
         """
         return None
 
     def present(self, identifier: str) -> dict[str, Tensor]:
         """Whether each of this cohort's modalities is available for one sample.
 
-        A single-modality cohort holds data for every identifier it indexed, so the
-        default is unconditionally ``True``. Composite cohorts override this: they
-        may carry a patient who has a clinical record but no usable slide.
+        Unconditionally ``True`` here, since a single-modality cohort holds data for
+        every identifier it indexed. Composites override it: a patient may have a
+        clinical record but no usable slide.
         """
         return {self.name: torch.tensor(True)}
 
@@ -203,15 +163,8 @@ class Cohort(ABC):
     def view(self, indices: Indices, preprocessor: Preprocessor | None) -> CohortView:
         """Pair a row subset with a fitted preprocessor to make a torch Dataset.
 
-        Args:
-            indices (Indices): Positional indices into ``self.identifiers``.
-            preprocessor (Preprocessor | None): This fold's fitted state, from
-                :meth:`fit_preprocessor`. Required, even when it is ``None``:
-                passing it explicitly is what keeps a fold's provenance visible at
-                the call site rather than buried in object state.
-
-        Returns:
-            CohortView: A dataset over those rows under that preprocessor.
+        ``preprocessor`` is required even when ``None``: passing it explicitly keeps a
+        fold's provenance at the call site rather than buried in object state.
         """
         return CohortView(self, indices, preprocessor)
 
@@ -219,28 +172,27 @@ class Cohort(ABC):
         self,
         test_size: float = 0.2,
         random_state: int | None = None,
-        stratify: bool | np.ndarray = True,
+        *,
+        stratify: bool | np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Split into two sets of **indices**, stratified where possible.
+        """Split into two sets of **indices**, balanced on what you name.
 
-        Returns indices rather than cohorts so that it composes with scikit-learn's
-        splitters and so that a cohort is never something you have to re-split.
-
-        Stratifying matters at clinical cohort sizes: an unstratified 20% split of a
-        few hundred patients can easily land with a badly skewed event rate.
+        Indices rather than cohorts, so this composes with scikit-learn's splitters.
 
         Args:
             test_size (float, optional): Proportion held out. Defaults to 0.2.
             random_state (int | None, optional): Seed.
-            stratify (bool | np.ndarray, optional): ``True`` asks the target for
-                labels to stratify on, ``False`` disables it, or pass an array to
-                stratify on something of your own choosing. Defaults to ``True``.
+            stratify (bool | np.ndarray): **Required, no default.** ``True`` asks the
+                target for labels, ``False`` disables it, or pass an array. Required
+                because it changes the numbers you report and leaves no trace when
+                wrong -- an unstratified 20% split of a few hundred patients can land
+                several points off on the event rate.
 
         Returns:
             tuple[np.ndarray, np.ndarray]: Train and test indices, each sorted.
 
         Raises:
-            TypeError: If ``stratify=True`` but the target cannot supply labels.
+            TypeError: If ``stratify=True`` but no target can supply labels.
         """
         labels = self._stratify_labels(stratify)
         train_idx, test_idx = train_test_split(
@@ -254,13 +206,16 @@ class Cohort(ABC):
             return None
         if not isinstance(stratify, bool):
             return np.asarray(stratify)
-        if self.target is None:
-            return None
 
-        # Asked for by capability rather than required of every Target. What is worth
-        # stratifying on is task-specific -- the event indicator for survival, the
-        # class for classification -- and there is no sensible universal answer, so
-        # this stays an optional extension rather than bloating the contract.
+        if self.target is None:
+            raise TypeError(
+                "stratify=True needs a target to take labels from, and this cohort has "
+                "none. Pass stratify=False to split at random, or pass an array to "
+                "balance on something of your own choosing."
+            )
+
+        # Optional extension, not part of the Target contract: what is worth
+        # stratifying on is task-specific and has no universal answer.
         labels_for = getattr(self.target, "stratify_labels", None)
         if labels_for is None:
             raise TypeError(

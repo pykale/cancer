@@ -235,8 +235,7 @@ def test_summarise_follows_up_only_the_censored(frame, make_target):
     """Median follow-up over everyone would be a different, wrong number."""
     target = bind(make_target(), frame)
     censored = frame.loc[frame[EVENT_COLUMN] != EVENT_VALUE, TIME_COLUMN]
-    expected = np.median(censored) / 365.25 * 12.0
-    assert f"{expected:.1f} months" in target.summarise(frame["patient_id"].tolist())
+    assert f"{np.median(censored):.1f}" in target.summarise(frame["patient_id"].tolist())
 
 
 def test_summarise_omits_follow_up_when_every_sample_had_the_event(frame, make_target):
@@ -249,23 +248,37 @@ def test_summarise_on_no_identifiers_does_not_divide_by_zero(frame, make_target)
     assert "0 events" in bind(make_target(), frame).summarise([])
 
 
-@pytest.mark.parametrize(("unit", "per_year"), [("days", 365.25), ("months", 12.0), ("years", 1.0)])
-def test_summarise_converts_the_declared_unit_to_months(frame, make_target, unit, per_year):
+@pytest.mark.parametrize("unit", [None, "days", "months", "years", "cycles"])
+def test_the_reported_median_is_the_columns_own_median_whatever_the_unit(frame, make_target, unit):
+    """Nothing is converted, so no declared unit can make the number wrong."""
     target = bind(make_target(unit=unit), frame)
     censored = frame.loc[frame[EVENT_COLUMN] != EVENT_VALUE, TIME_COLUMN]
-    expected = np.median(censored) / per_year * 12.0
-    assert f"{expected:.1f} months" in target.summarise(frame["patient_id"].tolist())
+    summary = target.summarise(frame["patient_id"].tolist())
+
+    assert f"{np.median(censored):.1f}" in summary
+    assert (unit or SurvivalTarget.GENERIC_UNIT) in summary
 
 
-@pytest.mark.parametrize("unit", ["DAYS", " Days ", "days"])
-def test_unit_is_case_and_whitespace_insensitive(unit):
-    assert SurvivalTarget(time="t", event="e", unit=unit).unit == "days"
+def test_no_unit_reports_a_scale_free_label(frame, make_target):
+    """The default states nothing about the column, which is why it cannot be wrong."""
+    assert "time units" in bind(make_target(unit=None), frame).summarise(frame["patient_id"].tolist())
 
 
-def test_unknown_unit_raises_at_construction_and_lists_the_accepted_ones():
-    """``'day'`` silently meaning ``'years'`` would be a 365x error."""
-    with pytest.raises(ValueError, match="Unknown time unit"):
-        SurvivalTarget(time="t", event="e", unit="day")
+def test_a_unit_is_a_label_and_never_arithmetic(frame, make_target):
+    """A unit has no correct arithmetic to do: the partial likelihood and the c-index
+    are built from the ordering of event times, so rescaling changes nothing."""
+    censored = frame.loc[frame[EVENT_COLUMN] != EVENT_VALUE, TIME_COLUMN]
+    reported = [
+        bind(make_target(unit=u), frame).summarise(frame["patient_id"].tolist()).split("follow-up ")[1].split()[0]
+        for u in ("days", "months", "years")
+    ]
+    assert reported == [f"{np.median(censored):.1f}"] * 3
+
+
+@pytest.mark.parametrize(("given", "expected"), [(" days ", "days"), ("Days", "Days"), (None, None)])
+def test_unit_is_stripped_but_otherwise_untouched(given, expected):
+    """A free label, so case is the caller's business; only stray whitespace goes."""
+    assert SurvivalTarget(time="t", event="e", unit=given).unit == expected
 
 
 def test_repr_surfaces_the_event_rate_once_bound(frame, make_target):

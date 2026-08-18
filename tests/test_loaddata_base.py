@@ -292,9 +292,8 @@ def test_a_cohort_that_volunteers_a_bulk_path_is_cached(index_path):
 def test_a_stochastic_payload_is_never_cached(index_path):
     """The guarantee a slide cohort depends on.
 
-    Tile sampling is per-epoch, so caching would freeze one draw for an entire
-    run -- invisibly, and it would look like it was working. A cohort opts into
-    caching by implementing ``payload_bulk``; one that does not, cannot be cached.
+    Tile sampling is per-epoch, so caching would freeze one draw for a whole run and
+    look like it was working. Caching is opt-in via ``payload_bulk``.
     """
     cohort = StochasticToyCohort(index_path)
     view = cohort.view(range(4), None)
@@ -367,14 +366,26 @@ def test_split_indices_come_back_sorted(toy):
     assert list(train_idx) == sorted(train_idx)
 
 
-def test_split_without_a_target_does_not_stratify(toy):
-    train_idx, test_idx = toy.split(test_size=0.2, random_state=0)
+def test_asking_to_stratify_without_a_target_raises(toy):
+    """A request that cannot be honoured is refused, not quietly ignored."""
+    with pytest.raises(TypeError, match="needs a target to take labels from"):
+        toy.split(test_size=0.2, random_state=0, stratify=True)
+
+
+def test_stratify_is_required(toy):
+    """No default: what a split balances on changes the numbers and leaves no trace."""
+    with pytest.raises(TypeError, match="stratify"):
+        toy.split(test_size=0.2, random_state=0)
+
+
+def test_splitting_without_stratification_is_spelled_out(toy):
+    train_idx, test_idx = toy.split(test_size=0.2, random_state=0, stratify=False)
     assert len(train_idx) + len(test_idx) == len(toy)
 
 
 def test_split_asks_the_target_for_stratification_labels(index_path):
     cohort = ToyCohort(index_path, target=StubTarget())
-    train_idx, test_idx = cohort.split(test_size=0.4, random_state=0)
+    train_idx, test_idx = cohort.split(test_size=0.4, random_state=0, stratify=True)
     labels = [int(cohort.identifiers[i]) % 2 for i in test_idx]
     assert sorted(labels) == [0, 0, 1, 1], "both classes represented in proportion"
 
@@ -393,7 +404,7 @@ def test_split_refuses_to_stratify_on_a_target_that_cannot(index_path):
 
     cohort = ToyCohort(index_path, target=Bare())
     with pytest.raises(TypeError, match="stratify_labels"):
-        cohort.split(test_size=0.2)
+        cohort.split(test_size=0.2, stratify=True)
 
 
 def test_split_accepts_explicit_labels(toy):
@@ -425,9 +436,8 @@ def test_a_view_without_a_preprocessor_reports_no_feature_names(toy):
 def test_feature_names_pass_through_per_modality_untouched(index_path):
     """A composite preprocessor names several modalities; the view must not reshape.
 
-    The view used to wrap whatever it found under the cohort's own single name,
-    which turned a per-modality dict into a list of its keys -- feature names
-    silently became modality names.
+    Wrapping them under the cohort's single name turns the dict into a list of its
+    keys, so feature names silently become modality names.
     """
 
     class Composite:

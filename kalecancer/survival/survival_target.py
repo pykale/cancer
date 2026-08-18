@@ -1,13 +1,11 @@
 """Supervision targets, keyed by sample identifier.
 
-A target is bound once, at load time, against the values that carry it. It is keyed
-by identifier rather than by row position, which is what lets a cohort be subset,
-split and recombined without the target ever needing realignment.
+Bound once at load time and keyed by identifier rather than row position, so a cohort
+can be subset and recombined without the target needing realignment.
 
-Nothing here is cancer-specific, tabular-specific, or dependent on pandas:
-``SurvivalTarget`` is the piece most likely to move into PyKale core alongside the
-survival heads, losses and metrics that consume it, so it takes plain arrays and
-keeps its dependencies to numpy and torch.
+Nothing here is cancer-specific, tabular-specific or dependent on pandas:
+``SurvivalTarget`` is the piece most likely to move into PyKale core, so it takes
+plain arrays and depends only on numpy and torch.
 """
 
 from __future__ import annotations
@@ -23,20 +21,13 @@ from torch import Tensor
 
 
 def _is_missing(value: Any) -> bool:
-    """Whether one value is absent, across the dtypes a table can produce.
-
-    Covers ``None`` and float ``NaN``, which is what a blank cell becomes whether
-    the surrounding column was read as object, float, or a mix.
-    """
+    """Whether one value is absent: ``None`` or float ``NaN``, whatever the column dtype."""
     return value is None or (isinstance(value, float) and math.isnan(value))
 
 
 def _as_float(value: Any) -> float:
-    """Coerce one value to float, returning NaN rather than raising.
-
-    Failures are collected and reported together by the caller, naming the samples
-    involved -- more useful than the first exception numpy would throw.
-    """
+    """Coerce to float, returning NaN rather than raising, so the caller can name
+    every offending sample at once."""
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -46,44 +37,36 @@ def _as_float(value: Any) -> float:
 class SurvivalTarget:
     """Right-censored survival target: a time and an event indicator.
 
-    The columns are named rather than positional, and the value that means "the
-    event happened" is declared explicitly. Both choices exist to stop the same
-    silent bug: with a positional ``[time, status]`` pair or an assumed ``1 ==
-    event`` coding, getting it backwards runs cleanly and predicts survival
-    inverted.
+    Columns are named rather than positional, and the value meaning "the event
+    happened" is declared. Both stop the same silent bug: a positional ``[time,
+    status]`` pair or an assumed ``1 == event`` coding runs cleanly when reversed, and
+    predicts survival inverted.
 
     Args:
         time (str): Column holding follow-up time.
         event (str): Column holding the event indicator.
-        event_value (Any, optional): Value(s) in ``event`` meaning the event was
-            observed, e.g. ``"deceased"`` or ``1``. Any other *recorded* value is
-            treated as censored, which is what makes a competing-risks coding work:
-            with ``0/1/2`` and ``event_value=1``, deaths from other causes are
-            censored, the cause-specific convention. A *missing* value is not a
-            value and raises -- see :meth:`bind`. Defaults to ``1``.
-        unit (str, optional): Unit of the ``time`` column, one of ``"days"``,
-            ``"weeks"``, ``"months"``, ``"years"``. Case-insensitive. Defaults to
-            ``"days"``.
+        event_value (Any, optional): Value(s) meaning the event was observed. Any other
+            *recorded* value is censored, which is what makes competing risks work:
+            with ``0/1/2`` and ``event_value=1``, other-cause deaths are censored --
+            the cause-specific convention. A *missing* value raises. Defaults to ``1``.
+        unit (str | None, optional): What one unit of ``time`` is called. **A display
+            label only** -- nothing is converted, so it cannot make a result wrong.
+            ``None`` reports follow-up in "time units", right whatever the column holds.
 
     Raises:
-        ValueError: On construction, if ``unit`` is not a recognised time unit.
-        ValueError: On :meth:`bind`, if times or statuses are invalid or absent, or
-            the resulting event rate is 0% or 100% -- all of which indicate a
-            mis-specified target rather than an unusual cohort.
+        ValueError: On :meth:`bind`, if times or statuses are invalid or absent, or the
+            event rate is 0% or 100% -- a mis-specified target, not an unusual cohort.
     """
 
-    _PER_YEAR = {"days": 365.25, "months": 12.0, "years": 1.0, "weeks": 52.18}
+    #: Used when no ``unit`` was given. Reporting the median in the column's own
+    #: scale is correct whatever that scale is, so there is nothing left to assume.
+    GENERIC_UNIT = "time units"
 
-    def __init__(self, time: str, event: str, event_value: Any = 1, unit: str = "days"):
+    def __init__(self, time: str, event: str, event_value: Any = 1, unit: str | None = None):
         self.time = time
         self.event = event
         self.event_values = list(event_value) if isinstance(event_value, list | tuple | set) else [event_value]
-        # Validated here rather than defaulted at the point of use: the vocabulary is
-        # four strings typed by hand, so 'day' or 'DAYS' silently meaning 'years' is a
-        # 365x error in a number whose job is to make mis-specification visible.
-        self.unit = str(unit).strip().lower()
-        if self.unit not in self._PER_YEAR:
-            raise ValueError(f"Unknown time unit '{unit}'. Expected one of {sorted(self._PER_YEAR)}.")
+        self.unit = None if unit is None else str(unit).strip()
         self._row_of: dict[str, int] = {}
         self._times: Tensor = torch.empty(0)
         self._events: Tensor = torch.empty(0)
@@ -96,14 +79,9 @@ class SurvivalTarget:
     def bind(self, identifiers: Sequence[str], values: Mapping[str, ArrayLike]) -> None:
         """Extract and validate times and events, keyed by identifier.
 
-        Args:
-            identifiers (Sequence[str]): Sample identifiers, in row order.
-            values (Mapping[str, ArrayLike]): Arrays for :attr:`required_columns`,
-                aligned with ``identifiers``.
-
         Raises:
-            ValueError: On non-numeric or negative times, a missing event status, or
-                a degenerate event rate.
+            ValueError: On non-numeric or negative times, a missing event status, or a
+                degenerate event rate.
         """
         ids = list(identifiers)
         raw_times = np.asarray(values[self.time], dtype=object).ravel()
@@ -144,9 +122,8 @@ class SurvivalTarget:
                 f"'{self.event}', which cannot be right. Observed values: {observed}"
             )
 
-        # Stored as tensors rather than dicts of Python floats so that for_() returns
-        # a view instead of allocating two tensors per sample per epoch, and so the
-        # array-returning accessors below are gathers rather than list comprehensions.
+        # Tensors rather than dicts of floats: for_() then returns a view instead of
+        # allocating two tensors per sample per epoch.
         self._row_of = {identifier: i for i, identifier in enumerate(ids)}
         self._times = torch.tensor(times, dtype=torch.float32)
         self._events = torch.tensor(events, dtype=torch.float32)
@@ -167,10 +144,7 @@ class SurvivalTarget:
     def stratify_labels(self, identifiers: Sequence[str]) -> np.ndarray:
         """Labels to stratify a split on: the event indicator.
 
-        The optional half of the ``Target`` contract, used by
-        :meth:`~kalecancer.loaddata.base.Cohort.split`. Event status is what matters
-        to balance here -- an unstratified 20% split of a few hundred patients can
-        easily land with a badly skewed event rate.
+        The optional half of the ``Target`` contract, used by ``Cohort.split``.
         """
         return self.events_for(identifiers)
 
@@ -188,8 +162,7 @@ class SurvivalTarget:
         # Median follow-up among the censored: the simple approximation, not reverse KM.
         censored = times[events == 0]
         if censored.size:
-            months = np.median(censored) / self._PER_YEAR[self.unit] * 12.0
-            parts.append(f"median follow-up {months:.1f} months")
+            parts.append(f"median follow-up {np.median(censored):.1f} {self.unit or self.GENERIC_UNIT}")
         return " | ".join(parts)
 
     def __repr__(self) -> str:

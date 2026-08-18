@@ -274,7 +274,7 @@ def test_held_out_rows_use_train_statistics_exactly(cohort):
     declared pipeline by hand, fitted on exactly the training rows, and demands an
     exact match. Any statistic computed from the test rows breaks it.
     """
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0)
+    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
     prep = cohort.fit_preprocessor(train_idx)
     test_view = cohort.view(test_idx, prep)
 
@@ -293,7 +293,7 @@ def test_held_out_rows_use_train_statistics_exactly(cohort):
 
 def test_the_standardised_test_mean_is_not_zero(cohort):
     """The cheap smoke signal, kept because it is the one a human can eyeball."""
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0)
+    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
     prep = cohort.fit_preprocessor(train_idx)
 
     assert matrix_of(cohort.view(train_idx, prep))[:, 0].mean() == pytest.approx(0.0, abs=1e-5)
@@ -329,14 +329,10 @@ def test_an_unseen_category_at_test_time_does_not_crash(cohort):
 
 
 def test_a_cohort_cannot_be_split_into_a_fitted_state(cohort):
-    """The old ``split() after fit`` trap cannot be expressed any more.
-
-    ``split`` returns indices and a cohort holds no fitted state, so there is
-    nothing for either half to inherit. The guard that used to be needed here is
-    gone because the failure mode is gone.
-    """
+    """The ``split() after fit`` trap cannot be expressed: ``split`` returns indices and
+    a cohort holds no fitted state, so neither half inherits anything."""
     cohort.fit_preprocessor(range(len(cohort)))
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0)
+    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
     assert set(train_idx).isdisjoint(test_idx)
 
 
@@ -346,14 +342,14 @@ def test_a_cohort_cannot_be_split_into_a_fitted_state(cohort):
 
 
 def test_split_is_disjoint_and_exhaustive(cohort):
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0)
+    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
     assert len(train_idx) + len(test_idx) == len(cohort)
     assert set(train_idx).isdisjoint(test_idx)
     assert set(train_idx) | set(test_idx) == set(range(len(cohort)))
 
 
 def test_split_honours_test_size(cohort):
-    _, test_idx = cohort.split(test_size=0.25, random_state=0)
+    _, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
     assert len(test_idx) == round(0.25 * len(cohort))
 
 
@@ -367,7 +363,7 @@ def test_split_is_stratified_on_event_status(cohort):
     overall = event_rate(cohort, cohort.identifiers)
     deviations = []
     for seed in range(20):
-        train_idx, test_idx = cohort.split(test_size=0.25, random_state=seed)
+        train_idx, test_idx = cohort.split(test_size=0.25, random_state=seed, stratify=True)
         for part in (train_idx, test_idx):
             deviations.append(abs(event_rate(cohort, [cohort.identifiers[i] for i in part]) - overall))
 
@@ -377,17 +373,17 @@ def test_split_is_stratified_on_event_status(cohort):
 
 
 def test_split_is_reproducible(cohort):
-    a, _ = cohort.split(test_size=0.25, random_state=7)
-    b, _ = cohort.split(test_size=0.25, random_state=7)
-    c, _ = cohort.split(test_size=0.25, random_state=8)
+    a, _ = cohort.split(test_size=0.25, random_state=7, stratify=True)
+    b, _ = cohort.split(test_size=0.25, random_state=7, stratify=True)
+    c, _ = cohort.split(test_size=0.25, random_state=8, stratify=True)
 
     np.testing.assert_array_equal(a, b)
     assert not np.array_equal(a, c)
 
 
-def test_split_works_without_a_target(make_cohort):
+def test_split_works_without_a_target_when_stratification_is_declined(make_cohort):
     cohort = make_cohort(target=None)
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0)
+    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=False)
     assert len(train_idx) + len(test_idx) == len(cohort)
 
 
@@ -478,11 +474,9 @@ def test_a_dataloader_batches_a_view(cohort):
 
 
 def test_feature_names_are_keyed_by_modality(cohort):
-    """The shape the protocol declares, so a composite preprocessor needs no special case.
+    """The shape the protocol declares, so a composite needs no special case.
 
-    A flat list has nowhere to say which name belongs to which modality, and the
-    view used to paper over that by wrapping it under the cohort's own name -- which
-    silently turned a composite's per-modality dict into a list of modality names.
+    A flat list has nowhere to say which name belongs to which modality.
     """
     view = fitted_view(cohort)
     assert set(view.feature_names) == {"clinical"}
@@ -497,10 +491,10 @@ def test_width_counts_every_modalitys_features(cohort):
 
 
 def test_feature_names_belong_to_the_preprocessor_not_the_cohort(cohort):
-    """One name, one meaning. The cohort declares columns; a fold produces features.
+    """The cohort declares columns; a fold produces features.
 
-    A one-hot encoder fitted on one fold can emit a column the next fold's does
-    not, so "how many features" is only answerable once a fold exists.
+    A one-hot encoder fitted on one fold can emit a column the next one's does not, so
+    "how many features" is only answerable once a fold exists.
     """
     view = fitted_view(cohort)
     assert cohort.feature_columns == CONTINUOUS + CATEGORICAL

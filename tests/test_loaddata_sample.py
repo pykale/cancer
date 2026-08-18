@@ -36,11 +36,10 @@ def sample(pid: str, *, tiles: int | None = None, target: bool = True) -> Patien
 
 
 def test_default_collate_cannot_handle_a_patient_sample():
-    """The measured fact the whole module rests on.
+    """The measured fact the module rests on.
 
-    If a future torch learns to collate dataclasses this test fails, and the
-    right response is to reconsider whether ``collate_samples`` is still needed
-    for fixed-width data -- not to delete the test.
+    If a future torch learns to collate dataclasses this fails; reconsider whether
+    ``collate_samples`` is still needed, rather than deleting the test.
     """
     with pytest.raises(TypeError, match="batch must contain"):
         default_collate([sample("a"), sample("b")])
@@ -101,12 +100,9 @@ def test_padding_is_zero_and_confined_to_the_tail():
 
 
 def test_present_and_pad_mask_are_different_axes():
-    """The reason they are not both called "mask".
-
-    ``present`` is one flag per patient per modality; ``pad_mask`` is one flag per
-    tile within a bag. Conflating them would give a fusion layer the wrong shape
-    and, worse, a plausible one.
-    """
+    """Why they are not both called "mask": one flag per patient per modality, versus
+    one per tile within a bag. Conflating them gives a fusion layer a plausible but
+    wrong shape."""
     batch = collate_samples([sample("a", tiles=1), sample("b", tiles=3)])
 
     assert batch.present["wsi"].shape == (2,)

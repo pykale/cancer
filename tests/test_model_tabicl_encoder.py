@@ -132,7 +132,7 @@ def stub_tabicl(monkeypatch):
 @pytest.fixture
 def folds(cohort):
     """A train view and a test view, both under the train fold's preprocessor."""
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0)
+    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
     prep = cohort.fit_preprocessor(train_idx)
     return cohort.view(train_idx, prep), cohort.view(test_idx, prep)
 
@@ -237,7 +237,7 @@ def test_fit_returns_a_new_encoder_and_leaves_the_original_unfitted(folds):
 
 def test_two_folds_fitted_from_one_encoder_hold_separate_contexts(cohort):
     """The whole point of clone-per-fold: fold B must not inherit fold A's context."""
-    train_idx, _ = cohort.split(test_size=0.25, random_state=0)
+    train_idx, _ = cohort.split(test_size=0.25, random_state=0, stratify=True)
     fold_a = fitted_view(cohort, train_idx[0::2])
     fold_b = fitted_view(cohort, train_idx[1::2])
     encoder = TabICLEncoder()
@@ -257,7 +257,7 @@ def test_folds_share_one_loaded_checkpoint(cohort):
     are read-only here -- no fine-tuning, no gradients, kv_cache off -- so one module
     serves every fold.
     """
-    train_idx, _ = cohort.split(test_size=0.25, random_state=0)
+    train_idx, _ = cohort.split(test_size=0.25, random_state=0, stratify=True)
     encoder = TabICLEncoder()
 
     fitted = [encoder.fit(fitted_view(cohort, train_idx[i::5])) for i in range(5)]
@@ -272,7 +272,7 @@ def test_sharing_weights_does_not_share_the_context(cohort):
     Sharing the module must not let folds see each other's in-context rows -- that
     would make every fold report the last fold's context, silently.
     """
-    train_idx, _ = cohort.split(test_size=0.25, random_state=0)
+    train_idx, _ = cohort.split(test_size=0.25, random_state=0, stratify=True)
     encoder = TabICLEncoder()
 
     fitted = [encoder.fit(fitted_view(cohort, train_idx[i::5])) for i in range(5)]
@@ -428,7 +428,7 @@ def test_encoding_a_differently_shaped_dataset_raises(cohort, make_cohort):
     training fold ends up a different width. Without this guard that surfaces as a
     shape error inside the transformer, nowhere near the transform that caused it.
     """
-    train_idx, _ = cohort.split(test_size=0.25, random_state=0)
+    train_idx, _ = cohort.split(test_size=0.25, random_state=0, stratify=True)
     encoder = TabICLEncoder().fit(fitted_view(cohort, train_idx))
 
     narrower = fitted_view(make_cohort(continuous=["age"], categorical=[]))

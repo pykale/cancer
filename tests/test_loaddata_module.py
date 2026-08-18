@@ -20,7 +20,7 @@ from tests.conftest import CONTINUOUS
 @pytest.fixture
 def folds(cohort):
     """A three-way split: inner train, inner validation, outer test."""
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0)
+    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
     return train_idx[:45], train_idx[45:], test_idx
 
 
