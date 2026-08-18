@@ -24,6 +24,7 @@ import torch
 
 from kalecancer.loaddata.base import NotFittedError
 from kalecancer.model.embed.tabicl import TabICLEncoder
+from tests.conftest import fitted_view, subview
 
 # --------------------------------------------------------------------------- #
 # a stub standing in for TabICLClassifier
@@ -130,15 +131,15 @@ def stub_tabicl(monkeypatch):
 
 @pytest.fixture
 def folds(cohort):
-    """A fitted train fold and a test fold carrying the train fold's statistics."""
-    train, test = cohort.split(test_size=0.25, random_state=0)
-    fitted_train = train.fit_transform()
-    return fitted_train, fitted_train.transform(test)
+    """A train view and a test view, both under the train fold's preprocessor."""
+    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0)
+    prep = cohort.fit_preprocessor(train_idx)
+    return cohort.view(train_idx, prep), cohort.view(test_idx, prep)
 
 
-def first_features(dataset) -> np.ndarray:
-    """Each row's leading feature value, in identifier order."""
-    return np.array([dataset.get_by_id(i)[0].item() for i in dataset.identifiers], dtype=float)
+def first_features(view) -> np.ndarray:
+    """Each row's leading feature value, in the view's own order."""
+    return np.array([view[i].modalities["clinical"][0].item() for i in range(len(view))], dtype=float)
 
 
 # --------------------------------------------------------------------------- #
@@ -167,7 +168,7 @@ def test_encode_preserves_identifier_order(folds):
     train, test = folds
     encoder = TabICLEncoder().fit(train)
 
-    reordered = test.subset(list(reversed(range(len(test)))))
+    reordered = subview(test, reversed(range(len(test))))
     encoded = encoder.encode(reordered)
 
     assert reordered.identifiers == list(reversed(test.identifiers))
@@ -181,7 +182,7 @@ def test_encode_of_a_subset_matches_those_rows_of_the_whole(folds):
 
     whole = encoder.encode(test)
     indices = [0, 3, 7]
-    part = encoder.encode(test.subset(indices))
+    part = encoder.encode(subview(test, indices))
 
     torch.testing.assert_close(part, whole[indices])
 
@@ -236,9 +237,9 @@ def test_fit_returns_a_new_encoder_and_leaves_the_original_unfitted(folds):
 
 def test_two_folds_fitted_from_one_encoder_hold_separate_contexts(cohort):
     """The whole point of clone-per-fold: fold B must not inherit fold A's context."""
-    train, test = cohort.split(test_size=0.25, random_state=0)
-    fold_a = train.subset(range(0, len(train), 2)).fit_transform()
-    fold_b = train.subset(range(1, len(train), 2)).fit_transform()
+    train_idx, _ = cohort.split(test_size=0.25, random_state=0)
+    fold_a = fitted_view(cohort, train_idx[0::2])
+    fold_b = fitted_view(cohort, train_idx[1::2])
     encoder = TabICLEncoder()
 
     a, b = encoder.fit(fold_a), encoder.fit(fold_b)
@@ -256,10 +257,10 @@ def test_folds_share_one_loaded_checkpoint(cohort):
     are read-only here -- no fine-tuning, no gradients, kv_cache off -- so one module
     serves every fold.
     """
-    train, _ = cohort.split(test_size=0.25, random_state=0)
+    train_idx, _ = cohort.split(test_size=0.25, random_state=0)
     encoder = TabICLEncoder()
 
-    fitted = [encoder.fit(train.subset(range(i, len(train), 5)).fit_transform()) for i in range(5)]
+    fitted = [encoder.fit(fitted_view(cohort, train_idx[i::5])) for i in range(5)]
 
     assert len({id(f._clf.model_) for f in fitted}) == 1
     assert _StubClassifier.loads == 1, "the checkpoint was read more than once"
@@ -271,10 +272,10 @@ def test_sharing_weights_does_not_share_the_context(cohort):
     Sharing the module must not let folds see each other's in-context rows -- that
     would make every fold report the last fold's context, silently.
     """
-    train, _ = cohort.split(test_size=0.25, random_state=0)
+    train_idx, _ = cohort.split(test_size=0.25, random_state=0)
     encoder = TabICLEncoder()
 
-    fitted = [encoder.fit(train.subset(range(i, len(train), 5)).fit_transform()) for i in range(5)]
+    fitted = [encoder.fit(fitted_view(cohort, train_idx[i::5])) for i in range(5)]
 
     assert len({id(f._clf) for f in fitted}) == 5
     assert not np.array_equal(fitted[0]._clf.fit_X, fitted[1]._clf.fit_X)
@@ -312,7 +313,7 @@ def test_context_labels_come_from_the_target_event_indicator(folds):
 
     fitted = TabICLEncoder(context_label="event").fit(train)
 
-    expected = train.target.events_for(train.identifiers)
+    expected = train.cohort.target.events_for(train.identifiers)
     np.testing.assert_array_equal(fitted._clf.fit_y, expected.astype(int))
 
 
@@ -360,31 +361,54 @@ def test_out_dim_before_fit_raises():
         _ = TabICLEncoder().out_dim
 
 
-def test_fit_without_a_target_raises(make_dataset):
+def test_fit_without_a_target_raises(make_cohort):
     """TabICL's column embedder is target-aware; a context with no labels is not a context."""
-    dataset = make_dataset(target=None)
-
     with pytest.raises(ValueError, match="needs a dataset with a target"):
-        TabICLEncoder().fit(dataset.fit_transform())
+        TabICLEncoder().fit(fitted_view(make_cohort(target=None)))
 
 
-def test_fit_with_a_target_that_cannot_supply_event_labels_raises(cohort, folds):
-    """``Target`` promises only bind/for_; event language is not universal to targets.
+def test_fit_with_a_target_that_cannot_supply_event_labels_raises(make_cohort):
+    """``Target`` promises only required_columns/bind/for_; event language is not universal.
 
     A target that satisfies the protocol but has no ``events_for`` must be turned
     away by name, not fail later on a missing attribute inside the context build.
     """
-    train, _ = folds
-    train.target = type("LabelTarget", (), {"bind": lambda *a: None, "for_": lambda *a: {}})()
+
+    class LabelTarget:
+        required_columns = ()
+
+        def bind(self, identifiers, values):
+            pass
+
+        def for_(self, identifier):
+            return {}
 
     with pytest.raises(TypeError, match="needs a target providing events_for"):
-        TabICLEncoder().fit(train)
+        TabICLEncoder().fit(fitted_view(make_cohort(target=LabelTarget())))
 
 
-def test_fit_on_a_dataset_with_unfitted_transforms_raises(cohort):
-    """Otherwise the context is built from untransformed columns without complaint."""
-    with pytest.raises(NotFittedError):
-        TabICLEncoder().fit(cohort)
+def test_fit_on_a_multi_modality_view_raises(folds):
+    """This encoder consumes one modality; fusing several is a later stage's job.
+
+    Silently taking the first would encode whichever modality happened to be
+    inserted first into the dict.
+    """
+    train, _ = folds
+
+    class TwoModalities:
+        def __init__(self, view):
+            self.view, self.cohort, self.identifiers = view, view.cohort, view.identifiers
+
+        def __len__(self):
+            return len(self.view)
+
+        def __getitem__(self, i):
+            item = self.view[i]
+            item.modalities = {**item.modalities, "extra": item.modalities["clinical"]}
+            return item
+
+    with pytest.raises(ValueError, match="single-modality view"):
+        TabICLEncoder().fit(TwoModalities(train))
 
 
 def test_encode_an_empty_dataset_raises(folds):
@@ -392,11 +416,11 @@ def test_encode_an_empty_dataset_raises(folds):
     train, test = folds
     encoder = TabICLEncoder().fit(train)
 
-    with pytest.raises(ValueError, match="empty dataset"):
-        encoder.encode(test.subset([]))
+    with pytest.raises(ValueError, match="empty view"):
+        encoder.encode(subview(test, []))
 
 
-def test_encoding_a_differently_shaped_dataset_raises(cohort, make_dataset):
+def test_encoding_a_differently_shaped_dataset_raises(cohort, make_cohort):
     """A fold-fitted one-hot encoder can emit a column the next fold's does not.
 
     Named for the realistic cause: ``handle_unknown='ignore'`` keeps a rare category
@@ -404,11 +428,10 @@ def test_encoding_a_differently_shaped_dataset_raises(cohort, make_dataset):
     training fold ends up a different width. Without this guard that surfaces as a
     shape error inside the transformer, nowhere near the transform that caused it.
     """
-    train, _ = cohort.split(test_size=0.25, random_state=0)
-    encoder = TabICLEncoder().fit(train.fit_transform())
+    train_idx, _ = cohort.split(test_size=0.25, random_state=0)
+    encoder = TabICLEncoder().fit(fitted_view(cohort, train_idx))
 
-    narrower = make_dataset(continuous=["age"], categorical=[])
-    narrower = narrower.fit_transform()
+    narrower = fitted_view(make_cohort(continuous=["age"], categorical=[]))
 
     with pytest.raises(ValueError, match="was fitted on .* features but was given"):
         encoder.encode(narrower)

@@ -37,7 +37,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from kalecancer.loaddata.base import BaseDataset, NotFittedError
+from kalecancer.loaddata.base import NotFittedError
+from kalecancer.loaddata.view import CohortView
 
 #: Context rows must never attend to the rows being encoded. See the module docstring.
 _EMBED_WITH_TEST = False
@@ -103,17 +104,26 @@ def _remember_load(clf, key: tuple) -> None:
     _LOADED[key] = {name: getattr(clf, name) for name in _CHECKPOINT_ATTRS if hasattr(clf, name)}
 
 
-def _matrix(dataset: BaseDataset) -> np.ndarray:
-    """Stack a dataset's feature vectors into ``(n_samples, n_features)``.
+def _matrix(view: CohortView) -> np.ndarray:
+    """Stack a view's feature vectors into ``(n_samples, n_features)``.
 
-    Goes through :meth:`~kalecancer.loaddata.base.BaseDataset.get_by_id` in
-    ``identifiers`` order rather than touching any internal matrix, so rows are
-    keyed by identifier and any dataset implementing the modality contract works
-    here unchanged.
+    Goes through the view's own ``__getitem__`` in its natural order rather than
+    touching any internal matrix, so rows stay aligned with ``view.identifiers``
+    and any cohort implementing the modality contract works here unchanged.
     """
-    if len(dataset) == 0:
-        raise ValueError("Cannot encode an empty dataset.")
-    return np.stack([dataset.get_by_id(i).numpy() for i in dataset.identifiers])
+    if len(view) == 0:
+        raise ValueError("Cannot encode an empty view.")
+    rows = []
+    for i in range(len(view)):
+        modalities = view[i].modalities
+        if len(modalities) != 1:
+            raise ValueError(
+                f"TabICLEncoder needs a single-modality view; this one carries "
+                f"{sorted(modalities)}. Encode each modality with its own encoder and "
+                f"fuse the representations afterwards."
+            )
+        rows.append(next(iter(modalities.values())).numpy())
+    return np.stack(rows)
 
 
 class TabICLEncoder:
@@ -211,7 +221,7 @@ class TabICLEncoder:
         model = self._clf.model_
         return int(model.embed_dim * model.row_num_cls)
 
-    def fit(self, dataset: BaseDataset) -> TabICLEncoder:
+    def fit(self, dataset: CohortView) -> TabICLEncoder:
         """Absorb ``dataset`` as the in-context example set.
 
         No gradient step happens here -- TabICL predicts by conditioning on context
@@ -220,7 +230,7 @@ class TabICLEncoder:
         and no amount of correct ``ColumnTransformer`` handling catches it.
 
         Args:
-            dataset (BaseDataset): Training rows. Must be fitted (its own transforms
+            dataset (CohortView): Training rows. Must carry a preprocessor (its own transforms
                 applied) and must carry a target.
 
         Returns:
@@ -232,7 +242,8 @@ class TabICLEncoder:
             TypeError: If the target cannot supply the requested ``context_label``.
             NotFittedError: If ``dataset``'s own transforms are unfitted.
         """
-        if dataset.target is None:
+        target = dataset.cohort.target
+        if target is None:
             raise ValueError(
                 "TabICLEncoder.fit needs a dataset with a target: TabICL's column embedder "
                 "is target-aware, so the context rows must carry labels. Construct the "
@@ -242,11 +253,11 @@ class TabICLEncoder:
         # Asked for by capability rather than by type. The Target protocol deliberately
         # stops at bind/for_ -- event language is not universal to every target -- so a
         # survival-specific need is checked here, where it is needed, and named in full.
-        labels_for = getattr(dataset.target, "events_for", None)
+        labels_for = getattr(target, "events_for", None)
         if labels_for is None:
             raise TypeError(
                 f"context_label='{self.context_label}' needs a target providing events_for(), "
-                f"which {type(dataset.target).__name__} does not. Use a SurvivalTarget, or add "
+                f"which {type(target).__name__} does not. Use a SurvivalTarget, or add "
                 f"that method to your target."
             )
 
@@ -281,14 +292,14 @@ class TabICLEncoder:
     # encoding
     # ------------------------------------------------------------------ #
 
-    def encode(self, dataset: BaseDataset) -> Tensor:
+    def encode(self, dataset: CohortView) -> Tensor:
         """Return one representation per sample, in ``dataset.identifiers`` order.
 
         Rows are appended after the context and embedded against it in a single
         forward pass; the context's own representations are discarded.
 
         Args:
-            dataset (BaseDataset): Rows to encode. For held-out data, transform it
+            dataset (CohortView): Rows to encode. For held-out data, build the view
                 with the training fold's statistics first.
 
         Returns:
