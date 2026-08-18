@@ -1,21 +1,20 @@
+"""Covariates read from a flat table, keyed by a sample identifier."""
+
 from __future__ import annotations
 
-import copy
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
-import torch
 from sklearn.base import clone as sk_clone
 from sklearn.compose import ColumnTransformer
-from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from torch import Tensor
 
-from kalecancer.loaddata.base import BaseDataset, NotFittedError
-from kalecancer.survival.survival_target import SurvivalTarget
+from kalecancer.loaddata.base import Cohort, Indices, NotFittedError
+from kalecancer.loaddata.protocols import Target
+from kalecancer.prepdata.tabular import TabularPreprocessor
 
 _READERS = {
     ".csv": lambda p, dtype: pd.read_csv(p, dtype=dtype),
@@ -49,42 +48,41 @@ def _prepare_frame(frame: pd.DataFrame, id_column: str) -> pd.DataFrame:
     return frame
 
 
-class TabularDataset(BaseDataset):
-    """Covariates read from a flat table, keyed by a sample identifier.
+class TabularCohort(Cohort):
+    """Covariates from a flat table, keyed by a sample identifier.
 
     Column roles are declared, and preprocessing is declared per role using plain
-    scikit-learn transformers. Nothing is fitted at construction: transforms are
-    fitted via :meth:`fit_transform`, which returns a new instance rather than
-    mutating this one. Fitting is scoped to the rows a dataset holds, so a fold is
-    fitted by restricting first -- ``cohort.subset(train_idx).fit_transform()`` --
-    and can never see statistics computed on data outside it.
+    scikit-learn transformers. Nothing is fitted here and this object is never
+    mutated: :meth:`fit_preprocessor` fits on the rows you name and hands back a
+    separate artifact, and :meth:`~kalecancer.loaddata.base.Cohort.view` pairs a row
+    subset with one of those artifacts to make a dataset.
 
     Args:
         source (str | Path | pd.DataFrame): A table to read (``.csv``, ``.tsv``,
-            ``.json``), or an already-loaded ``DataFrame``. Anything pandas can read but
-            this cannot -- parquet, Excel, a database query -- goes through the frame:
-            read it yourself and pass the result. The frame is copied, so later edits to
-            the caller's object do not reach the dataset.
+            ``.json``), or an already-loaded ``DataFrame``. Anything pandas can read
+            but this cannot -- parquet, Excel, a database query -- goes through the
+            frame: read it yourself and pass the result. The frame is copied, so
+            later edits to the caller's object do not reach the cohort.
             Read it with ``dtype={identifier: str}`` -- by the time a frame arrives
             here, a zero-padded ``"001"`` inferred as ``1`` is already unrecoverable.
         identifier (str): Column holding sample identifiers. Must be unique.
-        target (SurvivalTarget | None, optional): Supervision target. ``None`` for a
-            pure feature provider used as a component of a larger cohort.
+        target (Target | None, optional): Supervision target. ``None`` for a pure
+            feature provider used as a component of a larger cohort.
         continuous (Sequence[str], optional): Numeric feature columns.
         categorical (Sequence[str], optional): Categorical feature columns.
-        continuous_transform (optional): A scikit-learn transformer, or a list of them
-            applied in order, for the continuous columns. ``None`` (the default) passes
-            them through untouched. There is deliberately no default pipeline: imputation
-            and scaling are modelling decisions that belong in the caller's script, where
-            they can be read, reviewed and reported.
+        continuous_transform (optional): A scikit-learn transformer, or a list of
+            them applied in order, for the continuous columns. ``None`` (the default)
+            passes them through untouched. There is deliberately no default pipeline:
+            imputation and scaling are modelling decisions that belong in the
+            caller's script, where they can be read, reviewed and reported.
         categorical_transform (optional): As above, for the categorical columns.
-        name (str, optional): Key for this modality's features in the item dict.
-            Defaults to ``"clinical"``.
+        name (str, optional): Key for this modality's features in
+            ``PatientSample.modalities``. Defaults to ``"clinical"``.
 
     Example:
         >>> from sklearn.impute import SimpleImputer
         >>> from sklearn.preprocessing import OneHotEncoder, StandardScaler
-        >>> cohort = TabularDataset(
+        >>> cohort = TabularCohort(
         ...     "data/my_cohort.csv",
         ...     identifier="patient_id",
         ...     target=SurvivalTarget(time="os_days", event="vital_status",
@@ -95,27 +93,25 @@ class TabularDataset(BaseDataset):
         ...     categorical_transform=OneHotEncoder(handle_unknown="ignore",
         ...                                         sparse_output=False),
         ... )
-        >>> train, test = cohort.split(test_size=0.2, random_state=0)
-        >>> fitted_train = train.fit_transform()
-        >>> fitted_test = fitted_train.transform(test)
+        >>> train_idx, test_idx = cohort.split(test_size=0.2, random_state=0)
+        >>> prep = cohort.fit_preprocessor(train_idx)     # fitted on train rows only
+        >>> train, test = cohort.view(train_idx, prep), cohort.view(test_idx, prep)
 
         Passing a frame is the seam for anything that has to happen between reading
-        the file and binding the target -- resolving rows the target refuses to
-        guess at, or joining a second table -- so the decision stays visible in the
-        script rather than in a separately-prepared file:
+        the file and binding the target -- resolving rows the target refuses to guess
+        at, or joining a second table -- so the decision stays visible in the script
+        rather than in a separately-prepared file:
 
         >>> frame = pd.read_csv("data/my_cohort.csv", dtype={"patient_id": str})
         >>> frame = frame[frame.vital_status.notna()]   # 24 patients, status not recorded
-        >>> cohort = TabularDataset(frame, identifier="patient_id", target=target)
+        >>> cohort = TabularCohort(frame, identifier="patient_id", target=target)
     """
-
-    target: SurvivalTarget | None
 
     def __init__(
         self,
         source: str | Path | pd.DataFrame,
         identifier: str,
-        target: SurvivalTarget | None = None,
+        target: Target | None = None,
         continuous: Sequence[str] = (),
         categorical: Sequence[str] = (),
         continuous_transform: Any = None,
@@ -130,13 +126,10 @@ class TabularDataset(BaseDataset):
         self.categorical_transform = categorical_transform
 
         # Doubles as the in-memory source: seeded here when the caller passed a frame,
-        # replaced by _load_index with the table read from self.path otherwise. The empty
-        # placeholder is never read -- _load_index overwrites it before anything else runs.
+        # replaced by _load_index with the table read from self.path otherwise. The
+        # empty placeholder is never read -- _load_index overwrites it first.
         self._frame: pd.DataFrame = source.copy() if isinstance(source, pd.DataFrame) else pd.DataFrame()
-        self._preprocessor_spec: ColumnTransformer | None = None
-        self._preprocessor: ColumnTransformer | None = None
-        self._matrix: Tensor | None = None
-        self.feature_names: list[str] = []
+        self._spec: ColumnTransformer | None = None
 
         super().__init__(path=None if isinstance(source, pd.DataFrame) else source, name=name, target=target)
 
@@ -153,7 +146,7 @@ class TabularDataset(BaseDataset):
 
         Reads the whole table because a clinical table is small; for this modality
         index and payload are the same read. The expensive-payload case that
-        motivates the split is WSI, where this would read a manifest only.
+        motivates the split is WSI, where this would read a tile manifest only.
         """
         self._frame = (
             _prepare_frame(self._frame, self.identifier)
@@ -171,14 +164,27 @@ class TabularDataset(BaseDataset):
                 f"{self._frame.loc[duplicates, self.identifier].unique()[:5].tolist()}"
             )
 
-        if self.target is not None:
-            self.target.bind(self._frame, self.identifier)
-
-        self._preprocessor_spec = self._build_preprocessor()
+        self._bind_target()
+        self._spec = self._build_spec()
         self._check_untransformed_roles()
-        if self._preprocessor_spec is None:
-            # Nothing to fit, so values are available immediately.
-            self._materialise()
+
+    def _bind_target(self) -> None:
+        """Hand the target the columns it declared it needs, as arrays.
+
+        Checking ``required_columns`` here rather than letting ``bind`` discover a
+        missing column means the error names the target's own vocabulary and fires
+        at construction.
+        """
+        if self.target is None:
+            return
+        missing = [c for c in self.target.required_columns if c not in self._frame.columns]
+        if missing:
+            raise ValueError(
+                f"{type(self.target).__name__} requires column(s) {missing}, which are not "
+                f"in this table. Available: {sorted(self._frame.columns)}"
+            )
+        values = {c: self._frame[c].to_numpy() for c in self.target.required_columns}
+        self.target.bind(self.identifiers, values)
 
     def _validate_columns(self) -> None:
         columns = set(self._frame.columns)
@@ -193,8 +199,12 @@ class TabularDataset(BaseDataset):
         if self.identifier in self.feature_columns:
             raise ValueError(f"Identifier column '{self.identifier}' cannot also be a feature.")
 
-    def _build_preprocessor(self) -> ColumnTransformer | None:
-        """Assemble a ColumnTransformer from the declared roles, or None if no-op."""
+    def _build_spec(self) -> ColumnTransformer | None:
+        """Assemble an *unfitted* ColumnTransformer from the declared roles.
+
+        Returns ``None`` when no role declares a stateful transform, which is what
+        tells :meth:`fit_preprocessor` there is nothing to fit.
+        """
         blocks, stateful = [], False
         for columns, spec, label in self._roles():
             if not columns:
@@ -233,74 +243,79 @@ class TabularDataset(BaseDataset):
         return list(spec) if isinstance(spec, list | tuple) else [spec]
 
     # ------------------------------------------------------------------ #
-    # fold discipline
+    # fold-local fitting
     # ------------------------------------------------------------------ #
 
-    @property
-    def is_fitted(self) -> bool:
-        return self._preprocessor_spec is None or self._preprocessor is not None
+    def fit_preprocessor(self, indices: Indices) -> TabularPreprocessor:
+        """Fit the declared transforms on ``indices`` only, and return the artifact.
 
-    def subset(self, indices: Sequence[int]) -> TabularDataset:
-        """Return a new dataset over ``indices``, slicing the frame in step."""
-        clone = super().subset(indices)
-        clone._frame = self._frame.iloc[list(indices)].reset_index(drop=True)
-        clone._matrix = None if self._matrix is None else self._matrix[list(indices)]
-        return clone
-
-    def fit_transform(self) -> TabularDataset:
-        """Fit transforms on this dataset's rows and return a fitted copy.
-
-        Fitting is scoped to the rows this dataset holds, so restrict first to fit
-        one fold: ``cohort.subset(train_idx).fit_transform()``.
-
-        Returns:
-            TabularDataset: A new, fitted instance. ``self`` is untouched, so folds
-            stay independent and can be fitted in parallel.
-        """
-        clone = copy.copy(self)
-        if self._preprocessor_spec is not None:
-            clone._preprocessor = sk_clone(self._preprocessor_spec)
-            clone._preprocessor.fit(clone._frame[self.feature_columns])
-        clone._materialise()
-        return clone
-
-    def transform(self, other: TabularDataset) -> TabularDataset:
-        """Apply this dataset's fitted transforms to ``other``'s rows.
+        This cohort is not modified, so folds are independent and can be fitted in
+        parallel. Fitting is scoped to the rows you name, so a fold can never see
+        statistics computed outside it.
 
         Args:
-            other (TabularDataset): Held-out data to prepare.
+            indices (Indices): Positional indices into ``self.identifiers``,
+                normally one fold's training rows.
 
         Returns:
-            TabularDataset: A new instance over ``other``'s rows, using ``self``'s
-            fitted statistics.
-
-        Raises:
-            NotFittedError: If ``self`` has unfitted transforms.
+            TabularPreprocessor: Fitted transforms, the resulting feature names, and
+            the identifiers they were fitted on.
         """
-        if not self.is_fitted:
-            raise NotFittedError(f"{type(self).__name__} has unfitted transforms; call fit_transform() first.")
-        clone = copy.copy(other)
-        clone._preprocessor = self._preprocessor
-        clone._materialise()
-        return clone
+        rows = list(indices)
+        columns = self.feature_columns
+        if self._spec is None:
+            # Nothing stateful was declared. fitted_on stays empty: a passthrough
+            # carries no row's information, so it cannot leak one.
+            return TabularPreprocessor(None, columns, feature_names={self.name: list(columns)})
 
-    def _materialise(self) -> None:
-        """Compute the feature matrix for this dataset's rows.
+        transformer = sk_clone(self._spec)
+        transformer.fit(self._frame.iloc[rows][columns])
+        return TabularPreprocessor(
+            transformer,
+            columns,
+            feature_names={self.name: list(transformer.get_feature_names_out())},
+            fitted_on=frozenset(self.identifiers[i] for i in rows),
+        )
 
-        Done once per fitted instance rather than per item: the table is small, and
-        calling scikit-learn's ``transform`` inside ``__getitem__`` would dominate
-        the training loop.
+    # ------------------------------------------------------------------ #
+    # payload
+    # ------------------------------------------------------------------ #
+
+    def payload_bulk(self, identifiers, prep) -> dict[str, Tensor]:
+        """Transform every row at once.
+
+        Overridden because a clinical table is small and scikit-learn's ``transform``
+        has enough per-call overhead to dominate a training loop if invoked per row.
+        This is what lets a view cache; see
+        :meth:`~kalecancer.loaddata.base.Cohort.payload_bulk`.
         """
-        frame = self._frame[self.feature_columns]
-        if self._preprocessor is None:
-            values = frame.to_numpy(dtype="float64")
-            names = list(self.feature_columns)
-        else:
-            values = self._preprocessor.transform(frame)
-            names = list(self._preprocessor.get_feature_names_out())
-        # np.array (not asarray) forces a writable copy as torch warns on read-only views.
-        self._matrix = torch.as_tensor(np.array(values, dtype="float64"), dtype=torch.float32)
-        self.feature_names = names
+        self._require(prep)
+        rows = self.index_of(identifiers)
+        return {self.name: prep.transform(self._frame.iloc[rows])}
+
+    def payload(self, identifier: str, prep) -> dict[str, Tensor]:
+        """Return the ``(n_features,)`` feature vector for one sample."""
+        self._require(prep)
+        row = self._row_of[identifier]
+        return {self.name: prep.transform(self._frame.iloc[[row]])[0]}
+
+    def _require(self, prep) -> None:
+        """Refuse to serve values without a preprocessor.
+
+        Refused even when nothing stateful was declared, so there is one rule rather
+        than two: :meth:`fit_preprocessor` is cheap and always returns an artifact,
+        and accepting ``None`` here would mean a cohort *with* declared transforms
+        silently serving raw values to anyone who passed it.
+        """
+        if prep is None:
+            raise NotFittedError(
+                f"{type(self).__name__} was asked for values with no preprocessor.\n"
+                f"  Fit one on this fold's training rows first:\n"
+                f"      prep = cohort.fit_preprocessor(train_idx)\n"
+                f"      train = cohort.view(train_idx, prep)\n"
+                f"      val   = cohort.view(val_idx, prep)   # same prep, never refitted\n"
+                f"  For the untransformed values, use cohort.frame."
+            )
 
     #: Suggested fix per role, quoted back at the user in the messages below.
     _ENCODE_HINT = "categorical_transform=OneHotEncoder(handle_unknown='ignore', sparse_output=False)"
@@ -310,7 +325,7 @@ class TabularDataset(BaseDataset):
     }
 
     def _check_untransformed_roles(self) -> None:
-        """Refuse to emit a feature matrix that no transform was declared to clean up.
+        """Refuse to build a cohort whose features no transform was declared to clean up.
 
         Checked **per role**, at construction, because declaring a transform for one
         role does nothing for the other. Checking the feature block as a whole would
@@ -351,24 +366,9 @@ class TabularDataset(BaseDataset):
     # access
     # ------------------------------------------------------------------ #
 
-    def get_by_id(self, identifier) -> Tensor:
-        """Return the ``(n_features,)`` feature vector for one sample.
-
-        Raises:
-            NotFittedError: If transforms are declared but not yet fitted.
-        """
-        if self._matrix is None:
-            raise NotFittedError(
-                f"{type(self).__name__} has {len(self._pending())} unfitted transform(s) "
-                f"({', '.join(self._pending())}). Call fit_transform() to fit them on these "
-                f"rows, or subset(indices).fit_transform() to fit one fold. For the "
-                f"untransformed values, use .frame"
-            )
-        return self._matrix[self._row_of[identifier]]
-
     @property
     def frame(self) -> pd.DataFrame:
-        """The untransformed table for this dataset's rows. The exploration hatch."""
+        """The untransformed table. The exploration hatch."""
         return self._frame
 
     @property
@@ -376,63 +376,14 @@ class TabularDataset(BaseDataset):
         """Declared feature columns, continuous first."""
         return self.continuous + self.categorical
 
-    @property
-    def n_features(self) -> int:
-        """Feature count after encoding. Equals the declared column count until fitted."""
-        return len(self.feature_names) if self.feature_names else len(self.feature_columns)
-
-    def split(self, test_size: float = 0.2, random_state: int | None = None):
-        """Split into two datasets, stratified on event status when a target is present.
-
-        Stratifying matters at this cohort size: an unstratified 20% split of a few
-        hundred patients can easily land with a badly skewed event rate.
-
-        Args:
-            test_size (float, optional): Proportion held out. Defaults to 0.2.
-            random_state (int | None, optional): Seed.
-
-        Returns:
-            tuple[TabularDataset, TabularDataset]: Train and test, both unfitted.
-
-        Raises:
-            RuntimeError: If called on a fitted dataset. Both halves would inherit
-                statistics fitted across all rows, so the held-out half would be
-                standardised using its own data -- silently, with no error.
-        """
-        if self._preprocessor is not None:
-            raise RuntimeError(
-                "split() on a fitted dataset would give both halves transforms fitted "
-                "across all rows, leaking the held-out half into its own preprocessing. "
-                "Split first, then fit_transform() the training half and transform() the rest."
-            )
-        stratify = None if self.target is None else self.target.events_for(self.identifiers)
-        train_idx, test_idx = train_test_split(
-            np.arange(len(self)), test_size=test_size, random_state=random_state, stratify=stratify
-        )
-        return self.subset(sorted(train_idx)), self.subset(sorted(test_idx))
-
-    @property
-    def _fit_status(self) -> str:
-        """Which of the three transform states this dataset is in.
-
-        Three, not two: having nothing to fit is not the same as not having fitted
-        yet. Both leave ``_preprocessor`` as ``None``, but the first serves values
-        immediately and the second raises, so a two-way test reports them alike and
-        contradicts :attr:`is_fitted`.
-        """
-        if self._preprocessor is not None:
-            return "fitted"
-        return "no transforms" if self._preprocessor_spec is None else "unfitted"
-
-    #: Longer phrasing for :meth:`describe_transforms`, which has room to say what to do
-    #: next. Keyed by :attr:`_fit_status`; anything absent is used as-is.
-    _STATUS_DETAIL = {
-        "no transforms": "none declared",
-        "unfitted": "unfitted - fitted per fold",
-    }
-
     def describe_transforms(self) -> str:
-        """Human-readable summary of the resolved transforms and their fitted status."""
+        """Summary of the transforms this cohort *declares*.
+
+        What a given fold actually *applied* is a question for that fold's
+        :class:`~kalecancer.prepdata.tabular.TabularPreprocessor`, which is a
+        different object and knows the answer -- including the encoded feature
+        names, which depend on the rows it saw.
+        """
         lines = []
         for columns, spec, label in self._roles():
             if not columns:
@@ -440,26 +391,13 @@ class TabularDataset(BaseDataset):
             steps = self._resolve(spec)
             rendered = " -> ".join(type(s).__name__ for s in steps) if steps else "passthrough"
             lines.append(f"{label:<12}({len(columns)} cols): {rendered}")
-        status = self._STATUS_DETAIL.get(self._fit_status, self._fit_status)
-        lines.append(f"{'status':<12}: {status}")
+        if not lines:
+            return "no feature columns declared"
         return "\n".join(lines)
-
-    def _pending(self) -> list[str]:
-        """Names of transformer classes that are declared but not yet fitted."""
-        if self._preprocessor_spec is None or self._preprocessor is not None:
-            return []
-        names: list[str] = []
-        for _, pipeline, _ in self._preprocessor_spec.transformers:
-            if pipeline == "passthrough":
-                continue
-            names.extend(type(step).__name__ for _, step in pipeline.steps)
-        return names
 
     def __repr__(self) -> str:
         parts = [f"{len(self)} samples", f"{len(self.feature_columns)} columns"]
-        if self.feature_names:
-            parts.append(f"{len(self.feature_names)} features")
         if self.target is not None:
-            parts.append(self.target.summarise(self.identifiers))
-        parts.append(self._fit_status)
+            summarise = getattr(self.target, "summarise", None)
+            parts.append(summarise(self.identifiers) if summarise else type(self.target).__name__)
         return f"{type(self).__name__}({' | '.join(parts)})"

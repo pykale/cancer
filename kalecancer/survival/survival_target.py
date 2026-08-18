@@ -1,22 +1,46 @@
 """Supervision targets, keyed by sample identifier.
 
-A target is bound once, at load time, against the table that carries it. It is
-keyed by identifier rather than row position, which is what lets a dataset be
-subset and recombined without the target ever needing realignment.
+A target is bound once, at load time, against the values that carry it. It is keyed
+by identifier rather than by row position, which is what lets a cohort be subset,
+split and recombined without the target ever needing realignment.
 
-Nothing here is cancer-specific or tabular-specific: ``SurvivalTarget`` is the
-piece most likely to move into PyKale core alongside the survival heads, losses
-and metrics that consume it.
+Nothing here is cancer-specific, tabular-specific, or dependent on pandas:
+``SurvivalTarget`` is the piece most likely to move into PyKale core alongside the
+survival heads, losses and metrics that consume it, so it takes plain arrays and
+keeps its dependencies to numpy and torch.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import math
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
-import pandas as pd
 import torch
+from numpy.typing import ArrayLike
+from torch import Tensor
+
+
+def _is_missing(value: Any) -> bool:
+    """Whether one value is absent, across the dtypes a table can produce.
+
+    Covers ``None`` and float ``NaN``, which is what a blank cell becomes whether
+    the surrounding column was read as object, float, or a mix.
+    """
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+
+def _as_float(value: Any) -> float:
+    """Coerce one value to float, returning NaN rather than raising.
+
+    Failures are collected and reported together by the caller, naming the samples
+    involved -- more useful than the first exception numpy would throw.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return math.nan
 
 
 class SurvivalTarget:
@@ -43,9 +67,9 @@ class SurvivalTarget:
 
     Raises:
         ValueError: On construction, if ``unit`` is not a recognised time unit.
-        ValueError: On :meth:`bind`, if the columns are missing, times or statuses
-            are invalid or absent, or the resulting event rate is 0% or 100% -- all
-            of which indicate a mis-specified target rather than an unusual cohort.
+        ValueError: On :meth:`bind`, if times or statuses are invalid or absent, or
+            the resulting event rate is 0% or 100% -- all of which indicate a
+            mis-specified target rather than an unusual cohort.
     """
 
     _PER_YEAR = {"days": 365.25, "months": 12.0, "years": 1.0, "weeks": 52.18}
@@ -60,79 +84,101 @@ class SurvivalTarget:
         self.unit = str(unit).strip().lower()
         if self.unit not in self._PER_YEAR:
             raise ValueError(f"Unknown time unit '{unit}'. Expected one of {sorted(self._PER_YEAR)}.")
-        self._times: dict = {}
-        self._events: dict = {}
+        self._row_of: dict[str, int] = {}
+        self._times: Tensor = torch.empty(0)
+        self._events: Tensor = torch.empty(0)
 
-    def bind(self, frame: pd.DataFrame, identifier: str) -> None:
+    @property
+    def required_columns(self) -> tuple[str, ...]:
+        """The time and event columns, which a cohort must supply to :meth:`bind`."""
+        return (self.time, self.event)
+
+    def bind(self, identifiers: Sequence[str], values: Mapping[str, ArrayLike]) -> None:
         """Extract and validate times and events, keyed by identifier.
 
         Args:
-            frame (pd.DataFrame): Table containing the target columns.
-            identifier (str): Column holding sample identifiers.
+            identifiers (Sequence[str]): Sample identifiers, in row order.
+            values (Mapping[str, ArrayLike]): Arrays for :attr:`required_columns`,
+                aligned with ``identifiers``.
 
         Raises:
-            ValueError: On missing columns, non-numeric or negative times, a missing
-                event status, or a degenerate event rate.
+            ValueError: On non-numeric or negative times, a missing event status, or
+                a degenerate event rate.
         """
-        missing = [c for c in (self.time, self.event) if c not in frame.columns]
-        if missing:
-            raise ValueError(f"Target column(s) {missing} not found. Available: {list(frame.columns)}")
+        ids = list(identifiers)
+        raw_times = np.asarray(values[self.time], dtype=object).ravel()
+        raw_events = np.asarray(values[self.event], dtype=object).ravel()
 
-        times = pd.to_numeric(frame[self.time], errors="coerce")
-        if times.isna().any():
-            bad = frame.loc[times.isna(), identifier].tolist()[:5]
+        times = np.array([_as_float(v) for v in raw_times], dtype=float)
+        bad = np.isnan(times)
+        if bad.any():
+            examples = [ids[i] for i in np.flatnonzero(bad)[:5]]
             raise ValueError(
-                f"Column '{self.time}' has {int(times.isna().sum())} missing or "
-                f"non-numeric value(s), e.g. for {bad}. Survival time must be known "
-                f"for every sample; drop or impute these before constructing the dataset."
+                f"Column '{self.time}' has {int(bad.sum())} missing or non-numeric "
+                f"value(s), e.g. for {examples}. Survival time must be known for every "
+                f"sample; drop or impute these before constructing the cohort."
             )
         if (times < 0).any():
             raise ValueError(f"Column '{self.time}' contains negative values.")
 
-        observed = frame[self.event]
-        unknown = observed.isna()
+        unknown = np.array([_is_missing(v) for v in raw_events])
         if unknown.any():
-            bad = frame.loc[unknown, identifier].tolist()[:5]
+            examples = [ids[i] for i in np.flatnonzero(unknown)[:5]]
             raise ValueError(
                 f"Column '{self.event}' has {int(unknown.sum())} missing value(s), e.g. for "
-                f"{bad}. An unknown outcome is not a censored one: censoring asserts the "
-                f"sample was event-free throughout its recorded time, which an absent status "
-                f"does not establish. Treating these as censored would drop events from the "
-                f"numerator while keeping their follow-up in the denominator, biasing every "
-                f"estimate towards the null. Decide explicitly before constructing the "
-                f"dataset -- drop these rows, or recode them as censored if that is what a "
-                f"blank means in your data dictionary."
+                f"{examples}. An unknown outcome is not a censored one: censoring asserts "
+                f"the sample was event-free throughout its recorded time, which an absent "
+                f"status does not establish. Treating these as censored would drop events "
+                f"from the numerator while keeping their follow-up in the denominator, "
+                f"biasing every estimate towards the null. Decide explicitly before "
+                f"constructing the cohort -- drop these rows, or recode them as censored "
+                f"if that is what a blank means in your data dictionary."
             )
 
-        events = observed.isin(self.event_values)
-        rate = float(events.mean())
+        events = np.array([v in self.event_values for v in raw_events], dtype=float)
+        rate = float(events.mean()) if events.size else 0.0
         if rate in (0.0, 1.0):
+            observed = sorted({str(v) for v in raw_events})[:10]
             raise ValueError(
                 f"event_value={self.event_values} matches {rate:.0%} of rows in column "
-                f"'{self.event}', which cannot be right. Observed values: "
-                f"{sorted(observed.dropna().unique().tolist())[:10]}"
+                f"'{self.event}', which cannot be right. Observed values: {observed}"
             )
 
-        ids = frame[identifier].tolist()
-        self._times = dict(zip(ids, times.astype(float), strict=False))
-        self._events = dict(zip(ids, events.astype(float), strict=False))
+        # Stored as tensors rather than dicts of Python floats so that for_() returns
+        # a view instead of allocating two tensors per sample per epoch, and so the
+        # array-returning accessors below are gathers rather than list comprehensions.
+        self._row_of = {identifier: i for i, identifier in enumerate(ids)}
+        self._times = torch.tensor(times, dtype=torch.float32)
+        self._events = torch.tensor(events, dtype=torch.float32)
 
-    def for_(self, identifier) -> dict:
+    def for_(self, identifier: str) -> dict[str, Tensor]:
         """Return ``{"time": Tensor, "event": Tensor}`` for one sample."""
-        return {
-            "time": torch.tensor(self._times[identifier], dtype=torch.float32),
-            "event": torch.tensor(self._events[identifier], dtype=torch.float32),
-        }
+        row = self._row_of[identifier]
+        return {"time": self._times[row], "event": self._events[row]}
 
-    def events_for(self, identifiers: Sequence) -> np.ndarray:
-        """Event indicators for ``identifiers``, as a float array. Used for stratifying."""
-        return np.array([self._events[i] for i in identifiers], dtype=float)
+    def events_for(self, identifiers: Sequence[str]) -> np.ndarray:
+        """Event indicators for ``identifiers``, as a float array."""
+        return self._gather(self._events, identifiers)
 
-    def times_for(self, identifiers: Sequence) -> np.ndarray:
+    def times_for(self, identifiers: Sequence[str]) -> np.ndarray:
         """Follow-up times for ``identifiers``, as a float array."""
-        return np.array([self._times[i] for i in identifiers], dtype=float)
+        return self._gather(self._times, identifiers)
 
-    def summarise(self, identifiers: Sequence) -> str:
+    def stratify_labels(self, identifiers: Sequence[str]) -> np.ndarray:
+        """Labels to stratify a split on: the event indicator.
+
+        The optional half of the ``Target`` contract, used by
+        :meth:`~kalecancer.loaddata.base.Cohort.split`. Event status is what matters
+        to balance here -- an unstratified 20% split of a few hundred patients can
+        easily land with a badly skewed event rate.
+        """
+        return self.events_for(identifiers)
+
+    def _gather(self, source: Tensor, identifiers: Sequence[str]) -> np.ndarray:
+        rows = torch.tensor([self._row_of[i] for i in identifiers], dtype=torch.long)
+        return source[rows].numpy().astype(float)
+
+    def summarise(self, identifiers: Sequence[str]) -> str:
         """One-line description of events and follow-up across ``identifiers``."""
         events = self.events_for(identifiers)
         times = self.times_for(identifiers)
@@ -145,3 +191,9 @@ class SurvivalTarget:
             months = np.median(censored) / self._PER_YEAR[self.unit] * 12.0
             parts.append(f"median follow-up {months:.1f} months")
         return " | ".join(parts)
+
+    def __repr__(self) -> str:
+        parts = [f"time={self.time!r}", f"event={self.event!r}", f"event_value={self.event_values}"]
+        if len(self._row_of):
+            parts.append(self.summarise(list(self._row_of)))
+        return f"{type(self).__name__}({' | '.join(parts)})"

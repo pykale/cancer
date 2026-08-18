@@ -20,8 +20,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
-from kalecancer.loaddata.tabular import TabularDataset
+from kalecancer.loaddata.tabular import TabularCohort
+from kalecancer.loaddata.view import CohortView
 from kalecancer.survival.survival_target import SurvivalTarget
 
 N_PATIENTS = 80
@@ -87,6 +89,53 @@ def write_table(frame: pd.DataFrame, directory: Path, fmt: str = "csv") -> Path:
     return path
 
 
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+
+
+def matrix_of(view: CohortView, name: str = "clinical") -> np.ndarray:
+    """Stack a view's feature vectors into ``(n_rows, n_features)``.
+
+    Goes through ``__getitem__`` rather than any internal cache, so it exercises
+    the same path a ``DataLoader`` takes.
+    """
+    return torch.stack([view[i].modalities[name] for i in range(len(view))]).numpy()
+
+
+def fitted_view(cohort: TabularCohort, indices=None) -> CohortView:
+    """Fit a preprocessor on ``indices`` and return the view over those same rows.
+
+    The common shorthand for "prepare this fold's training data". Defaults to every
+    row, for tests that are not about folds at all.
+    """
+    rows = np.arange(len(cohort)) if indices is None else np.asarray(list(indices))
+    return cohort.view(rows, cohort.fit_preprocessor(rows))
+
+
+def subview(view: CohortView, positions) -> CohortView:
+    """Re-slice a view by *its own* positions, keeping its preprocessor.
+
+    A view is not itself sliceable -- deliberately, since that would be a second way
+    to build one -- so this goes back through the cohort, which is the only way.
+    """
+    indices = np.asarray(view.indices)[np.asarray(list(positions), dtype=int)]
+    return view.cohort.view(indices, view.preprocessor)
+
+
+def event_rate(cohort: TabularCohort, identifiers) -> float:
+    """Observed event rate over ``identifiers``."""
+    target = cohort.target
+    # events_for is survival-specific -- it is not part of the Target protocol.
+    assert isinstance(target, SurvivalTarget), "event_rate needs a cohort with a SurvivalTarget"
+    return float(target.events_for(list(identifiers)).mean())
+
+
+# --------------------------------------------------------------------------- #
+# fixtures
+# --------------------------------------------------------------------------- #
+
+
 @pytest.fixture
 def frame() -> pd.DataFrame:
     """A fresh copy of the synthetic cohort, so a test can mutate it freely."""
@@ -116,7 +165,7 @@ def make_target():
     """Factory for a ``SurvivalTarget`` over the fixture's columns.
 
     A factory rather than a single instance: ``bind`` stores state on the target,
-    so two datasets sharing one instance would fight over it.
+    so two cohorts sharing one instance would fight over it.
     """
 
     def build(**overrides) -> SurvivalTarget:
@@ -128,8 +177,8 @@ def make_target():
 
 
 @pytest.fixture
-def make_dataset(table_path: Path, make_target):
-    """Factory for a fully-declared ``TabularDataset`` over the synthetic cohort.
+def make_cohort(table_path: Path, make_target):
+    """Factory for a fully-declared ``TabularCohort`` over the synthetic cohort.
 
     Defaults to the realistic setup -- impute-then-scale on the continuous
     columns, impute-then-one-hot on the categorical ones -- with every argument
@@ -139,7 +188,7 @@ def make_dataset(table_path: Path, make_target):
     from sklearn.impute import SimpleImputer
     from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-    def build(**overrides) -> TabularDataset:
+    def build(**overrides) -> TabularCohort:
         kwargs = {
             "source": table_path,
             "identifier": "patient_id",
@@ -153,12 +202,12 @@ def make_dataset(table_path: Path, make_target):
             ],
         }
         kwargs.update(overrides)
-        return TabularDataset(**kwargs)
+        return TabularCohort(**kwargs)
 
     return build
 
 
 @pytest.fixture
-def cohort(make_dataset) -> TabularDataset:
-    """A fully-declared, unfitted cohort."""
-    return make_dataset()
+def cohort(make_cohort) -> TabularCohort:
+    """A fully-declared cohort. Nothing is fitted: a cohort never is."""
+    return make_cohort()
