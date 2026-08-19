@@ -11,7 +11,7 @@ thing worth checking -- which rows the statistics came from -- out of sight.
 Example:
     >>> config = load_config("configs/config.yaml")
     >>> cohort = build_cohort(config)
-    >>> train_idx, test_idx = split_indices(cohort, config)
+    >>> train_ids, test_ids = split_identifiers(cohort, config)
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ from sklearn.preprocessing import (
 )
 from torch import nn
 
-from kalecancer.loaddata import TabularCohort
-from kalecancer.model.embed import TabICLEncoder
+from kalecancer.loaddata import CohortView, TabularCohort
+from kalecancer.model.embed import TabICLEmbedder
 from kalecancer.survival import SurvivalTarget
 
 #: Config lives next to this file, so the demo runs from any working directory.
@@ -69,12 +69,12 @@ TRANSFORMS: dict[str, type] = {
 #: Keys each section accepts. A config typo is silent by nature -- mis-spell
 #: `transform` and the preprocessing is simply not applied -- so it is checked.
 SCHEMA: dict[str | None, set[str]] = {
-    None: {"seed", "data", "target", "features", "split", "encoder", "head"},
+    None: {"seed", "data", "target", "features", "split", "embedder", "head"},
     "data": {"source", "identifier"},
     "target": {"time", "event", "event_value", "unit"},
     "features": {"continuous", "categorical"},
     "split": {"test_size", "random_state", "stratify"},
-    "encoder": {"context_label", "checkpoint", "n_estimators", "device", "random_state"},
+    "embedder": {"context_label", "trainable", "checkpoint", "n_estimators", "device", "random_state"},
     "head": {"hidden_dim", "epochs", "learning_rate", "weight_decay", "log_every"},
 }
 
@@ -323,8 +323,8 @@ def _check_strata(labels: np.ndarray, columns: list[str]) -> None:
     )
 
 
-def split_indices(cohort: TabularCohort, config: dict) -> tuple[np.ndarray, np.ndarray]:
-    """Split into train and test **indices**, balanced on whatever the config names.
+def split_identifiers(cohort: TabularCohort, config: dict) -> tuple[list[str], list[str]]:
+    """Split into train and test **identifiers**, balanced on whatever the config names.
 
     Indices rather than cohorts, so swapping in a scikit-learn splitter later is a
     one-line change.
@@ -337,11 +337,29 @@ def split_indices(cohort: TabularCohort, config: dict) -> tuple[np.ndarray, np.n
     )
 
 
-def build_encoder(config: dict) -> TabICLEncoder:
-    """Build the unfitted ``TabICLEncoder`` the config describes."""
-    encoder = dict(section(config, "encoder"))
-    encoder["random_state"] = _seeded(encoder.get("random_state"), config)
-    return TabICLEncoder(**encoder)
+def build_embedder(config: dict, context: CohortView) -> TabICLEmbedder:
+    """Build the ``TabICLEmbedder`` the config describes, over ``context``'s rows.
+
+    ``context_label`` is resolved here rather than inside the embedder: which
+    supervision value conditions the representation is a modelling choice this
+    wiring layer makes, and the embedder only ever sees an array of labels.
+    """
+    spec = dict(section(config, "embedder"))
+    label = spec.pop("context_label")
+    spec["random_state"] = _seeded(spec.get("random_state"), config)
+
+    # The batch already carries the supervision under its own names, so the label is
+    # a key lookup rather than a reach into the cohort's target.
+    batch = context.batch()
+    if label not in batch.target:
+        available = sorted(batch.target) or "nothing -- this cohort was built without a target"
+        raise ValueError(f"embedder.context_label={label!r} is not available. This view offers {available}.")
+
+    return TabICLEmbedder(
+        context_x=batch.modalities[context.cohort.name],
+        context_y=batch.target[label],
+        **spec,
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -1,44 +1,35 @@
 """Quickstart for the cohort/preprocessor/view API, on the HANCOCK clinical table.
 
-Three objects with three lifetimes: a **cohort** indexes patients and is never
-mutated; a **preprocessor** is fitted on the rows you name and belongs to that fold;
-a **view** pairs a row subset with one preprocessor and is what a ``DataLoader``
-iterates. You cannot build a view without naming a preprocessor, which is what keeps
-a fold's statistics visible in the script.
-
 See ``pipeline.py`` for the same thing driven from a YAML config.
 
 Run with::
 
     uv run python examples/HANCOCK_tabular/quickstart.py
 """
-
+import torch
 from sklearn.impute import SimpleImputer
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from kalecancer.loaddata import CohortDataModule, TabularCohort
-from kalecancer.model.embed import TabICLEncoder
+from kalecancer.loaddata import TabularCohort
+from kalecancer.model.embed import TabICLEmbedder
 from kalecancer.survival import SurvivalTarget
 
 SEED = 0
+N_FOLDS = 5
 DATA_LOC = "data/HANCOCK/raw/StructuredData/clinical_data.json"
 
-
-# --------------------------------------------------------------------------- #
-# 1. Declare the cohort
-# --------------------------------------------------------------------------- #
-# Nothing is fitted here, and nothing is imputed unless you asked for it -- so this
-# block is the whole of the preprocessing.
+target = SurvivalTarget(
+    time="days_to_last_information",
+    event="survival_status",
+    event_value="deceased",
+    unit="days",
+)
 
 cohort = TabularCohort(
     source=DATA_LOC,
     identifier="patient_id",
-    target=SurvivalTarget(
-        time="days_to_last_information",
-        event="survival_status",
-        event_value="deceased",
-        unit="days",  # a display label only; nothing is converted
-    ),
+    target=target,
     continuous=["age_at_initial_diagnosis", "year_of_initial_diagnosis"],
     continuous_transform=[SimpleImputer(strategy="median"), StandardScaler()],
     categorical=["sex", "smoking_status", "primarily_metastasis"],
@@ -47,93 +38,50 @@ cohort = TabularCohort(
         OneHotEncoder(handle_unknown="ignore", sparse_output=False),
     ],
 )
-
 print(cohort)
-print(cohort.describe_transforms())
 
+dev_ids, test_ids = cohort.split(test_size=0.2, random_state=SEED, stratify=True)
+print(f"dev {len(dev_ids)} patients | test {len(test_ids)} patients")
 
-# --------------------------------------------------------------------------- #
-# 2. Hold out a test set -- once
-# --------------------------------------------------------------------------- #
-# Indices, not cohorts, so this composes with KFold and friends later. `stratify` is
-# required: unstratified, a 20% split of a few hundred patients can land several
-# points off on the event rate.
-
-train_idx, test_idx = cohort.split(test_size=0.2, random_state=SEED, stratify=True)
-print(f"\ntrain {len(train_idx)} patients | test {len(test_idx)} patients")
-
-
-# --------------------------------------------------------------------------- #
-# 3. Prepare the fold
-# --------------------------------------------------------------------------- #
-# Fit on the training rows, then build both views from that same preprocessor.
-# Fitting a second one on the test rows is the leak this API makes visible.
-
-prep = cohort.fit_preprocessor(train_idx)
-train = cohort.view(train_idx, prep)
-test = cohort.view(test_idx, prep)
-
-print(f"\n{prep.describe()}")
-# Keyed by modality: one key here, several once a slide cohort joins it.
-print(f"features ({prep.width}): {prep.feature_names['clinical']}")
-
-# The preprocessor records whose rows are in it, so the fold boundary is assertable.
-assert set(test.identifiers).isdisjoint(prep.fitted_on)
-print(f"\nno test patient contributed to the fitted statistics ({len(prep.fitted_on)} train rows)")
-
-
-# --------------------------------------------------------------------------- #
-# 4. Look at one patient
-# --------------------------------------------------------------------------- #
-# A view yields PatientSample: features by modality, an availability flag per
-# modality, and the target under named keys -- never a positional [time, event] pair,
-# which runs perfectly when built backwards and predicts survival inverted.
-
-sample = train[0]
-print(f"\npatient {sample.patient_id}")
-print(f"  clinical : {tuple(sample.modalities['clinical'].shape)} {sample.modalities['clinical'].dtype}")
-print(f"  present  : {sample.present}")
-print(f"  target   : {sample.target}")
-print(f"  sample type : {type(sample)}")
-
-
-# --------------------------------------------------------------------------- #
-# 5. Hand it to Lightning
-# --------------------------------------------------------------------------- #
-# Fold-local: it fits the preprocessor in setup(), builds the views, and hands a
-# Trainer its loaders. One per fold.
+# Each patient is embedded against a context that excludes them. Not merely fold
+# hygiene: TabICL's context rows see their own label, so a patient embedded against a
+# context containing them is optimistic in a way a held-out patient never is. Embedding
+# every fold's validation rows is what makes these 610 vectors comparable to each other.
 #
-# batch_size has no default. With a Cox head the partial likelihood is averaged
-# within a batch, so it selects the risk-set approximation -- a modelling decision,
-# not a loader detail. "full" is exact and affordable at this size.
+# The ids are carried alongside because torch.cat below returns them in *fold* order,
+# not dev_ids order -- same patients, different sequence.
+embeddings, embedded_ids = [], []
+labels = target.values_for(dev_ids)["event"]
+folds = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+for fold, (train_pos, val_pos) in enumerate(folds.split(dev_ids, labels), start=1):
+    train_ids = [dev_ids[i] for i in train_pos]
+    val_ids = [dev_ids[i] for i in val_pos]
 
-dm = CohortDataModule(cohort, train_idx, test_idx=test_idx, batch_size="full", shuffle=True)
-dm.setup()
+    transform = cohort.fit_preprocessor(train_ids)
+    train = cohort.view(train_ids, transform)
+    val = cohort.view(val_ids, transform)
+    assert set(val.identifiers).isdisjoint(transform.fitted_on)
 
-batch = next(iter(dm.train_dataloader()))
-print(f"\n{dm!r}")
-print(
-    f"  batch of {len(batch)}: clinical {tuple(batch.modalities['clinical'].shape)}, "
-    f"time {tuple(batch.target['time'].shape)}, event {tuple(batch.target['event'].shape)}"
-)
-print(f"  events in batch: {int(batch.target['event'].sum())}")
+    context = train.batch()
+    embedder = TabICLEmbedder(
+        context_x=context.modalities["clinical"],
+        context_y=context.target["event"],
+        trainable=False,
+        random_state=SEED,
+    )
 
-# From here a LightningModule would go straight into:
-#     L.Trainer(max_epochs=50).fit(model, datamodule=dm)
+    with torch.no_grad():
+        encoded = embedder(val.batch().modalities["clinical"])
+    embeddings.append(encoded)
+    embedded_ids.extend(val.identifiers)
+    print(f"fold {fold}: {embedder} -> encoded {tuple(encoded.shape)}")
 
+all_embeddings = torch.cat(embeddings)
+print(f"\nembeddings {tuple(all_embeddings.shape)} | mean {all_embeddings.mean():.4f}")
 
-# --------------------------------------------------------------------------- #
-# 6. Encode with a frozen foundation model
-# --------------------------------------------------------------------------- #
-# TabICL conditions on context rows, so "fitting" is storing them -- making the
-# context fold state exactly as a scaler mean is. Fit on the training view only.
-# Downloads a ~100MB checkpoint from Hugging Face on first use.
-
-encoder = TabICLEncoder(random_state=SEED).fit(train)
-
-encoded_train = encoder.encode(train)
-encoded_test = encoder.encode(test)
-
-print(f"\n{encoder}")
-print(f"  encoded_train: {tuple(encoded_train.shape)}")
-print(f"  encoded_test : {tuple(encoded_test.shape)}")
+# What the ids are for. Row i of all_embeddings is patient embedded_ids[i], so
+# supervision is fetched by name; pairing the block with dev_ids instead would put
+# every patient against someone else's outcome, and would run without complaint.
+targets = target.values_for(embedded_ids)
+assert embedded_ids != dev_ids and sorted(embedded_ids) == sorted(dev_ids)
+print(f"aligned to {len(embedded_ids)} patients | {int(targets['event'].sum())} events")

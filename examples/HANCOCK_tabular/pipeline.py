@@ -14,7 +14,7 @@ Paths in the config are relative to the directory you run this from.
 import torch
 from config_handler import (
     build_cohort,
-    build_encoder,
+    build_embedder,
     build_head,
     build_optimiser,
     c_index,
@@ -22,7 +22,7 @@ from config_handler import (
     cox_ph_loss,
     section,
     set_seed,
-    split_indices,
+    split_identifiers,
     supervision,
 )
 
@@ -39,7 +39,7 @@ set_seed(config)
 cohort = build_cohort(config)
 print(cohort)
 
-train_idx, test_idx = split_indices(cohort, config)
+train_ids, test_ids = split_identifiers(cohort, config)
 
 
 # --------------------------------------------------------------------------- #
@@ -48,26 +48,29 @@ train_idx, test_idx = split_indices(cohort, config)
 # Fit on the training rows, then build both views from that same preprocessor: a
 # view cannot be built without naming the statistics it uses.
 
-prep = cohort.fit_preprocessor(train_idx)
-train = cohort.view(train_idx, prep)
-test = cohort.view(test_idx, prep)
+prep = cohort.fit_preprocessor(train_ids)
+train = cohort.view(train_ids, prep)
+test = cohort.view(test_ids, prep)
 
 print(f"\n{prep.describe()}")
 assert set(test.identifiers).isdisjoint(prep.fitted_on), "test rows leaked into the fitted statistics"
 
 
 # --------------------------------------------------------------------------- #
-# 3. Encode
+# 3. Embed
 # --------------------------------------------------------------------------- #
-# TabICL conditions on context rows, so fitting it means storing them, and that
-# context is fold state like a scaler's mean. Fit on train only. Frozen, so encoding
-# once is the same as encoding every epoch.
+# TabICL conditions on context rows, so its context is fold state like a scaler's
+# mean -- built from the training view only. The embedder is handed the rows and the
+# labels; `context_label` is resolved by the config layer, not by the embedder.
 
-encoder = build_encoder(config).fit(train)
-encoded_train = encoder.encode(train)
-encoded_test = encoder.encode(test)
+embedder = build_embedder(config, train)
+with torch.no_grad():
+    # .cpu() is the demo head's requirement, not the embedder's: like any nn.Module
+    # it returns on the device it lives on, so a GPU training loop needs no move.
+    encoded_train = embedder(train.batch().modalities["clinical"]).cpu()
+    encoded_test = embedder(test.batch().modalities["clinical"]).cpu()
 
-print(f"\n{encoder}")
+print(f"\n{embedder}")
 print(f"encoded_train {tuple(encoded_train.shape)} | encoded_test {tuple(encoded_test.shape)}")
 
 

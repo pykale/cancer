@@ -46,10 +46,11 @@ split:
   random_state: null    # null -> use `seed`
   stratify: event       # event | none | a column | [col, col]. Required, no default.
 
-# Frozen TabICL row representations. The checkpoint is downloaded from Hugging
-# Face on first use.
-encoder:
+# TabICL row representations. The checkpoint is downloaded from Hugging Face on
+# first use.
+embedder:
   context_label: event  # which supervision value conditions the representation
+  trainable: false      # required: fine-tuning on a few hundred patients can be destructive
   checkpoint: null      # null -> TabICL's own default checkpoint
   n_estimators: 1
   device: null          # null -> let TabICL choose
