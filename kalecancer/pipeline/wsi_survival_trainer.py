@@ -18,8 +18,7 @@ import torch
 from kale.pipeline.base_nn_trainer import BaseNNTrainer
 
 from kalecancer.model.embed.attention_mil import AttentionMIL
-from kalecancer.survival.cox import CoxHead
-from kalecancer.survival.loss import cox_ph_loss, has_risk_set
+from kalecancer.survival.cox import CoxHead, as_event_mask, has_risk_set, neg_partial_log_likelihood
 from kalecancer.survival.metrics import concordance_index
 
 logger = logging.getLogger(__name__)
@@ -37,7 +36,6 @@ class WSISurvivalTrainer(BaseNNTrainer):
         optimizer: PyKale optimizer spec, e.g. ``{"type": "AdamW", "optim_params": {...}}``.
         max_epochs: Maximum training epochs.
         init_lr: Initial learning rate.
-        ties_method: Tie handling for the Cox loss, ``"efron"`` or ``"breslow"``.
     """
 
     def __init__(
@@ -50,7 +48,6 @@ class WSISurvivalTrainer(BaseNNTrainer):
         optimizer: dict | None = None,
         max_epochs: int = 50,
         init_lr: float = 1e-4,
-        ties_method: str = "efron",
     ) -> None:
         super().__init__(optimizer=optimizer, max_epochs=max_epochs, init_lr=init_lr)
         self.save_hyperparameters()
@@ -63,7 +60,6 @@ class WSISurvivalTrainer(BaseNNTrainer):
             gated=gated,
         )
         self.cox_head = CoxHead(self.encoder.output_dim)
-        self.ties_method = ties_method
         self._epoch_outputs: dict[str, list[torch.Tensor]] = {}
 
     def forward(self, bags: list[torch.Tensor]) -> tuple[torch.Tensor, list[torch.Tensor]]:
@@ -77,7 +73,7 @@ class WSISurvivalTrainer(BaseNNTrainer):
             and ``attentions`` holds one weight vector per bag, aligned with its patches.
         """
         embeddings, attentions = self.encoder.forward_bags(bags)
-        return self.cox_head(embeddings), attentions
+        return self.cox_head(embeddings).squeeze(-1), attentions
 
     def compute_loss(self, batch: dict, split_name: str = "valid") -> tuple[torch.Tensor, dict]:
         """Cox partial-likelihood loss over the batch's risk set."""
@@ -86,7 +82,7 @@ class WSISurvivalTrainer(BaseNNTrainer):
         event = batch["event"].to(self.device)
 
         risk, _ = self.forward(bags)
-        loss = cox_ph_loss(risk, event, duration, ties_method=self.ties_method)
+        loss = neg_partial_log_likelihood(risk, duration, as_event_mask(event))
 
         # Only the evaluation splits report an epoch-level C-index.
         if split_name != "train":
@@ -149,4 +145,7 @@ class WSISurvivalTrainer(BaseNNTrainer):
             logger.warning("no events in the %s split; skipping the C-index", split_name)
             return
 
-        self.log(f"{split_name}_c_index", concordance_index(risk, event, duration), prog_bar=True)
+        index = concordance_index(
+            risk.double().numpy(), duration.double().numpy(), as_event_mask(event).numpy()
+        )
+        self.log(f"{split_name}_c_index", index, prog_bar=True)

@@ -167,38 +167,21 @@ class CoxHead(nn.Module):
             raise ValueError(f"CoxHead expects input of shape (B, {self.in_features}), got {tuple(z.shape)}")
         return self.linear(z)
 
-"""Cox proportional-hazards prediction head."""
 
-from __future__ import annotations
+def as_event_mask(events: torch.Tensor) -> torch.Tensor:
+    """Normalise an event indicator to the boolean mask the Cox routines require.
 
-import torch
-from torch import nn
-
-
-class CoxHead(nn.Module):
-    """Map a patient representation to a log partial hazard.
-
-    The output is the linear predictor of a Cox model: an unbounded score where
-    **higher means higher risk** (shorter expected time to event). It has no
-    intercept, because the Cox partial likelihood cancels any baseline hazard; use
-    :class:`~kalecancer.survival.baseline.BreslowBaselineHazard` to recover absolute
-    survival probabilities.
-
-    Args:
-        in_features: Dimension of the patient representation.
+    Accepts the ``1 = event observed`` / ``0 = censored`` convention in any numeric
+    dtype.
     """
+    return events if events.dtype == torch.bool else events.bool()
 
-    def __init__(self, in_features: int) -> None:
-        super().__init__()
-        self.risk = nn.Linear(in_features, 1, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Predict log partial hazards.
+def has_risk_set(events: torch.Tensor) -> bool:
+    """Whether a batch contains at least one observed event.
 
-        Args:
-            x: ``(batch, in_features)`` patient representations.
-
-        Returns:
-            ``(batch,)`` log partial hazards.
-        """
-        return self.risk(x).squeeze(-1)
+    The partial likelihood sums over observed events, so a batch of purely censored
+    subjects carries no gradient and :func:`neg_partial_log_likelihood` rejects it.
+    Callers should skip such batches rather than stepping the optimiser.
+    """
+    return bool(as_event_mask(events).any())

@@ -107,7 +107,6 @@ def run_split(cohort: pd.DataFrame, split: dict, cfg: CfgNode, out_dir: str | Pa
         optimizer={"type": cfg.SOLVER.OPTIMIZER, "optim_params": {"weight_decay": cfg.SOLVER.WEIGHT_DECAY}},
         max_epochs=cfg.SOLVER.MAX_EPOCHS,
         init_lr=cfg.SOLVER.BASE_LR,
-        ties_method=cfg.SURVIVAL.TIES,
     )
 
     checkpoint = ModelCheckpoint(

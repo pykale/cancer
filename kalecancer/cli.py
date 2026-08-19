@@ -157,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = resolve_config(args)
     if args.print_config:
-        print(cfg.dump())
+        print(cfg.dump())  # noqa: T201 - stdout is this command's output
         return 0
 
     if cfg.DATASET.SOURCE == "local":

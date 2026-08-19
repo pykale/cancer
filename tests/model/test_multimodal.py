@@ -113,7 +113,7 @@ def test_early_fusion_head_reads_the_fused_representation(encoders) -> None:
     model = build("early", encoders, fused_dim=48)
 
     assert model.fusion.output_dim == 48
-    assert model.head.risk.in_features == 48
+    assert model.head.linear.in_features == 48
 
 
 @pytest.mark.parametrize(("method", "kwargs"), [("concat", {}), ("poe", {}), ("lowrank", {"rank": 3})])

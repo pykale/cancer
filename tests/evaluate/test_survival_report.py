@@ -22,14 +22,16 @@ from kalecancer.pipeline import WSISurvivalTrainer
 from tests.conftest import FEATURE_DIM
 
 
-def make_predictions(split: str = "test", n: int = 12) -> SplitPredictions:
-    torch.manual_seed(0)
+def make_predictions(split: str = "test", n: int = 12, seed: int = 0) -> SplitPredictions:
+    """Predictions whose follow-up comfortably spans the horizons used below."""
+    generator = torch.Generator().manual_seed(seed)
     return SplitPredictions(
         split=split,
         patient_ids=[f"{i:03d}" for i in range(n)],
-        risk=torch.randn(n),
-        duration=torch.rand(n) * 1000 + 50,
-        event=(torch.rand(n) < 0.5).int(),
+        risk=torch.randn(n, generator=generator),
+        duration=torch.rand(n, generator=generator) * 1800 + 100,
+        # A censored majority keeps the censoring distribution defined at every horizon.
+        event=(torch.rand(n, generator=generator) < 0.3).int(),
     )
 
 
@@ -63,9 +65,20 @@ def test_evaluate_reports_harrell_without_training_predictions() -> None:
 
 
 def test_evaluate_adds_censoring_aware_metrics_with_training_predictions() -> None:
-    metrics = evaluate_predictions(make_predictions(n=30), make_predictions("train", n=40), [365.0])
+    metrics = evaluate_predictions(
+        make_predictions(n=120, seed=1), make_predictions("train", n=200, seed=2), [365.0, 1095.0]
+    )
 
-    assert {"c_index", "c_index_ipcw", "auc"} <= set(metrics)
+    assert {"c_index", "auc", "mean_auc", "integrated_brier_score"} <= set(metrics)
+    assert set(metrics["auc"]) == {"365", "1095"}
+
+
+def test_evaluate_records_why_censoring_weighted_metrics_were_unavailable() -> None:
+    """A cohort too small to support IPCW must not abort the run."""
+    metrics = evaluate_predictions(make_predictions(n=6), make_predictions("train", n=6), [365.0])
+
+    assert "c_index" in metrics
+    assert "censoring_weighted_metrics_error" in metrics
 
 
 def test_summarise_folds_reports_mean_and_spread() -> None:

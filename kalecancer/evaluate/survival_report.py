@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from kalecancer.survival.metrics import survival_metrics
+from kalecancer.evaluate.survival_metrics import integrated_brier, time_dependent_auc, usable_eval_times
+from kalecancer.survival.baseline import breslow_baseline_hazard, predict_survival_function
+from kalecancer.survival.metrics import concordance_index
 from kalecancer.utils.io import write_csv, write_json
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -74,24 +80,63 @@ def evaluate_predictions(
 ) -> dict:
     """Compute survival metrics for a split.
 
-    Censoring-weighted metrics and the Brier score need the training outcomes, which
-    supply a leakage-free censoring distribution and the baseline hazard.
+    Harrell's C-index is always reported. The censoring-weighted metrics additionally
+    need the training outcomes, which supply a leakage-free estimate of the censoring
+    distribution.
 
     Args:
         predictions: Predictions for the split being scored.
         train_predictions: Predictions on the training split.
         eval_times: Horizons for the time-dependent metrics, in the unit of ``duration``.
+
+    Returns:
+        Metric names mapped to values; time-dependent entries are keyed by horizon.
     """
-    horizons = torch.tensor(eval_times, dtype=torch.float32) if eval_times else None
-    return survival_metrics(
-        predictions.risk,
-        predictions.event,
-        predictions.duration,
-        train_risk=None if train_predictions is None else train_predictions.risk,
-        train_event=None if train_predictions is None else train_predictions.event,
-        train_time=None if train_predictions is None else train_predictions.duration,
-        eval_times=horizons,
-    )
+    risk = predictions.risk.numpy().astype(float)
+    times = predictions.duration.numpy().astype(float)
+    events = predictions.event.numpy().astype(bool)
+
+    metrics: dict = {
+        "num_patients": float(len(risk)),
+        "num_events": float(events.sum()),
+        "c_index": concordance_index(risk, times, events),
+    }
+    if train_predictions is None or not eval_times:
+        return metrics
+
+    train_times = train_predictions.duration.numpy().astype(float)
+    train_events = train_predictions.event.numpy().astype(bool)
+
+    # Horizons must sit inside both follow-ups: the training one supplies the IPCW
+    # weights, the test one is what the metrics are computed over.
+    horizons = usable_eval_times(np.asarray(eval_times, dtype=float), times)
+    horizons = usable_eval_times(horizons, train_times)
+    if horizons.size < 2:
+        metrics["censoring_weighted_metrics_error"] = (
+            f"fewer than two of {list(eval_times)} fall inside the observed follow-up"
+        )
+        return metrics
+
+    # IPCW weighting needs a censoring distribution that supports every horizon;
+    # too few censored subjects leaves it undefined, which must not abort a run.
+    try:
+        auc, mean_auc = time_dependent_auc(train_times, train_events, times, events, risk, horizons)
+        metrics["auc"] = {f"{time:.0f}": float(value) for time, value in zip(horizons, auc, strict=True)}
+        metrics["mean_auc"] = float(mean_auc)
+
+        # The baseline hazard is fitted on the training split only; fitting it on the
+        # split being scored would leak its event times into its own evaluation.
+        event_times, cumulative_hazard = breslow_baseline_hazard(
+            train_predictions.risk.numpy().astype(float), train_times, train_events
+        )
+        survival_probs = predict_survival_function(risk, event_times, cumulative_hazard, horizons)
+        metrics["integrated_brier_score"] = float(
+            integrated_brier(train_times, train_events, times, events, survival_probs, horizons)
+        )
+    except ValueError as error:
+        logger.warning("censoring-weighted metrics unavailable: %s", error)
+        metrics["censoring_weighted_metrics_error"] = str(error)
+    return metrics
 
 
 def summarise_folds(fold_metrics: list[dict], split: str = "test") -> dict:

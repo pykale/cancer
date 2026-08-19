@@ -1,162 +1,89 @@
-"""Tests for censoring-aware survival metrics."""
+"""Tests for ``kalecancer.survival.metrics``."""
 
 from __future__ import annotations
 
-import pytest
+import numpy as np
 import torch
 
-from kalecancer.survival import (
-    censoring_weights,
-    concordance_index,
-    survival_metrics,
-    usable_eval_times,
-)
+from kalecancer.survival.metrics import concordance_index
+from kalecancer.survival.synthetic import make_synthetic_survival
 
 
-@pytest.fixture
-def cohort() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    torch.manual_seed(0)
-    time = torch.rand(64) * 2000 + 50
-    event = (torch.rand(64) < 0.4).int()
-    return torch.randn(64), event, time
+def _concordance(risk: torch.Tensor, times: torch.Tensor, events: torch.Tensor) -> float:
+    """Harrell's C computed naively in O(n^2); reference for tests only."""
+    concordant, comparable = 0.0, 0.0
+    n = times.shape[0]
+    for i in range(n):
+        if not events[i]:
+            continue
+        for j in range(n):
+            if times[j] > times[i]:
+                comparable += 1.0
+                if risk[i] > risk[j]:
+                    concordant += 1.0
+                elif risk[i] == risk[j]:
+                    concordant += 0.5
+    return concordant / comparable
 
 
-def test_concordance_is_one_for_a_perfect_ranking() -> None:
-    time = torch.tensor([10.0, 50.0, 100.0, 400.0])
-    event = torch.ones(4, dtype=torch.int)
+def test_perfect_reversed_and_random_ranking() -> None:
+    times = np.arange(1, 101, dtype=np.float64)
+    events = np.ones(100, dtype=bool)
 
-    # Higher risk must mean shorter survival.
-    assert concordance_index(-time, event, time) == pytest.approx(1.0)
+    # Highest risk assigned to the earliest event -> every comparable pair concordant.
+    perfect_risk = -times
+    assert concordance_index(perfect_risk, times, events) == 1.0
 
+    # Highest risk assigned to the latest event -> every comparable pair discordant.
+    reversed_risk = times
+    assert concordance_index(reversed_risk, times, events) == 0.0
 
-def test_concordance_is_zero_for_a_reversed_ranking() -> None:
-    time = torch.tensor([10.0, 50.0, 100.0, 400.0])
-    event = torch.ones(4, dtype=torch.int)
-
-    assert concordance_index(time, event, time) == pytest.approx(0.0)
-
-
-def test_evaluation_horizons_outside_follow_up_are_dropped() -> None:
-    time = torch.tensor([100.0, 500.0, 900.0])
-
-    horizons = usable_eval_times(torch.tensor([50.0, 365.0, 5000.0]), time)
-
-    assert horizons.tolist() == [365.0]
+    rng = np.random.default_rng(42)
+    n = 5000
+    random_times = rng.uniform(1.0, 100.0, size=n)
+    random_events = rng.random(n) < 0.7
+    random_risk = rng.standard_normal(n)  # uncorrelated with outcome
+    c = concordance_index(random_risk, random_times, random_events)
+    assert abs(c - 0.5) < 0.05
 
 
-def test_censoring_weights_are_derived_from_the_supplied_cohort(cohort) -> None:
-    _, event, time = cohort
-    query = torch.tensor([365.0, 1095.0])
+def test_all_tied_risks_is_exactly_half() -> None:
+    times = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    events = np.array([True, False, True, True, False])
+    risk = np.zeros(5)  # every pair ties in risk
 
-    weights = censoring_weights(event, time, new_time=query)
-
-    assert weights.shape == (2,)
-    assert bool((weights > 0).all())
+    assert concordance_index(risk, times, events) == 0.5
 
 
-def test_reports_harrell_without_training_outcomes(cohort) -> None:
-    risk, event, time = cohort
+def test_agrees_with_on_squared_reference() -> None:
+    data = make_synthetic_survival(seed=3)
 
-    metrics = survival_metrics(risk, event, time)
+    reference = _concordance(data.true_risk, data.times, data.events)
+    vectorised = concordance_index(data.true_risk.numpy(), data.times.numpy(), data.events.numpy())
 
-    assert set(metrics) == {"c_index", "num_patients", "num_events"}
-    assert metrics["num_patients"] == 64.0
-
-
-def test_adds_censoring_aware_metrics_with_training_outcomes(cohort) -> None:
-    risk, event, time = cohort
-    train, test = slice(0, 40), slice(40, None)
-
-    metrics = survival_metrics(
-        risk[test],
-        event[test],
-        time[test],
-        train_risk=risk[train],
-        train_event=event[train],
-        train_time=time[train],
-        eval_times=torch.tensor([365.0, 1095.0]),
-    )
-
-    assert {"c_index", "c_index_ipcw", "auc", "brier", "integrated_brier_score"} <= set(metrics)
-    assert 0.0 <= metrics["integrated_brier_score"] <= 1.0
-    assert set(metrics["auc"]) == {"365", "1095"}
+    assert abs(vectorised - reference) < 1e-9
 
 
-def test_brier_score_needs_training_risk_scores(cohort) -> None:
-    """Without training risks there is no baseline hazard, so no survival curve."""
-    risk, event, time = cohort
-    train, test = slice(0, 40), slice(40, None)
+def test_censored_never_form_comparable_pair_as_earlier_subject() -> None:
+    # Patient 0 is CENSORED at t=1, earlier than both other patients, with a
+    # huge risk score. If censoring were (wrongly) ignored when picking the
+    # earlier subject of a pair, patient 0 would form two extra "concordant"
+    # pairs with patients 1 and 2, inflating C from 0.0 to 2/3. The only
+    # legitimate comparable pair is (1, 2): patient 1 (event, t=2) is earlier
+    # than patient 2 (t=3), and its lower risk makes that pair discordant.
+    times = np.array([1.0, 2.0, 3.0])
+    events = np.array([False, True, True])
+    risk = np.array([100.0, -1.0, 5.0])
 
-    metrics = survival_metrics(
-        risk[test],
-        event[test],
-        time[test],
-        train_event=event[train],
-        train_time=time[train],
-        eval_times=torch.tensor([365.0]),
-    )
-
-    assert "auc" in metrics
-    assert "brier" not in metrics
+    assert concordance_index(risk, times, events) == 0.0
 
 
-def test_horizons_beyond_follow_up_are_skipped_entirely(cohort) -> None:
-    risk, event, time = cohort
-    train, test = slice(0, 40), slice(40, None)
+def test_no_comparable_pairs_raises() -> None:
+    import pytest
 
-    metrics = survival_metrics(
-        risk[test],
-        event[test],
-        time[test],
-        train_risk=risk[train],
-        train_event=event[train],
-        train_time=time[train],
-        eval_times=torch.tensor([99999.0]),
-    )
+    times = np.array([1.0, 2.0, 3.0])
+    events = np.array([False, False, False])
+    risk = np.zeros(3)
 
-    assert "auc" not in metrics
-
-
-def test_split_without_events_reports_undefined_instead_of_raising(cohort) -> None:
-    """A cross-validation fold can land with no events; that must not kill the run."""
-    risk, _, time = cohort
-    censored = torch.zeros(len(risk), dtype=torch.int)
-
-    metrics = survival_metrics(risk, censored, time)
-
-    assert metrics["num_events"] == 0.0
-    assert "c_index" not in metrics
-
-
-def test_training_split_without_events_skips_weighted_metrics(cohort) -> None:
-    risk, event, time = cohort
-    train, test = slice(0, 40), slice(40, None)
-
-    metrics = survival_metrics(
-        risk[test],
-        event[test],
-        time[test],
-        train_event=torch.zeros(40, dtype=torch.int),
-        train_time=time[train],
-        eval_times=torch.tensor([365.0]),
-    )
-
-    assert "c_index" in metrics
-    assert "c_index_ipcw" not in metrics
-
-
-def test_unusable_horizons_are_reported(cohort, caplog) -> None:
-    risk, event, time = cohort
-    train, test = slice(0, 40), slice(40, None)
-
-    with caplog.at_level("WARNING"):
-        survival_metrics(
-            risk[test],
-            event[test],
-            time[test],
-            train_event=event[train],
-            train_time=time[train],
-            eval_times=torch.tensor([99999.0]),
-        )
-
-    assert "evaluation horizons" in caplog.text
+    with pytest.raises(ValueError):
+        concordance_index(risk, times, events)

@@ -15,7 +15,7 @@ No data or credentials needed — patches are fetched from the published
 [HANCOCK dataset](https://hancock.research.fau.eu/) (CC BY 4.0):
 
 ```bash
-pip install -e ".[survival]"
+pip install -e .
 kalecancer wsi-survival --source hancock --patients 50 --preset quick
 ```
 
@@ -47,14 +47,13 @@ Requires **Python ≥ 3.10**.
 ```bash
 git clone https://github.com/pykale/cancer.git
 cd cancer
-pip install -e ".[survival]"
+pip install -e .
 ```
 
 Heavy libraries are kept out of the core install:
 
 | Extra | Packages | When to use |
 | --- | --- | --- |
-| `survival` | torchsurv | Time-to-event losses and metrics |
 | `imaging` | monai, nibabel, pydicom, SimpleITK | DICOM / NIfTI workflows |
 | `pathology` | openslide-python, tifffile | Reading whole-slide images |
 | `interpret` | shap, captum | Model explanation |
@@ -86,7 +85,7 @@ Early development. A preliminary version is targeted for **31 August 2026**.
 ## Contributing
 
 1. Fork the repository and create a feature branch.
-2. `pip install -e ".[dev,survival]"`.
+2. `pip install -e ".[dev]"`.
 3. Run the same checks as CI:
 
    ```bash

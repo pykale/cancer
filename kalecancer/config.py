@@ -96,8 +96,6 @@ _C.FUSION.MODALITY_DROPOUT = 0.0
 _C.SURVIVAL = CfgNode()
 # Endpoint key; see kalecancer.loaddata.clinical_access.ENDPOINTS.
 _C.SURVIVAL.ENDPOINT = "OS"
-# Tie handling in the Cox partial likelihood: "efron" or "breslow".
-_C.SURVIVAL.TIES = "efron"
 # Horizons for time-dependent metrics, in the unit of the survival time.
 _C.SURVIVAL.EVAL_TIMES = [365.0, 1095.0, 1825.0]
 

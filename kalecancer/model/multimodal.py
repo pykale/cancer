@@ -31,8 +31,7 @@ import torch
 from torch import nn
 
 from kalecancer.model.embed.multimodal_fusion import FusionBlock, build_fusion
-from kalecancer.survival.cox import CoxHead
-from kalecancer.survival.loss import cox_ph_loss
+from kalecancer.survival.cox import CoxHead, as_event_mask, neg_partial_log_likelihood
 
 
 @dataclass
@@ -170,7 +169,7 @@ class EarlyFusionSurvival(MultimodalSurvivalModel):
 
     def forward(self, inputs: Mapping[str, torch.Tensor], mask: torch.Tensor | None = None) -> MultimodalOutput:
         latents, mask = self._encode(inputs, mask)
-        return MultimodalOutput(risk=self.head(self.fusion(latents, mask)))
+        return MultimodalOutput(risk=self.head(self.fusion(latents, mask)).squeeze(-1))
 
 
 class LateFusionSurvival(MultimodalSurvivalModel):
@@ -205,7 +204,9 @@ class LateFusionSurvival(MultimodalSurvivalModel):
 
     def forward(self, inputs: Mapping[str, torch.Tensor], mask: torch.Tensor | None = None) -> MultimodalOutput:
         self._ordered(inputs)
-        modality_risk = {name: self.heads[name](self.encoders[name](inputs[name])) for name in self.modalities}
+        modality_risk = {
+            name: self.heads[name](self.encoders[name](inputs[name])).squeeze(-1) for name in self.modalities
+        }
         risks = torch.stack([modality_risk[name] for name in self.modalities], dim=1)
         mask = self._resolve_mask(risks.shape[0], mask, risks.device)
 
@@ -271,13 +272,14 @@ class HybridFusionSurvival(EarlyFusionSurvival):
 
     def forward(self, inputs: Mapping[str, torch.Tensor], mask: torch.Tensor | None = None) -> MultimodalOutput:
         latents, mask = self._encode(inputs, mask)
-        fused_risk = self.head(self.fusion(latents, mask))
+        fused_risk = self.head(self.fusion(latents, mask)).squeeze(-1)
 
         if self.auxiliary is None:
             return MultimodalOutput(risk=fused_risk)
 
         modality_risk = {
-            name: self.auxiliary[name](latent) for name, latent in zip(self.modalities, latents, strict=True)
+            name: self.auxiliary[name](latent).squeeze(-1)
+            for name, latent in zip(self.modalities, latents, strict=True)
         }
         if not self.combine_risks:
             return MultimodalOutput(risk=fused_risk, modality_risk=modality_risk)
@@ -295,7 +297,6 @@ def multimodal_cox_loss(
     event: torch.Tensor,
     duration: torch.Tensor,
     auxiliary_weight: float = 0.0,
-    ties_method: str = "efron",
 ) -> torch.Tensor:
     """Cox loss on the fused risk, optionally supervising each modality too.
 
@@ -308,14 +309,13 @@ def multimodal_cox_loss(
         event: ``(batch,)`` indicator, 1 observed and 0 censored.
         duration: ``(batch,)`` event or censoring times.
         auxiliary_weight: Weight on the mean per-modality loss. 0 disables it.
-        ties_method: Tie handling passed to the Cox loss.
     """
-    loss = cox_ph_loss(output.risk, event, duration, ties_method=ties_method)
+    loss = neg_partial_log_likelihood(output.risk, duration, as_event_mask(event))
     if auxiliary_weight <= 0 or not output.modality_risk:
         return loss
 
     auxiliary = torch.stack(
-        [cox_ph_loss(risk, event, duration, ties_method=ties_method) for risk in output.modality_risk.values()]
+        [neg_partial_log_likelihood(risk, duration, as_event_mask(event)) for risk in output.modality_risk.values()]
     )
     return loss + auxiliary_weight * auxiliary.mean()
 
