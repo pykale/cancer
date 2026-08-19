@@ -133,6 +133,18 @@ class SurvivalTarget:
         row = self._row_of[identifier]
         return {"time": self._times[row], "event": self._events[row]}
 
+    def values_for(self, identifiers: Sequence[str]) -> dict[str, Tensor]:
+        """The batched sibling of :meth:`for_`: the same keys and dtypes, many samples.
+
+        Lets a caller ask for supervision by name -- ``values_for(ids)["event"]`` --
+        without knowing this is a survival target. Tensors rather than arrays, so a
+        batch built from this is indistinguishable from one built by collating
+        :meth:`for_`; :meth:`events_for` and :meth:`times_for` are the numpy doors,
+        for scikit-learn.
+        """
+        rows = self._rows(identifiers)
+        return {"time": self._times[rows], "event": self._events[rows]}
+
     def events_for(self, identifiers: Sequence[str]) -> np.ndarray:
         """Event indicators for ``identifiers``, as a float array."""
         return self._gather(self._events, identifiers)
@@ -148,9 +160,12 @@ class SurvivalTarget:
         """
         return self.events_for(identifiers)
 
+    def _rows(self, identifiers: Sequence[str]) -> Tensor:
+        """Row positions for ``identifiers``, as an index tensor."""
+        return torch.tensor([self._row_of[i] for i in identifiers], dtype=torch.long)
+
     def _gather(self, source: Tensor, identifiers: Sequence[str]) -> np.ndarray:
-        rows = torch.tensor([self._row_of[i] for i in identifiers], dtype=torch.long)
-        return source[rows].numpy().astype(float)
+        return source[self._rows(identifiers)].numpy().astype(float)
 
     def summarise(self, identifiers: Sequence[str]) -> str:
         """One-line description of events and follow-up across ``identifiers``."""
