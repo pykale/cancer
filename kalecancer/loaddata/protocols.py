@@ -57,6 +57,19 @@ class Target(Protocol):
         """
         ...
 
+    def values_for(self, identifiers: Sequence[str]) -> dict[str, Tensor]:
+        """The same values for many samples: ``for_`` with a leading batch dimension.
+
+        Every consumer that is not a ``DataLoader`` wants this form -- a whole split's
+        labels for an embedder to condition on, a full-batch loss, a metric over the
+        held-out set. Looping :meth:`for_` costs a Python call per sample; a target
+        that stores its values as arrays answers this in one indexing operation.
+
+        Must return the same keys and the same dtypes as :meth:`for_`, and agree with
+        it value for value -- the two are read by different paths over the same data.
+        """
+        ...
+
 
 class Preprocessor(Protocol):
     """Fitted state belonging to exactly one cross-validation fold.
@@ -95,11 +108,11 @@ def check_target(target: object) -> None:
     Raises:
         TypeError: If any part of the contract is absent.
     """
-    missing = [name for name in ("required_columns", "bind", "for_") if not hasattr(target, name)]
+    missing = [name for name in ("required_columns", "bind", "for_", "values_for") if not hasattr(target, name)]
     if missing:
         raise TypeError(
             f"{type(target).__name__} is not a valid Target: missing {missing}. "
             f"A target must declare required_columns, and implement "
-            f"bind(identifiers, values) and for_(identifier). See "
+            f"bind(identifiers, values), for_(identifier) and values_for(identifiers). See "
             f"kalecancer.loaddata.protocols.Target."
         )

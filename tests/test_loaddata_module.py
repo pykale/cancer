@@ -7,7 +7,6 @@ otherwise invisible: overlapping splits, and a preprocessor carrying held-out ro
 
 from __future__ import annotations
 
-import numpy as np
 import pytest
 import torch
 
@@ -20,8 +19,8 @@ from tests.conftest import CONTINUOUS
 @pytest.fixture
 def folds(cohort):
     """A three-way split: inner train, inner validation, outer test."""
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
-    return train_idx[:45], train_idx[45:], test_idx
+    train_ids, test_ids = cohort.split(test_size=0.25, random_state=0, stratify=True)
+    return train_ids[:45], train_ids[45:], test_ids
 
 
 # =========================================================================== #
@@ -42,28 +41,26 @@ def test_batch_size_must_be_a_positive_integer_or_full(cohort, folds, bad):
 
 
 def test_full_resolves_to_the_training_split_size(cohort, folds):
-    train_idx, _, _ = folds
-    dm = CohortDataModule(cohort, train_idx, batch_size="full")
+    train_ids, _, _ = folds
+    dm = CohortDataModule(cohort, train_ids, batch_size="full")
     dm.setup()
-    assert next(iter(dm.train_dataloader())).modalities["clinical"].shape[0] == len(train_idx)
+    assert next(iter(dm.train_dataloader())).modalities["clinical"].shape[0] == len(train_ids)
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "expected"),
-    [
-        ({"val_idx": np.arange(5)}, "train and validation"),
-        ({"test_idx": np.arange(5)}, "train and test"),
-    ],
+    ("overlapping", "expected"),
+    [("val_ids", "train and validation"), ("test_ids", "train and test")],
 )
-def test_overlapping_splits_are_refused(cohort, kwargs, expected):
+def test_overlapping_splits_are_refused(cohort, overlapping, expected):
     """Independent of any preprocessor: evaluating on trained rows is wrong regardless.
 
     The leakage guard cannot see this when a cohort declares no stateful
     transforms, because a passthrough claims no rows -- so this check stands on
     its own.
     """
+    ten = cohort.identifiers[:10]
     with pytest.raises(ValueError, match=expected):
-        CohortDataModule(cohort, np.arange(10), batch_size=4, **kwargs)
+        CohortDataModule(cohort, ten, batch_size=4, **{overlapping: ten[:5]})
 
 
 def test_batch_size_is_recorded_in_the_hyperparameters(cohort, folds):
@@ -79,11 +76,11 @@ def test_batch_size_is_recorded_in_the_hyperparameters(cohort, folds):
 
 
 def test_setup_fits_on_the_training_rows_only(cohort, folds):
-    train_idx, val_idx, test_idx = folds
-    dm = CohortDataModule(cohort, train_idx, val_idx, test_idx, batch_size=8)
+    train_ids, val_ids, test_ids = folds
+    dm = CohortDataModule(cohort, train_ids, val_ids, test_ids, batch_size=8)
     dm.setup()
 
-    assert dm.preprocessor.fitted_on == {cohort.identifiers[i] for i in train_idx}
+    assert dm.preprocessor.fitted_on == set(train_ids)
 
 
 def test_setup_builds_every_view_from_the_same_preprocessor(cohort, folds):
@@ -114,8 +111,8 @@ def test_setup_does_not_mutate_the_cohort(cohort, folds):
 
 def test_held_out_rows_are_standardised_with_training_statistics(cohort, folds):
     """End to end through the data module, not just through the cohort."""
-    train_idx, _, test_idx = folds
-    dm = CohortDataModule(cohort, train_idx, test_idx=test_idx, batch_size="full")
+    train_ids, _, test_ids = folds
+    dm = CohortDataModule(cohort, train_ids, test_ids=test_ids, batch_size="full")
     dm.setup()
 
     train_batch = next(iter(dm.train_dataloader()))
@@ -134,26 +131,26 @@ def test_held_out_rows_are_standardised_with_training_statistics(cohort, folds):
 def test_a_supplied_preprocessor_fitted_on_held_out_rows_is_refused(cohort, folds):
     """The one path by which held-out statistics can reach a fold.
 
-    In the default flow this cannot happen -- setup fits on ``train_idx`` and the
+    In the default flow this cannot happen -- setup fits on ``train_ids`` and the
     splits are already known to be disjoint. Supplying a preprocessor is the
     escape hatch, so it is the escape hatch that is policed.
     """
-    train_idx, val_idx, test_idx = folds
-    leaky = cohort.fit_preprocessor(np.arange(len(cohort)))
-    dm = CohortDataModule(cohort, train_idx, val_idx, test_idx, batch_size=8, preprocessor=leaky)
+    train_ids, val_ids, test_ids = folds
+    leaky = cohort.fit_preprocessor(cohort.identifiers)
+    dm = CohortDataModule(cohort, train_ids, val_ids, test_ids, batch_size=8, preprocessor=leaky)
 
     with pytest.raises(LeakageError) as excinfo:
         dm.setup()
     message = str(excinfo.value)
     assert "validation" in message
-    assert cohort.identifiers[val_idx[0]] in message, "name the patients involved"
+    assert val_ids[0] in message, "name the patients involved"
 
 
 def test_a_legitimately_supplied_preprocessor_is_accepted(cohort, folds):
     """Reusing a fold's statistics downstream is a real workflow, not a mistake."""
-    train_idx, _, test_idx = folds
-    prep = cohort.fit_preprocessor(train_idx)
-    dm = CohortDataModule(cohort, train_idx, test_idx=test_idx, batch_size=8, preprocessor=prep)
+    train_ids, _, test_ids = folds
+    prep = cohort.fit_preprocessor(train_ids)
+    dm = CohortDataModule(cohort, train_ids, test_ids=test_ids, batch_size=8, preprocessor=prep)
     dm.setup()
 
     assert dm.preprocessor is prep
@@ -164,9 +161,9 @@ def test_a_passthrough_preprocessor_never_trips_the_guard(make_cohort, folds):
     cohort = make_cohort(
         continuous=["biomarker"], continuous_transform=None, categorical=[], categorical_transform=None
     )
-    train_idx, val_idx, test_idx = folds
-    prep = cohort.fit_preprocessor(np.arange(len(cohort)))
-    CohortDataModule(cohort, train_idx, val_idx, test_idx, batch_size=8, preprocessor=prep).setup()
+    train_ids, val_ids, test_ids = folds
+    prep = cohort.fit_preprocessor(cohort.identifiers)
+    CohortDataModule(cohort, train_ids, val_ids, test_ids, batch_size=8, preprocessor=prep).setup()
 
 
 # =========================================================================== #
@@ -186,8 +183,8 @@ def test_loaders_yield_patient_batches(cohort, folds):
 
 def test_only_the_training_loader_shuffles(cohort, folds):
     """A shuffled validation loader makes per-batch metrics irreproducible."""
-    train_idx, val_idx, test_idx = folds
-    dm = CohortDataModule(cohort, train_idx, val_idx, test_idx, batch_size=8)
+    train_ids, val_ids, test_ids = folds
+    dm = CohortDataModule(cohort, train_ids, val_ids, test_ids, batch_size=8)
     dm.setup()
 
     assert dm.train_dataloader().sampler.__class__.__name__ == "RandomSampler"
@@ -257,8 +254,8 @@ def test_a_trainer_can_fit_and_test_through_the_data_module(cohort, folds):
         def configure_optimizers(self):
             return torch.optim.SGD(self.parameters(), lr=1e-3)
 
-    train_idx, val_idx, test_idx = folds
-    dm = CohortDataModule(cohort, train_idx, val_idx, test_idx, batch_size=8)
+    train_ids, val_ids, test_ids = folds
+    dm = CohortDataModule(cohort, train_ids, val_ids, test_ids, batch_size=8)
     dm.setup()
     model = Toy(dm.preprocessor.width)
 

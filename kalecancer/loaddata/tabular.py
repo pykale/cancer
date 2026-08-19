@@ -12,7 +12,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import make_pipeline
 from torch import Tensor
 
-from kalecancer.loaddata.base import Cohort, Indices, NotFittedError
+from kalecancer.loaddata.base import Cohort, Identifiers, NotFittedError
 from kalecancer.loaddata.protocols import Target
 from kalecancer.prepdata.tabular import TabularPreprocessor
 
@@ -85,9 +85,9 @@ class TabularCohort(Cohort):
         ...     categorical_transform=OneHotEncoder(handle_unknown="ignore",
         ...                                         sparse_output=False),
         ... )
-        >>> train_idx, test_idx = cohort.split(test_size=0.2, random_state=0, stratify=True)
-        >>> prep = cohort.fit_preprocessor(train_idx)     # fitted on train rows only
-        >>> train, test = cohort.view(train_idx, prep), cohort.view(test_idx, prep)
+        >>> train_ids, test_ids = cohort.split(test_size=0.2, random_state=0, stratify=True)
+        >>> prep = cohort.fit_preprocessor(train_ids)     # fitted on train rows only
+        >>> train, test = cohort.view(train_ids, prep), cohort.view(test_ids, prep)
 
         A frame is the seam for anything between reading the file and binding the
         target, so the decision stays visible in your script:
@@ -229,8 +229,8 @@ class TabularCohort(Cohort):
     # fold-local fitting
     # ------------------------------------------------------------------ #
 
-    def fit_preprocessor(self, indices: Indices) -> TabularPreprocessor:
-        """Fit the declared transforms on ``indices`` only, and return the artifact.
+    def fit_preprocessor(self, identifiers: Identifiers) -> TabularPreprocessor:
+        """Fit the declared transforms on the named samples only, and return the artifact.
 
         The cohort is not modified, so folds are independent and can be fitted in
         parallel.
@@ -239,7 +239,7 @@ class TabularCohort(Cohort):
             TabularPreprocessor: Fitted transforms, the resulting feature names, and
             the identifiers they were fitted on.
         """
-        rows = list(indices)
+        ids = self.check_identifiers(identifiers)
         columns = self.feature_columns
         if self._spec is None:
             # Nothing stateful was declared. fitted_on stays empty: a passthrough
@@ -247,12 +247,12 @@ class TabularCohort(Cohort):
             return TabularPreprocessor(None, columns, feature_names={self.name: list(columns)})
 
         transformer = sk_clone(self._spec)
-        transformer.fit(self._frame.iloc[rows][columns])
+        transformer.fit(self._frame.iloc[self.index_of(ids)][columns])
         return TabularPreprocessor(
             transformer,
             columns,
             feature_names={self.name: list(transformer.get_feature_names_out())},
-            fitted_on=frozenset(self.identifiers[i] for i in rows),
+            fitted_on=frozenset(ids),
         )
 
     # ------------------------------------------------------------------ #
@@ -285,9 +285,9 @@ class TabularCohort(Cohort):
             raise NotFittedError(
                 f"{type(self).__name__} was asked for values with no preprocessor.\n"
                 f"  Fit one on this fold's training rows first:\n"
-                f"      prep = cohort.fit_preprocessor(train_idx)\n"
-                f"      train = cohort.view(train_idx, prep)\n"
-                f"      val   = cohort.view(val_idx, prep)   # same prep, never refitted\n"
+                f"      prep = cohort.fit_preprocessor(train_ids)\n"
+                f"      train = cohort.view(train_ids, prep)\n"
+                f"      val   = cohort.view(val_ids, prep)   # same prep, never refitted\n"
                 f"  For the untransformed values, use cohort.frame."
             )
 

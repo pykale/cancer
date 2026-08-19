@@ -1,25 +1,24 @@
-"""The fold-local dataset: a row subset of a cohort, under one fitted preprocessor.
+"""The fold-local dataset: a named subset of a cohort, under one fitted preprocessor.
 
 The only ``torch.utils.data.Dataset`` in the package. A cohort is an index, not a
 dataset; pairing it with rows and a preprocessor is what a ``DataLoader`` can iterate.
 
-Cheap -- an index array and two references -- so one per fold costs nothing, with no
-cloning and nothing to keep in sync.
+Cheap -- a list of identifiers and two references -- so one per fold costs nothing,
+with no cloning and nothing to keep in sync.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-import numpy as np
+import torch
 from torch import Tensor
 from torch.utils.data import Dataset as TorchDataset
 
-from kalecancer.loaddata.sample import PatientSample
+from kalecancer.loaddata.sample import PatientBatch, PatientSample, collate_samples
 
 if TYPE_CHECKING:  # import only for type checking -- avoids a cycle with base.py
-    from kalecancer.loaddata.base import Cohort
+    from kalecancer.loaddata.base import Cohort, Identifiers
     from kalecancer.loaddata.protocols import Preprocessor
 
 
@@ -31,19 +30,18 @@ class CohortView(TorchDataset):
     Args:
         cohort (Cohort): Held by reference and never mutated, so several folds' views
             share one cohort safely.
-        indices (Sequence[int] | np.ndarray): Positional indices into
-            ``cohort.identifiers``.
+        identifiers (Identifiers): Which samples, named. Validated against the cohort.
         preprocessor (Preprocessor | None): This fold's fitted state.
     """
 
     def __init__(
         self,
         cohort: Cohort,
-        indices: Sequence[int] | np.ndarray,
+        identifiers: Identifiers,
         preprocessor: Preprocessor | None,
     ):
         self.cohort = cohort
-        self.indices = np.asarray(indices, dtype=int)
+        self.identifiers = cohort.check_identifiers(identifiers)
         self.preprocessor = preprocessor
 
         # Caching is the cohort's decision, not the view's: one with a stochastic
@@ -53,11 +51,15 @@ class CohortView(TorchDataset):
             self._check_cache_alignment()
 
     def __len__(self) -> int:
-        return len(self.indices)
+        return len(self.identifiers)
 
     def __getitem__(self, i: int) -> PatientSample:
-        """Return one training item. ``i`` is a position within this view, not the cohort."""
-        identifier = self.cohort.identifiers[self.indices[i]]
+        """Return one training item.
+
+        ``i`` is a position within this view -- torch's ``Dataset`` contract, and the
+        only place in the API where a sample is reached for by number.
+        """
+        identifier = self.identifiers[i]
         if self._cache is None:
             modalities = self.cohort.payload(identifier, self.preprocessor)
         else:
@@ -69,10 +71,43 @@ class CohortView(TorchDataset):
             target={} if self.cohort.target is None else self.cohort.target.for_(identifier),
         )
 
-    @property
-    def identifiers(self) -> list[str]:
-        """Identifiers of this view's rows, in order."""
-        return [self.cohort.identifiers[i] for i in self.indices]
+    def batch(self) -> PatientBatch:
+        """Every sample in this view, collated into one :class:`PatientBatch`.
+
+        The bulk counterpart to iterating: features per modality, the target, the
+        identifiers and the padding masks, all in one object -- the same one a
+        ``DataLoader`` produces, so code written against a batch works either way.
+
+        For fitting an embedder's context, for a full-batch loss, or for anything
+        scikit-learn shaped. **Materialises the whole view**, so it suits a clinical
+        table and not a cohort of slides.
+
+        A cohort offering a bulk path already holds the block this would rebuild, so
+        that case is served from it rather than sliced apart and stacked back together.
+        The two routes must agree; a test pins them field for field.
+
+        Raises:
+            ValueError: If the view is empty.
+        """
+        if self._cache is None or not self.identifiers:
+            return collate_samples([self[i] for i in range(len(self))])
+
+        target = self.cohort.target
+        return PatientBatch(
+            patient_id=list(self.identifiers),
+            # Cloned, not handed out: the block is read again by every __getitem__,
+            # so an in-place op on the batch would rewrite this view's own features.
+            modalities={name: block.clone() for name, block in self._cache.items()},
+            present=self._present_bulk(),
+            # No pad_mask: a bulk block arrives as one stacked tensor, so its rows are
+            # fixed-width by construction and there is nothing ragged to mask.
+            target={} if target is None else target.values_for(self.identifiers),
+        )
+
+    def _present_bulk(self) -> dict[str, Tensor]:
+        """Availability per modality, stacked over this view's samples."""
+        flags = [self.cohort.present(identifier) for identifier in self.identifiers]
+        return {name: torch.stack([flag[name] for flag in flags]) for name in flags[0]}
 
     @property
     def feature_names(self) -> dict[str, list[str]]:
@@ -92,8 +127,8 @@ class CohortView(TorchDataset):
     def _check_cache_alignment(self) -> None:
         """Verify an eager cache lines up, row for row, with this view's patients.
 
-        The cache is read positionally while identifiers come from ``self.indices``, so
-        a cohort returning rows in another order would pair patients with the wrong
+        The cache is read positionally while the rows were asked for by name, so a
+        cohort returning them in another order would pair patients with the wrong
         features -- silently. This is the one door in the design that has to be
         positional, so it is the one that gets checked.
 

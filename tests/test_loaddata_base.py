@@ -31,7 +31,7 @@ class ToyCohort(Cohort):
         assert self.path is not None  # only reached when a path was given
         self.identifiers = self.path.read_text(encoding="utf-8").split()
 
-    def fit_preprocessor(self, indices):
+    def fit_preprocessor(self, identifiers):
         return None
 
     def payload(self, identifier, prep):
@@ -105,8 +105,15 @@ class StubTarget:
     def for_(self, identifier):
         return {"outcome": torch.tensor(float(identifier))}
 
+    def values_for(self, identifiers):
+        return {"outcome": torch.tensor([float(i) for i in identifiers])}
+
     def stratify_labels(self, identifiers):
         return np.array([int(i) % 2 for i in identifiers])
+
+
+#: The toy index is "0".."9", so an identifier reads as its own row number.
+TOY_IDS = [str(i) for i in range(10)]
 
 
 @pytest.fixture
@@ -147,7 +154,7 @@ def test_a_cohort_is_not_a_torch_dataset(toy):
 
 
 def test_a_view_is_a_torch_dataset(toy):
-    view = toy.view(range(4), None)
+    view = toy.view(TOY_IDS[:4], None)
     assert isinstance(view, TorchDataset)
     assert len(view) == 4
 
@@ -206,13 +213,13 @@ def test_contains_and_index_of_use_the_identifier_lookup(toy):
 
 
 def test_a_view_reports_its_own_identifiers_in_its_own_order(toy):
-    view = toy.view([7, 1, 4], None)
+    view = toy.view(["7", "1", "4"], None)
     assert view.identifiers == ["7", "1", "4"]
 
 
 def test_a_view_indexes_into_itself_not_into_the_cohort(toy):
     """``view[0]`` is the view's first row, which is rarely the cohort's."""
-    view = toy.view([7, 1, 4], None)
+    view = toy.view(["7", "1", "4"], None)
     assert view[0].patient_id == "7"
     assert view[2].patient_id == "4"
 
@@ -220,7 +227,7 @@ def test_a_view_indexes_into_itself_not_into_the_cohort(toy):
 def test_a_view_supports_negative_indices(toy):
     """``DataLoader`` never uses them, but people do, and silently wrapping to the
     cohort's last row rather than the view's would be a hard bug to see."""
-    view = toy.view([7, 1, 4], None)
+    view = toy.view(["7", "1", "4"], None)
     assert view[-1].patient_id == view[2].patient_id == "4"
 
 
@@ -235,7 +242,7 @@ def test_an_empty_view_is_valid(toy):
 
 def test_payload_is_only_read_on_demand(toy):
     """Building a view opens nothing; asking for an item is what reads."""
-    view = toy.view(range(10), None)
+    view = toy.view(TOY_IDS[:10], None)
     assert toy.payload_calls == []
 
     view[3]
@@ -243,7 +250,7 @@ def test_payload_is_only_read_on_demand(toy):
 
 
 def test_a_view_yields_patient_samples(toy):
-    item = toy.view(range(3), None)[1]
+    item = toy.view(TOY_IDS[:3], None)[1]
     assert isinstance(item, PatientSample)
     assert item.patient_id == "1"
     assert item.modalities["features"].shape == (3,)
@@ -252,12 +259,12 @@ def test_a_view_yields_patient_samples(toy):
 
 
 def test_the_name_is_the_modality_key(index_path):
-    view = ToyCohort(index_path, name="covariates").view([0], None)
+    view = ToyCohort(index_path, name="covariates").view(["0"], None)
     assert set(view[0].modalities) == {"covariates"}
 
 
 def test_a_target_contributes_its_own_keys(index_path):
-    view = ToyCohort(index_path, target=StubTarget()).view([5], None)
+    view = ToyCohort(index_path, target=StubTarget()).view(["5"], None)
     assert view[0].target == {"outcome": torch.tensor(5.0)}
 
 
@@ -281,7 +288,7 @@ def test_the_base_class_never_binds(index_path):
 
 def test_a_cohort_that_volunteers_a_bulk_path_is_cached(index_path):
     cohort = BulkToyCohort(index_path)
-    view = cohort.view(range(4), None)
+    view = cohort.view(TOY_IDS[:4], None)
 
     assert cohort.payload_calls == ["0"], "one call, the alignment spot check"
     values = [view[i].modalities["features"] for i in range(4)]
@@ -296,7 +303,7 @@ def test_a_stochastic_payload_is_never_cached(index_path):
     look like it was working. Caching is opt-in via ``payload_bulk``.
     """
     cohort = StochasticToyCohort(index_path)
-    view = cohort.view(range(4), None)
+    view = cohort.view(TOY_IDS[:4], None)
 
     first = view[0].modalities["features"]
     second = view[0].modalities["features"]
@@ -314,27 +321,27 @@ def test_a_bulk_block_in_the_wrong_order_is_caught(index_path):
     """
     cohort = MisorderedBulkCohort(index_path)
     with pytest.raises(ValueError, match="disagrees with payload"):
-        cohort.view([2, 3, 5], None)
+        cohort.view(["2", "3", "5"], None)
 
 
 def test_a_bulk_block_of_the_wrong_length_is_caught(index_path):
     """The cheap half of the check: asked for a subset, handed the whole cohort."""
     with pytest.raises(ValueError, match="returned 10 rows .* asked for 3"):
-        WholeCohortBulkCohort(index_path).view([2, 3, 5], None)
+        WholeCohortBulkCohort(index_path).view(["2", "3", "5"], None)
 
     with pytest.raises(ValueError, match="returned 3 rows .* asked for 4"):
-        ShortBulkCohort(index_path).view(range(4), None)
+        ShortBulkCohort(index_path).view(TOY_IDS[:4], None)
 
 
 def test_a_correctly_ordered_bulk_block_passes(index_path):
     """The check must not fire on the implementation it is meant to allow."""
-    view = BulkToyCohort(index_path).view([7, 1, 4], None)
+    view = BulkToyCohort(index_path).view(["7", "1", "4"], None)
     assert [v.modalities["features"][0].item() for v in (view[0], view[1], view[2])] == [7.0, 1.0, 4.0]
 
 
 def test_nan_features_do_not_trip_the_alignment_check(index_path):
     """``torch.equal`` calls any NaN tensor unequal to itself; aligned data must pass."""
-    view = NanBulkCohort(index_path).view(range(4), None)
+    view = NanBulkCohort(index_path).view(TOY_IDS[:4], None)
     assert torch.isnan(view[0].modalities["features"][1])
 
 
@@ -349,21 +356,22 @@ def test_the_default_is_no_bulk_path(toy):
 
 
 # =========================================================================== #
-# splitting -- indices, not cohorts
+# splitting -- identifiers, not cohorts
 # =========================================================================== #
 
 
-def test_split_returns_index_arrays(toy):
-    train_idx, test_idx = toy.split(test_size=0.2, random_state=0, stratify=False)
+def test_split_returns_identifiers(toy):
+    """Names, not row numbers -- a position means nothing outside the cohort that made it."""
+    train_ids, test_ids = toy.split(test_size=0.2, random_state=0, stratify=False)
 
-    assert isinstance(train_idx, np.ndarray)
-    assert len(train_idx) + len(test_idx) == len(toy)
-    assert set(train_idx).isdisjoint(test_idx)
+    assert all(isinstance(i, str) for i in train_ids + test_ids)
+    assert len(train_ids) + len(test_ids) == len(toy)
+    assert set(train_ids).isdisjoint(test_ids)
 
 
-def test_split_indices_come_back_sorted(toy):
-    train_idx, _ = toy.split(test_size=0.2, random_state=0, stratify=False)
-    assert list(train_idx) == sorted(train_idx)
+def test_split_returns_identifiers_in_cohort_order(toy):
+    train_ids, _ = toy.split(test_size=0.2, random_state=0, stratify=False)
+    assert train_ids == [i for i in toy.identifiers if i in set(train_ids)]
 
 
 def test_asking_to_stratify_without_a_target_raises(toy):
@@ -379,14 +387,14 @@ def test_stratify_is_required(toy):
 
 
 def test_splitting_without_stratification_is_spelled_out(toy):
-    train_idx, test_idx = toy.split(test_size=0.2, random_state=0, stratify=False)
-    assert len(train_idx) + len(test_idx) == len(toy)
+    train_ids, test_ids = toy.split(test_size=0.2, random_state=0, stratify=False)
+    assert len(train_ids) + len(test_ids) == len(toy)
 
 
 def test_split_asks_the_target_for_stratification_labels(index_path):
     cohort = ToyCohort(index_path, target=StubTarget())
-    train_idx, test_idx = cohort.split(test_size=0.4, random_state=0, stratify=True)
-    labels = [int(cohort.identifiers[i]) % 2 for i in test_idx]
+    _, test_ids = cohort.split(test_size=0.4, random_state=0, stratify=True)
+    labels = [int(i) % 2 for i in test_ids]
     assert sorted(labels) == [0, 0, 1, 1], "both classes represented in proportion"
 
 
@@ -402,6 +410,9 @@ def test_split_refuses_to_stratify_on_a_target_that_cannot(index_path):
         def for_(self, identifier):
             return {}
 
+        def values_for(self, identifiers):
+            return {}
+
     cohort = ToyCohort(index_path, target=Bare())
     with pytest.raises(TypeError, match="stratify_labels"):
         cohort.split(test_size=0.2, stratify=True)
@@ -409,8 +420,8 @@ def test_split_refuses_to_stratify_on_a_target_that_cannot(index_path):
 
 def test_split_accepts_explicit_labels(toy):
     labels = np.array([0] * 5 + [1] * 5)
-    _, test_idx = toy.split(test_size=0.4, random_state=0, stratify=labels)
-    assert sorted(labels[test_idx]) == [0, 0, 1, 1]
+    _, test_ids = toy.split(test_size=0.4, random_state=0, stratify=labels)
+    assert sorted(labels[int(i)] for i in test_ids) == [0, 0, 1, 1]
 
 
 # =========================================================================== #
@@ -420,7 +431,7 @@ def test_split_accepts_explicit_labels(toy):
 
 def test_a_view_collates_through_a_dataloader(index_path):
     cohort = ToyCohort(index_path, target=StubTarget())
-    loader = DataLoader(cohort.view(range(10), None), batch_size=4, collate_fn=collate_samples)
+    loader = DataLoader(cohort.view(TOY_IDS[:10], None), batch_size=4, collate_fn=collate_samples)
     batch = next(iter(loader))
 
     assert batch.modalities["features"].shape == (4, 3)
@@ -430,7 +441,7 @@ def test_a_view_collates_through_a_dataloader(index_path):
 
 def test_a_view_without_a_preprocessor_reports_no_feature_names(toy):
     """Legitimate here: this cohort genuinely has nothing to fit."""
-    assert toy.view(range(4), None).feature_names == {}
+    assert toy.view(TOY_IDS[:4], None).feature_names == {}
 
 
 def test_feature_names_pass_through_per_modality_untouched(index_path):
@@ -451,12 +462,12 @@ def test_feature_names_pass_through_per_modality_untouched(index_path):
         def fit_preprocessor(self, indices):
             return Composite()
 
-    view = Multi(index_path, name="multimodal").view(range(3), Composite())
+    view = Multi(index_path, name="multimodal").view(TOY_IDS[:3], Composite())
     assert view.feature_names == {"clinical": ["age", "sex"], "wsi": ["f0", "f1", "f2"]}
 
 
 def test_view_repr_says_how_much_of_the_cohort_it_covers(toy):
-    assert "4 of 10 samples" in repr(toy.view(range(4), None))
+    assert "4 of 10 samples" in repr(toy.view(TOY_IDS[:4], None))
 
 
 def test_cohort_repr_reports_size_and_name(toy):
@@ -473,3 +484,73 @@ def test_the_error_types_are_runtime_errors():
     """Both are conditions a caller may reasonably catch, not programming mistakes."""
     assert issubclass(NotFittedError, RuntimeError)
     assert issubclass(LeakageError, RuntimeError)
+
+
+# =========================================================================== #
+# identifiers are checked, because a wrong one is silent otherwise
+# =========================================================================== #
+
+
+def test_an_identifier_from_another_cohort_is_refused(toy, tmp_path):
+    """A split carried across cohorts is the mistake identifiers exist to expose."""
+    other = tmp_path / "other.txt"
+    other.write_text("a\nb\nc", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not in this cohort"):
+        toy.view(ToyCohort(other).identifiers, None)
+
+
+def test_a_repeated_identifier_is_refused(toy):
+    """A sample counted twice inflates n and lands on both sides of a comparison."""
+    with pytest.raises(ValueError, match="more than once"):
+        toy.view(["3", "5", "3"], None)
+
+
+def test_check_identifiers_returns_a_plain_list(toy):
+    assert toy.check_identifiers(iter(["2", "7"])) == ["2", "7"]
+
+
+def test_a_view_holds_the_identifiers_it_was_given(toy):
+    """No positions stored: the view's own order is the list you handed it."""
+    view = toy.view(["7", "1", "4"], None)
+    assert view.identifiers == ["7", "1", "4"]
+    assert not hasattr(view, "indices")
+
+
+def test_batch_collates_a_whole_view(toy):
+    batch = toy.view(["7", "1", "4"], None).batch()
+    assert batch.patient_id == ["7", "1", "4"]
+    assert batch.modalities["features"].shape == (3, 3)
+    assert batch.modalities["features"][:, 0].tolist() == [7.0, 1.0, 4.0]
+
+
+def test_the_two_batch_routes_agree(index_path):
+    """A cached cohort skips the per-sample path, so the two must not drift apart.
+
+    The same reasoning as ``_check_cache_alignment``: wherever a bulk shortcut exists
+    beside a per-sample path, the shortcut is what gets used and the check is what
+    keeps it honest.
+    """
+    cached = BulkToyCohort(index_path, target=StubTarget()).view(["7", "1", "4"], None)
+    uncached = ToyCohort(index_path, target=StubTarget()).view(["7", "1", "4"], None)
+    assert cached._cache is not None and uncached._cache is None
+
+    fast, slow = cached.batch(), uncached.batch()
+    assert fast.patient_id == slow.patient_id
+    assert fast.pad_mask == slow.pad_mask
+    for name in slow.modalities:
+        torch.testing.assert_close(fast.modalities[name], slow.modalities[name])
+    for name in slow.present:
+        torch.testing.assert_close(fast.present[name], slow.present[name])
+    for key in slow.target:
+        torch.testing.assert_close(fast.target[key], slow.target[key])
+
+
+def test_a_batch_does_not_alias_the_views_cache(index_path):
+    """Writing into a batch must not rewrite the features every later read returns."""
+    view = BulkToyCohort(index_path).view(["7", "1", "4"], None)
+    before = view[0].modalities["features"].clone()
+
+    view.batch().modalities["features"] += 100.0
+
+    torch.testing.assert_close(view[0].modalities["features"], before)

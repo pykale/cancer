@@ -20,7 +20,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-import torch
 
 from kalecancer.loaddata.tabular import TabularCohort
 from kalecancer.loaddata.view import CohortView
@@ -95,22 +94,27 @@ def write_table(frame: pd.DataFrame, directory: Path, fmt: str = "csv") -> Path:
 
 
 def matrix_of(view: CohortView, name: str = "clinical") -> np.ndarray:
-    """Stack a view's feature vectors into ``(n_rows, n_features)``.
+    """A view's feature vectors as ``(n_rows, n_features)``, via the public batch path."""
+    return view.batch().modalities[name].numpy()
 
-    Goes through ``__getitem__`` rather than any internal cache, so it exercises
-    the same path a ``DataLoader`` takes.
+
+def ids_at(cohort: TabularCohort, positions) -> list[str]:
+    """Identifiers at the given cohort positions.
+
+    Tests are often written against row numbers of the fixture frame, which is the
+    one place a position is still the clearest way to say what is meant.
     """
-    return torch.stack([view[i].modalities[name] for i in range(len(view))]).numpy()
+    return [cohort.identifiers[i] for i in positions]
 
 
-def fitted_view(cohort: TabularCohort, indices=None) -> CohortView:
-    """Fit a preprocessor on ``indices`` and return the view over those same rows.
+def fitted_view(cohort: TabularCohort, identifiers=None) -> CohortView:
+    """Fit a preprocessor on ``identifiers`` and return the view over those samples.
 
     The common shorthand for "prepare this fold's training data". Defaults to every
-    row, for tests that are not about folds at all.
+    sample, for tests that are not about folds at all.
     """
-    rows = np.arange(len(cohort)) if indices is None else np.asarray(list(indices))
-    return cohort.view(rows, cohort.fit_preprocessor(rows))
+    ids = list(cohort.identifiers) if identifiers is None else list(identifiers)
+    return cohort.view(ids, cohort.fit_preprocessor(ids))
 
 
 def subview(view: CohortView, positions) -> CohortView:
@@ -119,8 +123,8 @@ def subview(view: CohortView, positions) -> CohortView:
     A view is not itself sliceable -- deliberately, since that would be a second way
     to build one -- so this goes back through the cohort, which is the only way.
     """
-    indices = np.asarray(view.indices)[np.asarray(list(positions), dtype=int)]
-    return view.cohort.view(indices, view.preprocessor)
+    ids = [view.identifiers[i] for i in positions]
+    return view.cohort.view(ids, view.preprocessor)
 
 
 def event_rate(cohort: TabularCohort, identifiers) -> float:

@@ -25,6 +25,7 @@ from tests.conftest import (
     TIME_COLUMN,
     event_rate,
     fitted_view,
+    ids_at,
     matrix_of,
     write_table,
 )
@@ -205,7 +206,7 @@ def test_building_a_view_without_a_preprocessor_refuses(cohort):
     the earliest place to say so is when the view is built.
     """
     with pytest.raises(NotFittedError) as excinfo:
-        cohort.view(range(4), None)
+        cohort.view(ids_at(cohort, range(4)), None)
     message = str(excinfo.value)
     assert "fit_preprocessor" in message, "say how to fix it"
     assert "cohort.frame" in message, "and where the raw values are"
@@ -219,17 +220,17 @@ def test_the_exploration_hatch_works_before_any_fitting(cohort, frame):
 def test_fitting_does_not_mutate_the_cohort(cohort):
     """What makes parallel cross-validation and nested CV safe."""
     before = cohort.frame.copy()
-    cohort.fit_preprocessor(range(40))
-    cohort.fit_preprocessor(range(40, 80))
+    cohort.fit_preprocessor(ids_at(cohort, range(40)))
+    cohort.fit_preprocessor(ids_at(cohort, range(40, 80)))
     pd.testing.assert_frame_equal(cohort.frame, before)
 
 
 def test_folds_fitted_from_one_cohort_are_independent(cohort):
     """Each fold standardises against its own rows and nothing reaches across."""
-    fold_a = fitted_view(cohort, range(0, 40))
+    fold_a = fitted_view(cohort, ids_at(cohort, range(0, 40)))
     before = matrix_of(fold_a).copy()
 
-    fold_b = fitted_view(cohort, range(40, 80))
+    fold_b = fitted_view(cohort, ids_at(cohort, range(40, 80)))
     np.testing.assert_array_equal(matrix_of(fold_a), before)
 
     for fold, rows in ((fold_a, range(0, 40)), (fold_b, range(40, 80))):
@@ -240,7 +241,7 @@ def test_folds_fitted_from_one_cohort_are_independent(cohort):
 
 def test_a_preprocessor_records_the_rows_it_was_fitted_on(cohort):
     """Provenance by identifier, which is what makes the leakage check possible."""
-    prep = cohort.fit_preprocessor(range(0, 40))
+    prep = cohort.fit_preprocessor(ids_at(cohort, range(0, 40)))
     assert prep.fitted_on == frozenset(cohort.identifiers[:40])
 
 
@@ -253,12 +254,12 @@ def test_a_passthrough_preprocessor_claims_no_rows(make_cohort):
     cohort = make_cohort(
         continuous=["biomarker"], continuous_transform=None, categorical=[], categorical_transform=None
     )
-    assert cohort.fit_preprocessor(range(40)).fitted_on == frozenset()
+    assert cohort.fit_preprocessor(ids_at(cohort, range(40))).fitted_on == frozenset()
 
 
 def test_the_same_preprocessor_serves_every_view_of_a_fold(cohort):
-    prep = cohort.fit_preprocessor(range(60))
-    train, held_out = cohort.view(range(60), prep), cohort.view(range(60, 80), prep)
+    prep = cohort.fit_preprocessor(ids_at(cohort, range(60)))
+    train, held_out = cohort.view(ids_at(cohort, range(60)), prep), cohort.view(ids_at(cohort, range(60, 80)), prep)
     assert train.preprocessor is prep and held_out.preprocessor is prep
 
 
@@ -274,18 +275,19 @@ def test_held_out_rows_use_train_statistics_exactly(cohort):
     declared pipeline by hand, fitted on exactly the training rows, and demands an
     exact match. Any statistic computed from the test rows breaks it.
     """
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
-    prep = cohort.fit_preprocessor(train_idx)
-    test_view = cohort.view(test_idx, prep)
+    train_ids, test_ids = cohort.split(test_size=0.25, random_state=0, stratify=True)
+    prep = cohort.fit_preprocessor(train_ids)
+    test_view = cohort.view(test_ids, prep)
 
     assert prep.feature_names["clinical"][: len(CONTINUOUS)] == CONTINUOUS
 
+    frame = cohort.frame.set_index("patient_id")
     reference = make_pipeline(SimpleImputer(strategy="median"), StandardScaler())
-    reference.fit(cohort.frame.iloc[train_idx][CONTINUOUS])
+    reference.fit(frame.loc[train_ids, CONTINUOUS])
 
     np.testing.assert_allclose(
         matrix_of(test_view)[:, : len(CONTINUOUS)],
-        reference.transform(cohort.frame.iloc[test_idx][CONTINUOUS]),
+        reference.transform(frame.loc[test_ids, CONTINUOUS]),
         rtol=1e-5,
         atol=1e-6,
     )
@@ -293,18 +295,18 @@ def test_held_out_rows_use_train_statistics_exactly(cohort):
 
 def test_the_standardised_test_mean_is_not_zero(cohort):
     """The cheap smoke signal, kept because it is the one a human can eyeball."""
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
-    prep = cohort.fit_preprocessor(train_idx)
+    train_ids, test_ids = cohort.split(test_size=0.25, random_state=0, stratify=True)
+    prep = cohort.fit_preprocessor(train_ids)
 
-    assert matrix_of(cohort.view(train_idx, prep))[:, 0].mean() == pytest.approx(0.0, abs=1e-5)
-    assert abs(matrix_of(cohort.view(test_idx, prep))[:, 0].mean()) > 1e-4
+    assert matrix_of(cohort.view(train_ids, prep))[:, 0].mean() == pytest.approx(0.0, abs=1e-5)
+    assert abs(matrix_of(cohort.view(test_ids, prep))[:, 0].mean()) > 1e-4
 
 
 def test_a_held_out_missing_value_is_filled_with_the_training_median(cohort):
     """A test row's own column must not contribute to the value used to fill it."""
     train_rows = [i for i in range(len(cohort)) if i not in MISSING_AGE_ROWS]
-    prep = cohort.fit_preprocessor(train_rows)
-    held_out = cohort.view(MISSING_AGE_ROWS, prep)
+    prep = cohort.fit_preprocessor(ids_at(cohort, train_rows))
+    held_out = cohort.view(ids_at(cohort, MISSING_AGE_ROWS), prep)
 
     train_median = cohort.frame.iloc[train_rows]["age"].median()
     reference = make_pipeline(SimpleImputer(strategy="median"), StandardScaler())
@@ -318,8 +320,8 @@ def test_a_held_out_missing_value_is_filled_with_the_training_median(cohort):
 def test_an_unseen_category_at_test_time_does_not_crash(cohort):
     """``handle_unknown="ignore"`` on a small cohort: this will happen, not might."""
     train_rows = [i for i in range(len(cohort)) if i not in RARE_STAGE_ROWS]
-    prep = cohort.fit_preprocessor(train_rows)
-    held_out = cohort.view(RARE_STAGE_ROWS, prep)
+    prep = cohort.fit_preprocessor(ids_at(cohort, train_rows))
+    held_out = cohort.view(ids_at(cohort, RARE_STAGE_ROWS), prep)
 
     encoded_names = prep.feature_names["clinical"]
     assert "stage_IV" not in encoded_names
@@ -331,9 +333,9 @@ def test_an_unseen_category_at_test_time_does_not_crash(cohort):
 def test_a_cohort_cannot_be_split_into_a_fitted_state(cohort):
     """The ``split() after fit`` trap cannot be expressed: ``split`` returns indices and
     a cohort holds no fitted state, so neither half inherits anything."""
-    cohort.fit_preprocessor(range(len(cohort)))
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
-    assert set(train_idx).isdisjoint(test_idx)
+    cohort.fit_preprocessor(cohort.identifiers)
+    train_ids, test_ids = cohort.split(test_size=0.25, random_state=0, stratify=True)
+    assert set(train_ids).isdisjoint(test_ids)
 
 
 # =========================================================================== #
@@ -342,15 +344,15 @@ def test_a_cohort_cannot_be_split_into_a_fitted_state(cohort):
 
 
 def test_split_is_disjoint_and_exhaustive(cohort):
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
-    assert len(train_idx) + len(test_idx) == len(cohort)
-    assert set(train_idx).isdisjoint(test_idx)
-    assert set(train_idx) | set(test_idx) == set(range(len(cohort)))
+    train_ids, test_ids = cohort.split(test_size=0.25, random_state=0, stratify=True)
+    assert len(train_ids) + len(test_ids) == len(cohort)
+    assert set(train_ids).isdisjoint(test_ids)
+    assert set(train_ids) | set(test_ids) == set(cohort.identifiers)
 
 
 def test_split_honours_test_size(cohort):
-    _, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=True)
-    assert len(test_idx) == round(0.25 * len(cohort))
+    _, test_ids = cohort.split(test_size=0.25, random_state=0, stratify=True)
+    assert len(test_ids) == round(0.25 * len(cohort))
 
 
 def test_split_is_stratified_on_event_status(cohort):
@@ -363,9 +365,9 @@ def test_split_is_stratified_on_event_status(cohort):
     overall = event_rate(cohort, cohort.identifiers)
     deviations = []
     for seed in range(20):
-        train_idx, test_idx = cohort.split(test_size=0.25, random_state=seed, stratify=True)
-        for part in (train_idx, test_idx):
-            deviations.append(abs(event_rate(cohort, [cohort.identifiers[i] for i in part]) - overall))
+        train_ids, test_ids = cohort.split(test_size=0.25, random_state=seed, stratify=True)
+        for part in (train_ids, test_ids):
+            deviations.append(abs(event_rate(cohort, part) - overall))
 
     assert max(deviations) < 0.02, (
         f"worst event-rate deviation {max(deviations):.3f} over 20 seeds; stratification looks to have been dropped"
@@ -383,8 +385,8 @@ def test_split_is_reproducible(cohort):
 
 def test_split_works_without_a_target_when_stratification_is_declined(make_cohort):
     cohort = make_cohort(target=None)
-    train_idx, test_idx = cohort.split(test_size=0.25, random_state=0, stratify=False)
-    assert len(train_idx) + len(test_idx) == len(cohort)
+    train_ids, test_ids = cohort.split(test_size=0.25, random_state=0, stratify=False)
+    assert len(train_ids) + len(test_ids) == len(cohort)
 
 
 # =========================================================================== #
@@ -394,26 +396,25 @@ def test_split_works_without_a_target_when_stratification_is_declined(make_cohor
 
 def test_a_scattered_view_keeps_each_patients_own_row(cohort):
     """Rule 4, and the one that produces meaningless results when broken."""
-    prep = cohort.fit_preprocessor(range(len(cohort)))
-    scattered = [11, 2, 79, 40, 0]
+    prep = cohort.fit_preprocessor(cohort.identifiers)
+    scattered = ids_at(cohort, [11, 2, 79, 40, 0])
     view = cohort.view(scattered, prep)
 
-    assert view.identifiers == [cohort.identifiers[i] for i in scattered]
-    for position, row in enumerate(scattered):
-        identifier = cohort.identifiers[row]
+    assert view.identifiers == scattered
+    for position, identifier in enumerate(scattered):
         torch.testing.assert_close(view[position].modalities["clinical"], cohort.payload(identifier, prep)["clinical"])
 
 
 def test_payload_rejects_an_unknown_identifier(cohort):
-    prep = cohort.fit_preprocessor(range(len(cohort)))
+    prep = cohort.fit_preprocessor(cohort.identifiers)
     with pytest.raises(KeyError):
         cohort.payload("no-such-patient", prep)
 
 
 def test_the_bulk_and_per_sample_paths_agree(cohort):
     """A view caches through ``payload_bulk``; both must give identical answers."""
-    prep = cohort.fit_preprocessor(range(len(cohort)))
-    view = cohort.view(range(len(cohort)), prep)
+    prep = cohort.fit_preprocessor(cohort.identifiers)
+    view = cohort.view(cohort.identifiers, prep)
 
     for i in (0, 17, 79):
         torch.testing.assert_close(
@@ -480,14 +481,14 @@ def test_feature_names_are_keyed_by_modality(cohort):
     """
     view = fitted_view(cohort)
     assert set(view.feature_names) == {"clinical"}
-    assert view.feature_names == cohort.fit_preprocessor(range(len(cohort))).feature_names
+    assert view.feature_names == cohort.fit_preprocessor(cohort.identifiers).feature_names
     assert view.feature_names["clinical"][0] == CONTINUOUS[0]
 
 
 def test_width_counts_every_modalitys_features(cohort):
-    prep = cohort.fit_preprocessor(range(len(cohort)))
+    prep = cohort.fit_preprocessor(cohort.identifiers)
     assert prep.width == len(prep.feature_names["clinical"])
-    assert prep.width == matrix_of(cohort.view(range(len(cohort)), prep)).shape[1]
+    assert prep.width == matrix_of(cohort.view(cohort.identifiers, prep)).shape[1]
 
 
 def test_feature_names_belong_to_the_preprocessor_not_the_cohort(cohort):
@@ -516,7 +517,7 @@ def test_describe_transforms_reports_what_the_cohort_declares(cohort):
 
 
 def test_the_preprocessor_describes_what_a_fold_applied(cohort):
-    described = cohort.fit_preprocessor(range(40)).describe()
+    described = cohort.fit_preprocessor(ids_at(cohort, range(40))).describe()
     assert "fitted on 40 rows" in described
     assert "StandardScaler" in described
 
@@ -525,7 +526,7 @@ def test_a_passthrough_preprocessor_says_so(make_cohort):
     cohort = make_cohort(
         continuous=["biomarker"], continuous_transform=None, categorical=[], categorical_transform=None
     )
-    assert "passthrough" in cohort.fit_preprocessor(range(40)).describe()
+    assert "passthrough" in cohort.fit_preprocessor(ids_at(cohort, range(40))).describe()
 
 
 def test_repr_surfaces_the_event_rate(cohort, frame):
@@ -580,3 +581,38 @@ def test_columns_used_as_supervision_are_not_silently_also_features(cohort):
     view = fitted_view(cohort)
     assert TIME_COLUMN not in names(view)
     assert not any(name.startswith(EVENT_COLUMN) for name in names(view))
+
+
+# --------------------------------------------------------------------------- #
+# batch -- bulk access, the counterpart to iterating
+# --------------------------------------------------------------------------- #
+
+
+def test_batch_collates_every_sample_in_identifier_order(cohort):
+    """The seam an embedder reads: the whole split as the object a DataLoader yields."""
+    view = fitted_view(cohort)
+    batch = view.batch()
+
+    assert batch.patient_id == view.identifiers
+    assert batch.modalities["clinical"].shape == (len(view), view.preprocessor.width)
+    for i in range(len(view)):
+        torch.testing.assert_close(batch.modalities["clinical"][i], view[i].modalities["clinical"])
+
+
+def test_batch_carries_the_target_alongside_the_features(cohort):
+    """One call gives an embedder both what to embed and what to condition on."""
+    batch = fitted_view(cohort).batch()
+    assert set(batch.target) == {"time", "event"}
+    assert batch.target["event"].shape == (len(cohort),)
+
+
+def test_batch_matches_a_full_size_dataloader_batch(cohort):
+    """Bulk and streaming must not be two answers."""
+    view = fitted_view(cohort)
+    loaded = next(iter(DataLoader(view, batch_size=len(view), collate_fn=collate_samples)))
+    torch.testing.assert_close(view.batch().modalities["clinical"], loaded.modalities["clinical"])
+
+
+def test_batch_refuses_an_empty_view(cohort):
+    with pytest.raises(ValueError, match="empty list of samples"):
+        cohort.view([], cohort.fit_preprocessor(cohort.identifiers[:3])).batch()

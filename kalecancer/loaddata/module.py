@@ -15,10 +15,9 @@ from collections.abc import Callable
 from typing import Literal
 
 import lightning as L
-import numpy as np
 from torch.utils.data import DataLoader
 
-from kalecancer.loaddata.base import Cohort, Indices, LeakageError
+from kalecancer.loaddata.base import Cohort, Identifiers, LeakageError
 from kalecancer.loaddata.protocols import Preprocessor
 from kalecancer.loaddata.sample import collate_samples
 from kalecancer.loaddata.view import CohortView
@@ -32,20 +31,20 @@ class CohortDataModule(L.LightningDataModule):
 
     Args:
         cohort (Cohort): Read, never mutated, so every fold may hold the same instance.
-        train_idx (Indices): Training rows. The only rows fitted on.
-        val_idx (Indices | None, optional): Validation rows.
-        test_idx (Indices | None, optional): Test rows.
+        train_ids (Identifiers): Training samples. The only ones fitted on.
+        val_ids (Identifiers | None, optional): Validation samples.
+        test_ids (Identifiers | None, optional): Test samples.
         batch_size (int | "full"): **Required, no default.** With a Cox head the partial
             likelihood is averaged within a batch, so ``64`` and ``"full"`` optimise
             measurably different objectives -- a modelling decision wearing a loader
-            parameter's clothes. ``"full"`` means ``len(train_idx)``.
+            parameter's clothes. ``"full"`` means ``len(train_ids)``.
         num_workers (int, optional): ``0`` suits a clinical table, where worker startup
             costs more than it saves. Slide payloads want several. Defaults to 0.
         pin_memory (bool, optional): Defaults to ``False``.
         shuffle (bool, optional): Shuffles the *training* loader only. Defaults to ``True``.
         drop_last (bool, optional): Drop a short final training batch. Defaults to ``False``.
         preprocessor (Preprocessor | None, optional): Reuse an already-fitted one instead
-            of fitting from ``train_idx`` -- for refitting a final model, or scoring a
+            of fitting from ``train_ids`` -- for refitting a final model, or scoring a
             checkpoint against the transforms it was trained with. This is the path
             :meth:`check_no_leak` exists for.
         collate_fn (Callable, optional): Defaults to :func:`collate_samples`; torch's
@@ -55,17 +54,17 @@ class CohortDataModule(L.LightningDataModule):
         ValueError: If the splits overlap, or ``batch_size`` is invalid.
 
     Example:
-        >>> train_idx, test_idx = cohort.split(test_size=0.2, random_state=0, stratify=True)
-        >>> dm = CohortDataModule(cohort, train_idx, test_idx=test_idx, batch_size="full")
+        >>> train_ids, test_ids = cohort.split(test_size=0.2, random_state=0, stratify=True)
+        >>> dm = CohortDataModule(cohort, train_ids, test_ids=test_ids, batch_size="full")
         >>> L.Trainer(max_epochs=50).fit(model, datamodule=dm)
     """
 
     def __init__(
         self,
         cohort: Cohort,
-        train_idx: Indices,
-        val_idx: Indices | None = None,
-        test_idx: Indices | None = None,
+        train_ids: Identifiers,
+        val_ids: Identifiers | None = None,
+        test_ids: Identifiers | None = None,
         *,
         batch_size: BatchSize,
         num_workers: int = 0,
@@ -77,9 +76,9 @@ class CohortDataModule(L.LightningDataModule):
     ):
         super().__init__()
         self.cohort = cohort
-        self.train_idx = np.asarray(train_idx, dtype=int)
-        self.val_idx = None if val_idx is None else np.asarray(val_idx, dtype=int)
-        self.test_idx = None if test_idx is None else np.asarray(test_idx, dtype=int)
+        self.train_ids = cohort.check_identifiers(train_ids)
+        self.val_ids = None if val_ids is None else cohort.check_identifiers(val_ids)
+        self.test_ids = None if test_ids is None else cohort.check_identifiers(test_ids)
         self.collate_fn = collate_fn
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -116,11 +115,11 @@ class CohortDataModule(L.LightningDataModule):
         if self._prepared:
             return
         if not self._supplied_preprocessor:
-            self.preprocessor = self.cohort.fit_preprocessor(self.train_idx)
+            self.preprocessor = self.cohort.fit_preprocessor(self.train_ids)
         self.check_no_leak()
-        self.train_ds = self.cohort.view(self.train_idx, self.preprocessor)
-        self.val_ds = None if self.val_idx is None else self.cohort.view(self.val_idx, self.preprocessor)
-        self.test_ds = None if self.test_idx is None else self.cohort.view(self.test_idx, self.preprocessor)
+        self.train_ds = self.cohort.view(self.train_ids, self.preprocessor)
+        self.val_ds = None if self.val_ids is None else self.cohort.view(self.val_ids, self.preprocessor)
+        self.test_ds = None if self.test_ids is None else self.cohort.view(self.test_ids, self.preprocessor)
         self._prepared = True
 
     def train_dataloader(self) -> DataLoader:
@@ -142,12 +141,12 @@ class CohortDataModule(L.LightningDataModule):
         returning nothing would let it succeed having evaluated no rows.
 
         Raises:
-            ValueError: If the data module was built without ``test_idx``.
+            ValueError: If the data module was built without ``test_ids``.
         """
         if self.test_ds is None:
             raise ValueError(
                 "Trainer.test() was called but this CohortDataModule has no test split. "
-                "Pass test_idx=... when constructing it."
+                "Pass test_ids=... when constructing it."
             )
         return self._loader(self.test_ds, shuffle=False)
 
@@ -160,7 +159,7 @@ class CohortDataModule(L.LightningDataModule):
 
         Holds by construction in the default flow; it earns its keep when a
         ``preprocessor`` is *supplied*, the only way held-out statistics can reach a
-        fold. Compares identifiers, not positions, so it survives composition.
+        fold. Named samples throughout, so it survives subsetting and composition.
 
         Raises:
             LeakageError: If a validation or test identifier appears in ``fitted_on``.
@@ -168,17 +167,16 @@ class CohortDataModule(L.LightningDataModule):
         fitted_on = getattr(self.preprocessor, "fitted_on", None)
         if not fitted_on:
             return  # nothing fitted, or a passthrough, which carries no row's data
-        for label, indices in (("validation", self.val_idx), ("test", self.test_idx)):
-            if indices is None:
+        for label, ids in (("validation", self.val_ids), ("test", self.test_ids)):
+            if ids is None:
                 continue
-            held_out = {self.cohort.identifiers[i] for i in indices}
-            overlap = held_out & fitted_on
+            overlap = set(ids) & fitted_on
             if overlap:
                 raise LeakageError(
                     f"{len(overlap)} {label} patient(s) are among the rows this fold's "
                     f"preprocessor was fitted on, e.g. {sorted(overlap)[:5]}. Held-out "
                     f"data must be transformed with the training fold's statistics, never "
-                    f"fitted on them. Fit with cohort.fit_preprocessor(train_idx) and pass "
+                    f"fitted on them. Fit with cohort.fit_preprocessor(train_ids) and pass "
                     f"that same preprocessor to every view."
                 )
 
@@ -188,16 +186,16 @@ class CohortDataModule(L.LightningDataModule):
         Independent of :meth:`check_no_leak`, which cannot see this for a passthrough
         cohort -- the rows would still be evaluated as held out having been trained on.
         """
-        named = [("train", self.train_idx), ("validation", self.val_idx), ("test", self.test_idx)]
-        present = [(label, idx) for label, idx in named if idx is not None]
+        named = [("train", self.train_ids), ("validation", self.val_ids), ("test", self.test_ids)]
+        present = [(label, ids) for label, ids in named if ids is not None]
         for i, (left_label, left) in enumerate(present):
             for right_label, right in present[i + 1 :]:
-                shared = np.intersect1d(left, right)
-                if shared.size:
+                shared = sorted(set(left) & set(right))
+                if shared:
                     raise ValueError(
-                        f"{left_label} and {right_label} splits share {shared.size} row(s), "
-                        f"e.g. positions {shared[:5].tolist()}. Evaluating on rows that were "
-                        f"trained on reports a training score as a held-out one."
+                        f"{left_label} and {right_label} splits share {len(shared)} sample(s), "
+                        f"e.g. {shared[:5]}. Evaluating on samples that were trained on "
+                        f"reports a training score as a held-out one."
                     )
 
     # ------------------------------------------------------------------ #
@@ -220,14 +218,14 @@ class CohortDataModule(L.LightningDataModule):
     def _resolved_batch_size(self) -> int:
         """``"full"`` resolved against the training split size."""
         size = self.batch_size
-        return len(self.train_idx) if size == "full" else int(size)
+        return len(self.train_ids) if size == "full" else int(size)
 
     def __repr__(self) -> str:
-        sizes = [f"train={len(self.train_idx)}"]
-        if self.val_idx is not None:
-            sizes.append(f"val={len(self.val_idx)}")
-        if self.test_idx is not None:
-            sizes.append(f"test={len(self.test_idx)}")
+        sizes = [f"train={len(self.train_ids)}"]
+        if self.val_ids is not None:
+            sizes.append(f"val={len(self.val_ids)}")
+        if self.test_ids is not None:
+            sizes.append(f"test={len(self.test_ids)}")
         sizes.append(f"batch_size={self.batch_size!r}")
         return f"{type(self).__name__}({' | '.join(sizes)})"
 

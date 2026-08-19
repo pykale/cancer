@@ -283,3 +283,16 @@ def test_unit_is_stripped_but_otherwise_untouched(given, expected):
 
 def test_repr_surfaces_the_event_rate_once_bound(frame, make_target):
     assert "events" in repr(bind(make_target(), frame))
+
+
+def test_values_for_is_the_batched_form_of_for_(frame, make_target):
+    """Lets a caller ask for supervision by name without knowing the task is survival."""
+    target = bind(make_target(), frame)
+    identifiers = frame["patient_id"].tolist()
+    values = target.values_for(identifiers)
+
+    assert set(values) == {"time", "event"}
+    for i, identifier in enumerate(identifiers):
+        single = target.for_(identifier)
+        assert values["time"][i] == pytest.approx(single["time"].item())
+        assert values["event"][i] == pytest.approx(single["event"].item())

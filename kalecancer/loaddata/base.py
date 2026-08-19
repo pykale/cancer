@@ -5,8 +5,8 @@ table and a cohort of gigapixel slides: :meth:`Cohort._load_index` runs once and
 populates ``identifiers`` only; :meth:`Cohort.payload` reads one sample on demand.
 
 Fitted state belongs to neither. A cohort is never fitted --
-:meth:`Cohort.fit_preprocessor` returns a separate artifact scoped to the rows it
-was given, and :meth:`Cohort.view` pairs a row subset with one to make a
+:meth:`Cohort.fit_preprocessor` returns a separate artifact scoped to the samples it
+was given, and :meth:`Cohort.view` pairs a subset with one to make a
 :class:`~kalecancer.loaddata.view.CohortView`, the only ``Dataset`` in the package.
 
 The cohort is shared and never mutated; preprocessors and views live for one fold.
@@ -17,6 +17,7 @@ uses is never implicit.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -28,11 +29,11 @@ from torch import Tensor
 from kalecancer.loaddata.protocols import Preprocessor, Target, check_target
 from kalecancer.loaddata.view import CohortView
 
-#: Positional indices into ``Cohort.identifiers``. A numpy array is as natural a
-#: caller here as a list -- ``split()`` returns arrays and sklearn's splitters
-#: yield them -- so the alias admits both rather than forcing conversions at every
-#: call site.
-Indices = Sequence[int] | np.ndarray
+#: Sample identifiers. The currency of the whole API: rows are named, never numbered.
+#: Position 5 of a clinical table and position 5 of a slide manifest are different
+#: patients the moment either is subset, so a position is only ever meaningful inside
+#: the one object that produced it.
+Identifiers = Sequence[str]
 
 
 class NotFittedError(RuntimeError):
@@ -101,13 +102,13 @@ class Cohort(ABC):
         """
 
     @abstractmethod
-    def fit_preprocessor(self, indices: Indices) -> Preprocessor | None:
-        """Fit transforms on the given rows only, and return them as a new artifact.
+    def fit_preprocessor(self, identifiers: Identifiers) -> Preprocessor | None:
+        """Fit transforms on the named samples only, and return them as a new artifact.
 
         The cohort is not modified, so a fold can never see statistics from outside it.
 
         Args:
-            indices (Indices): Positional indices, normally one fold's training rows.
+            identifiers (Identifiers): Normally one fold's training samples.
 
         Returns:
             Preprocessor | None: The fitted artifact, or ``None`` when this cohort has
@@ -131,7 +132,7 @@ class Cohort(ABC):
     # optional hooks
     # ------------------------------------------------------------------ #
 
-    def payload_bulk(self, identifiers: Sequence[str], prep: Preprocessor | None) -> dict[str, Tensor] | None:
+    def payload_bulk(self, identifiers: Identifiers, prep: Preprocessor | None) -> dict[str, Tensor] | None:
         """Transform every sample in one call, for modalities cheap enough to allow it.
 
         ``None`` by default, and a view falls back to per-sample :meth:`payload`.
@@ -160,13 +161,13 @@ class Cohort(ABC):
     # shared
     # ------------------------------------------------------------------ #
 
-    def view(self, indices: Indices, preprocessor: Preprocessor | None) -> CohortView:
-        """Pair a row subset with a fitted preprocessor to make a torch Dataset.
+    def view(self, identifiers: Identifiers, preprocessor: Preprocessor | None) -> CohortView:
+        """Pair a subset of samples with a fitted preprocessor to make a torch Dataset.
 
         ``preprocessor`` is required even when ``None``: passing it explicitly keeps a
         fold's provenance at the call site rather than buried in object state.
         """
-        return CohortView(self, indices, preprocessor)
+        return CohortView(self, identifiers, preprocessor)
 
     def split(
         self,
@@ -174,10 +175,15 @@ class Cohort(ABC):
         random_state: int | None = None,
         *,
         stratify: bool | np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Split into two sets of **indices**, balanced on what you name.
+    ) -> tuple[list[str], list[str]]:
+        """Split into two sets of **identifiers**, balanced on what you name.
 
-        Indices rather than cohorts, so this composes with scikit-learn's splitters.
+        Identifiers rather than cohorts, so this stays composable; and identifiers
+        rather than positions, so a split taken from one cohort cannot be silently
+        applied to another whose rows are in a different order.
+
+        To use scikit-learn's splitters, split the returned list and index back into
+        it -- ``[train_ids[i] for i in fold]`` -- the same shape as their ``groups``.
 
         Args:
             test_size (float, optional): Proportion held out. Defaults to 0.2.
@@ -189,16 +195,20 @@ class Cohort(ABC):
                 several points off on the event rate.
 
         Returns:
-            tuple[np.ndarray, np.ndarray]: Train and test indices, each sorted.
+            tuple[list[str], list[str]]: Train and test identifiers, each in cohort order.
 
         Raises:
             TypeError: If ``stratify=True`` but no target can supply labels.
         """
         labels = self._stratify_labels(stratify)
-        train_idx, test_idx = train_test_split(
+        train_pos, test_pos = train_test_split(
             np.arange(len(self)), test_size=test_size, random_state=random_state, stratify=labels
         )
-        return np.sort(train_idx), np.sort(test_idx)
+        return self._ids_at(np.sort(train_pos)), self._ids_at(np.sort(test_pos))
+
+    def _ids_at(self, positions: Sequence[int] | np.ndarray) -> list[str]:
+        """Identifiers at the given positions. The only place positions are read."""
+        return [self.identifiers[i] for i in positions]
 
     def _stratify_labels(self, stratify: bool | np.ndarray) -> np.ndarray | None:
         """Resolve the ``stratify`` argument of :meth:`split` to labels or ``None``."""
@@ -225,9 +235,42 @@ class Cohort(ABC):
             )
         return np.asarray(labels_for(self.identifiers))
 
-    def index_of(self, identifiers: Sequence[str]) -> np.ndarray:
-        """Positional indices for ``identifiers``. The identifier-to-position bridge."""
-        return np.array([self._row_of[i] for i in identifiers], dtype=int)
+    def check_identifiers(self, identifiers: Identifiers) -> list[str]:
+        """Validate a caller's identifier list, returning it as a plain list.
+
+        Both failures it catches are silent otherwise. An identifier this cohort does
+        not hold means a split was taken from somewhere else; a repeated one means a
+        patient is counted twice, which inflates ``n`` and puts the same sample on both
+        sides of a comparison.
+
+        Raises:
+            ValueError: If any identifier is unknown or appears more than once.
+        """
+        ids = list(identifiers)
+        unknown = [i for i in ids if i not in self._row_of]
+        if unknown:
+            raise ValueError(
+                f"{len(unknown)} identifier(s) are not in this cohort, e.g. {unknown[:5]}. "
+                f"Identifiers must come from this cohort -- cohort.split() or "
+                f"cohort.identifiers -- not from another cohort or an earlier version of "
+                f"this one."
+            )
+        if len(set(ids)) != len(ids):
+            counts = Counter(ids)
+            repeated = sorted(i for i, n in counts.items() if n > 1)
+            raise ValueError(
+                f"{len(repeated)} identifier(s) appear more than once, e.g. {repeated[:5]}. "
+                f"A repeated sample is counted twice in every statistic it reaches."
+            )
+        return ids
+
+    def index_of(self, identifiers: Identifiers) -> np.ndarray:
+        """Positions for ``identifiers``. The identifier-to-position bridge.
+
+        For subclasses that store their payload as a block and must reach into it.
+        Nothing outside a cohort should need this.
+        """
+        return np.array([self._row_of[i] for i in self.check_identifiers(identifiers)], dtype=int)
 
     def __len__(self) -> int:
         return len(self.identifiers)

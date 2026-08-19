@@ -31,6 +31,9 @@ class GoodTarget:
     def for_(self, identifier):
         return {"t": torch.tensor(1.0)}
 
+    def values_for(self, identifiers):
+        return {"t": torch.ones(len(list(identifiers)))}
+
 
 def test_a_conforming_object_passes():
     check_target(GoodTarget())
@@ -40,7 +43,7 @@ def test_survival_target_passes(make_target):
     check_target(make_target())
 
 
-@pytest.mark.parametrize("dropped", ["required_columns", "bind", "for_"])
+@pytest.mark.parametrize("dropped", ["required_columns", "bind", "for_", "values_for"])
 def test_each_missing_member_is_named(dropped):
     """The message must say *what* is missing, not merely that something is."""
     namespace = {k: v for k, v in vars(GoodTarget).items() if k != dropped and not k.startswith("__")}
