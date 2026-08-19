@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from kalecancer.loaddata.wsi_dataset import BagSample, collate_bags
+from kalecancer.loaddata.wsi_dataset import collate_bags
 from kalecancer.pipeline import WSISurvivalTrainer
 
 FEATURE_DIM = 8
@@ -14,15 +14,15 @@ def make_batch(size: int = 4, events: list[int] | None = None):
     events = events if events is not None else [i % 2 for i in range(size)]
     return collate_bags(
         [
-            BagSample(
-                patient_id=f"{i:03d}",
-                slide_ids=("slide",),
-                features=torch.randn(6 + i, FEATURE_DIM),
-                coords=torch.zeros(6 + i, 2, dtype=torch.long),
-                slide_index=torch.zeros(6 + i, dtype=torch.long),
-                duration=torch.tensor(100.0 + i * 50),
-                event=torch.tensor(float(events[i])),
-            )
+            {
+                "group_id": f"{i:03d}",
+                "slide_ids": ("slide",),
+                "features": torch.randn(6 + i, FEATURE_DIM),
+                "coords": torch.zeros(6 + i, 2, dtype=torch.long),
+                "slide_index": torch.zeros(6 + i, dtype=torch.long),
+                "duration": torch.tensor(100.0 + i * 50),
+                "event": torch.tensor(float(events[i])),
+            }
             for i in range(size)
         ]
     )
@@ -54,8 +54,8 @@ def test_predict_risk_returns_one_risk_and_aligned_attention() -> None:
 
     risk, attentions = make_model().predict_risk(batch)
 
-    assert risk.shape == (len(batch),)
-    assert [len(a) for a in attentions] == [s.features.shape[0] for s in batch.samples]
+    assert risk.shape == (len(batch["samples"]),)
+    assert [len(a) for a in attentions] == [s["features"].shape[0] for s in batch["samples"]]
 
 
 def test_predict_risk_does_not_track_gradients() -> None:

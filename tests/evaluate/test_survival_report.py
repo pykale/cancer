@@ -17,7 +17,7 @@ from kalecancer.evaluate import (
     save_survival_report,
     summarise_folds,
 )
-from kalecancer.loaddata import WSIFeatureBagDataset, collate_bags
+from kalecancer.loaddata import WSIFeatureDataset, collate_bags
 from kalecancer.pipeline import WSISurvivalTrainer
 from tests.conftest import FEATURE_DIM
 
@@ -43,8 +43,8 @@ def test_rows_are_traceable_to_their_patient() -> None:
     assert set(rows[0]) == {"patient_id", "split", "risk_score", "duration", "event"}
 
 
-def test_predict_split_returns_one_risk_per_patient(cohort_bags) -> None:
-    dataset = WSIFeatureBagDataset(cohort_bags, expected_dim=FEATURE_DIM)
+def test_predict_split_returns_one_risk_per_patient(cohort) -> None:
+    dataset = WSIFeatureDataset(cohort, expected_dim=FEATURE_DIM)
     loader = DataLoader(dataset, batch_size=2, collate_fn=collate_bags, num_workers=0)
     model = WSISurvivalTrainer(input_dim=FEATURE_DIM, hidden_dim=8, attention_dim=4)
 

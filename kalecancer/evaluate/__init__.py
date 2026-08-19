@@ -1,5 +1,6 @@
-"""Performance metrics for cancer-domain prediction tasks."""
+"""Performance metrics and reports for cancer-domain prediction tasks."""
 
+from kalecancer.evaluate.cohort_report import cohort_summary, log_cohort_summary, split_summary
 from kalecancer.evaluate.survival_report import (
     SplitPredictions,
     evaluate_predictions,
@@ -10,8 +11,11 @@ from kalecancer.evaluate.survival_report import (
 
 __all__ = [
     "SplitPredictions",
+    "cohort_summary",
     "evaluate_predictions",
+    "log_cohort_summary",
     "predict_split",
     "save_survival_report",
+    "split_summary",
     "summarise_folds",
 ]

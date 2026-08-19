@@ -1,49 +1,42 @@
-"""Datasets and records: DICOM/CT, WSI, and tabular clinical data."""
+"""Datasets and records: WSI patch features, clinical labels, and dataset splitting."""
 
 from kalecancer.loaddata.clinical_access import (
     ENDPOINTS,
     ClinicalDataError,
     EndpointSpec,
-    SurvivalRecord,
-    build_survival_records,
     load_clinical_records,
+    survival_table,
 )
-from kalecancer.loaddata.cohort import CohortSummary, PatientBag, build_cohort
-from kalecancer.loaddata.split import CohortSplit, SplitError, split_patients, stratified_patient_folds
-from kalecancer.loaddata.wsi_dataset import BagBatch, BagSample, WSIFeatureBagDataset, collate_bags
+from kalecancer.loaddata.cohort import COHORT_COLUMNS, build_cohort
+from kalecancer.loaddata.split import SplitError, composite_labels, k_fold_splits, train_val_test_split
+from kalecancer.loaddata.wsi_dataset import WSIFeatureDataset, collate_bags
 from kalecancer.loaddata.wsi_feature_access import (
     InvalidFeatureFileError,
     SlideIdentifierError,
-    SlideRecord,
-    discover_slides,
     inspect_feature_bag,
     parse_patient_id,
     read_feature_bag,
+    slide_table,
 )
 
 __all__ = [
+    "COHORT_COLUMNS",
     "ENDPOINTS",
-    "BagBatch",
-    "BagSample",
     "ClinicalDataError",
-    "CohortSplit",
-    "CohortSummary",
     "EndpointSpec",
     "InvalidFeatureFileError",
-    "PatientBag",
     "SlideIdentifierError",
-    "SlideRecord",
     "SplitError",
-    "SurvivalRecord",
-    "WSIFeatureBagDataset",
+    "WSIFeatureDataset",
     "build_cohort",
-    "build_survival_records",
     "collate_bags",
-    "discover_slides",
+    "composite_labels",
     "inspect_feature_bag",
+    "k_fold_splits",
     "load_clinical_records",
     "parse_patient_id",
     "read_feature_bag",
-    "split_patients",
-    "stratified_patient_folds",
+    "slide_table",
+    "survival_table",
+    "train_val_test_split",
 ]

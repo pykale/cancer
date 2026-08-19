@@ -1,14 +1,8 @@
 """Clinical survival labels for time-to-event modelling.
 
-Records follow the label contract used across ``kalecancer``:
-
-``duration``
-    Time from baseline to event or censoring, in the unit of the source field (days
-    for HANCOCK).
-``event``
-    ``1`` if the event was observed, ``0`` if the patient was censored.
-
-Source files store outcomes as free text (e.g. ``"deceased"``), so each endpoint
+Labels follow one contract throughout ``kalecancer``: ``duration`` is the time to
+event or censoring, and ``event`` is ``1`` when the event was observed and ``0`` when
+the patient was censored. Source files record outcomes as free text, so an endpoint
 declares which field to read and which values count as an event.
 """
 
@@ -17,6 +11,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import pandas as pd
 
 
 class ClinicalDataError(ValueError):
@@ -35,18 +31,8 @@ class EndpointSpec:
     unknown_values: frozenset[str] = field(default_factory=frozenset)
 
 
-@dataclass(frozen=True)
-class SurvivalRecord:
-    """One patient's time-to-event label."""
-
-    patient_id: str
-    duration: float
-    event: int
-
-
 ENDPOINTS: dict[str, EndpointSpec] = {
-    # Overall survival: death from any cause. Primary target - death is unambiguous
-    # and more consistently recorded than recurrence.
+    # Overall survival: death from any cause.
     "OS": EndpointSpec(
         time_field="days_to_last_information",
         status_field="survival_status",
@@ -62,6 +48,8 @@ ENDPOINTS: dict[str, EndpointSpec] = {
     ),
 }
 
+
+SURVIVAL_COLUMNS = ["patient_id", "duration", "event"]
 EXCLUSION_REASONS = ("missing_time", "invalid_time", "missing_status", "unknown_status")
 
 
@@ -80,67 +68,66 @@ def load_clinical_records(path: str | Path) -> list[dict]:
     return payload
 
 
-def build_survival_records(
+def survival_table(
     records: list[dict],
     endpoint: str = "OS",
     patient_id_field: str = "patient_id",
-) -> tuple[dict[str, SurvivalRecord], dict[str, list[str]]]:
-    """Convert raw clinical records into validated survival labels.
+) -> tuple[pd.DataFrame, dict[str, list[str]]]:
+    """Convert clinical records into a table of validated survival labels.
 
     Args:
         records: Raw patient objects, e.g. from :func:`load_clinical_records`.
         endpoint: Key into :data:`ENDPOINTS`.
-        patient_id_field: Field holding the patient identifier. Values are read as
-            strings so zero padding matches the slide filenames.
+        patient_id_field: Field holding the patient identifier. Read as a string so
+            zero padding matches the identifiers used elsewhere.
 
     Returns:
-        Survival records keyed by patient id, and the patient ids excluded per reason
-        in :data:`EXCLUSION_REASONS`.
+        A table indexed by position with ``patient_id``, ``duration`` and ``event``
+        columns, and the identifiers excluded per reason.
 
     Raises:
         ClinicalDataError: If the endpoint is unknown, an identifier is missing, or a
-            patient id appears more than once.
+            patient appears more than once.
     """
     if endpoint not in ENDPOINTS:
         raise ClinicalDataError(f"unknown endpoint {endpoint!r}; available: {sorted(ENDPOINTS)}")
     spec = ENDPOINTS[endpoint]
 
-    survival: dict[str, SurvivalRecord] = {}
-    excluded: dict[str, list[str]] = {reason: [] for reason in EXCLUSION_REASONS}
-    seen: set[str] = set()
+    if any(patient_id_field not in record for record in records):
+        raise ClinicalDataError(f"every clinical record needs a {patient_id_field!r} field")
+    if not records:
+        return pd.DataFrame(columns=SURVIVAL_COLUMNS), {reason: [] for reason in EXCLUSION_REASONS}
 
-    for record in records:
-        raw_id = record.get(patient_id_field)
-        if raw_id is None:
-            raise ClinicalDataError(f"clinical record without {patient_id_field!r}: {record}")
+    table = pd.DataFrame(records)
+    table["patient_id"] = table[patient_id_field].astype(str)
+    duplicates = table["patient_id"][table["patient_id"].duplicated()].unique()
+    if len(duplicates):
+        raise ClinicalDataError(f"duplicate patient id(s) in clinical records: {sorted(duplicates)}")
 
-        patient_id = str(raw_id)
-        if patient_id in seen:
-            raise ClinicalDataError(f"duplicate patient id {patient_id!r} in clinical records")
-        seen.add(patient_id)
+    def column(name: str) -> pd.Series:
+        return table[name] if name in table.columns else pd.Series(index=table.index, dtype=object)
 
-        duration = record.get(spec.time_field)
-        status = record.get(spec.status_field)
+    duration = pd.to_numeric(column(spec.time_field), errors="coerce")
+    status = column(spec.status_field).astype("string").str.strip().str.lower()
 
-        if duration is None:
-            excluded["missing_time"].append(patient_id)
-            continue
-        if float(duration) <= 0:
-            excluded["invalid_time"].append(patient_id)
-            continue
-        if status is None:
-            excluded["missing_status"].append(patient_id)
-            continue
+    reasons = {
+        "missing_time": duration.isna(),
+        "invalid_time": duration.notna() & (duration <= 0),
+        "missing_status": status.isna(),
+        "unknown_status": status.isin(spec.unknown_values),
+    }
+    excluded, dropped = {}, pd.Series(False, index=table.index)
+    for reason in EXCLUSION_REASONS:
+        mask = reasons[reason]
+        mask = mask & ~dropped
+        excluded[reason] = table.loc[mask, "patient_id"].tolist()
+        dropped |= mask
 
-        status = str(status).strip().lower()
-        if status in spec.unknown_values:
-            excluded["unknown_status"].append(patient_id)
-            continue
-
-        survival[patient_id] = SurvivalRecord(
-            patient_id=patient_id,
-            duration=float(duration),
-            event=int(status in spec.event_values),
-        )
-
+    survival = pd.DataFrame(
+        {
+            "patient_id": table.loc[~dropped, "patient_id"],
+            "duration": duration[~dropped].astype(float),
+            "event": status[~dropped].isin(spec.event_values).astype(int),
+        }
+    ).reset_index(drop=True)
     return survival, excluded

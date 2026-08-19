@@ -33,11 +33,14 @@ _C.DATASET.VALIDATE_FEATURES = True
 # Evaluation and interpretation always use the full bag. 0 disables the cap.
 _C.DATASET.MAX_PATCHES = 2048
 _C.DATASET.NUM_WORKERS = 4
-_C.DATASET.TRAIN_RATIO = 0.7
+# Share of the cohort held out for validation and testing; training takes the rest.
 _C.DATASET.VAL_RATIO = 0.15
 _C.DATASET.TEST_RATIO = 0.15
-# Number of patient-level cross-validation folds. 0 uses the ratios above instead.
+# Number of cross-validation folds. 0 uses the ratios above instead.
 _C.DATASET.NUM_FOLDS = 0
+# Cohort columns whose distribution is preserved across splits. Samples sharing a
+# patient are always kept in one split regardless of this setting.
+_C.DATASET.STRATIFY_KEYS = ["event"]
 
 # ---------------------------------------------------------------------------
 # Model

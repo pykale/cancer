@@ -1,95 +1,36 @@
-"""Patient-level matching of slide features to clinical survival labels.
+"""Joining slide feature files to clinical survival labels.
 
-Matching is deterministic and happens entirely at patient level: a patient's slides
-are always kept together, which makes slide-level leakage between splits impossible
-downstream. Every excluded patient or file is recorded in :class:`CohortSummary`
-rather than dropped silently.
+Produces one row per slide, which is the representation the generic splitting and
+dataset utilities consume:
+
+======================  ==========================================================
+``patient_id``          Identifier shared by a patient's slides; the grouping key
+``slide_id``            Identifier of the individual slide
+``path``                Feature file for the slide
+``duration``, ``event`` Survival label, repeated for each of a patient's slides
+======================  ==========================================================
+
+Slides without a survival label, and labelled patients without usable features, are
+dropped from the table; :func:`~kalecancer.evaluate.cohort_report.cohort_summary`
+reports what was excluded.
 """
 
 from __future__ import annotations
 
-import logging
 import re
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from kalecancer.loaddata.clinical_access import (
-    SurvivalRecord,
-    build_survival_records,
-    load_clinical_records,
-)
+import pandas as pd
+
+from kalecancer.loaddata.clinical_access import load_clinical_records, survival_table
 from kalecancer.loaddata.wsi_feature_access import (
     DEFAULT_SLIDE_PATTERN,
     InvalidFeatureFileError,
-    SlideRecord,
-    discover_slides,
     inspect_feature_bag,
+    slide_table,
 )
 
-logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class PatientBag:
-    """All primary-tumour slides for one patient, with their survival label."""
-
-    patient_id: str
-    slides: tuple[SlideRecord, ...]
-    duration: float
-    event: int
-
-
-@dataclass
-class CohortSummary:
-    """Provenance of the matched cohort, suitable for JSON export."""
-
-    endpoint: str
-    num_clinical_patients: int = 0
-    num_wsi_patients: int = 0
-    num_wsi_slides: int = 0
-    num_matched_patients: int = 0
-    num_matched_slides: int = 0
-    num_events: int = 0
-    num_censored: int = 0
-    #: Clinical patients with no usable slide features.
-    patients_without_wsi: list[str] = field(default_factory=list)
-    #: Slide patients with no usable survival label, either absent from the clinical
-    #: file or excluded for this endpoint (see ``clinical_exclusions``).
-    unmatched_wsi_patients: list[str] = field(default_factory=list)
-    clinical_exclusions: dict[str, list[str]] = field(default_factory=dict)
-    invalid_feature_files: list[dict[str, str]] = field(default_factory=list)
-    unparsed_feature_files: list[dict[str, str]] = field(default_factory=list)
-    patients_with_multiple_slides: dict[str, int] = field(default_factory=dict)
-
-    def as_dict(self) -> dict:
-        return asdict(self)
-
-    def log(self) -> None:
-        logger.info(
-            "cohort (%s): %d matched patients / %d slides from %d clinical and %d WSI patients "
-            "(%d events, %d censored)",
-            self.endpoint,
-            self.num_matched_patients,
-            self.num_matched_slides,
-            self.num_clinical_patients,
-            self.num_wsi_patients,
-            self.num_events,
-            self.num_censored,
-        )
-        for label, values in (
-            ("clinical patients without WSI features", self.patients_without_wsi),
-            ("WSI patients without a usable survival label", self.unmatched_wsi_patients),
-            ("invalid feature files", self.invalid_feature_files),
-            ("unparsed feature files", self.unparsed_feature_files),
-        ):
-            if values:
-                logger.warning("excluded %d %s", len(values), label)
-        if self.clinical_exclusions:
-            logger.warning(
-                "clinical records excluded for the %s endpoint: %s",
-                self.endpoint,
-                {reason: len(ids) for reason, ids in self.clinical_exclusions.items()},
-            )
+COHORT_COLUMNS = ["patient_id", "slide_id", "path", "duration", "event"]
 
 
 def build_cohort(
@@ -99,73 +40,49 @@ def build_cohort(
     expected_dim: int | None = None,
     slide_pattern: re.Pattern[str] = DEFAULT_SLIDE_PATTERN,
     validate_features: bool = True,
-) -> tuple[list[PatientBag], CohortSummary]:
-    """Match slide feature files to clinical survival labels at patient level.
+) -> pd.DataFrame:
+    """Build the cohort table for a set of slides and clinical records.
 
     Args:
-        feature_root: Directory of HDF5 slide features, searched recursively.
+        feature_root: Directory of slide feature files, searched recursively.
         clinical_path: JSON file of clinical records.
         endpoint: Survival endpoint, see :data:`~kalecancer.loaddata.clinical_access.ENDPOINTS`.
         expected_dim: Feature dimension every slide must provide, if it should be checked.
         slide_pattern: Regular expression exposing a ``patient_id`` named group.
-        validate_features: Read each file's header to reject invalid bags up front.
+        validate_features: Read each file's header and drop unreadable slides.
 
     Returns:
-        Patient bags sorted by patient id, and the matching summary.
+        One row per usable slide, sorted by ``(patient_id, slide_id)``. Excluded
+        slides and patients are recorded in the ``attrs`` mapping under
+        ``"invalid_features"``, ``"unparsed_files"`` and ``"clinical_exclusions"``.
     """
-    slides, unparsed = discover_slides(feature_root, pattern=slide_pattern)
-    summary = CohortSummary(endpoint=endpoint)
-    summary.unparsed_feature_files = [{"path": str(path), "reason": reason} for path, reason in unparsed]
+    slides = slide_table(feature_root, pattern=slide_pattern)
 
-    usable: list[SlideRecord] = []
-    for slide in slides:
-        if validate_features:
+    invalid: list[dict[str, str]] = []
+    if validate_features and not slides.empty:
+        keep = []
+        for path in slides["path"]:
             try:
-                inspect_feature_bag(slide.path, expected_dim=expected_dim)
+                inspect_feature_bag(path, expected_dim=expected_dim)
             except InvalidFeatureFileError as error:
-                summary.invalid_feature_files.append({"path": str(slide.path), "reason": str(error)})
-                continue
-        usable.append(slide)
+                invalid.append({"path": str(path), "reason": str(error)})
+                keep.append(False)
+            else:
+                keep.append(True)
+        slides = slides[keep]
 
-    slides_by_patient: dict[str, list[SlideRecord]] = {}
-    for slide in usable:
-        slides_by_patient.setdefault(slide.patient_id, []).append(slide)
+    records = load_clinical_records(clinical_path)
+    survival, exclusions = survival_table(records, endpoint=endpoint)
 
-    clinical = load_clinical_records(clinical_path)
-    survival, clinical_exclusions = build_survival_records(clinical, endpoint=endpoint)
-
-    summary.num_clinical_patients = len(clinical)
-    summary.num_wsi_patients = len(slides_by_patient)
-    summary.num_wsi_slides = len(usable)
-    summary.clinical_exclusions = {reason: ids for reason, ids in clinical_exclusions.items() if ids}
-
-    bags = _match(slides_by_patient, survival, summary)
-    summary.num_matched_patients = len(bags)
-    summary.num_matched_slides = sum(len(bag.slides) for bag in bags)
-    summary.num_events = sum(bag.event for bag in bags)
-    summary.num_censored = summary.num_matched_patients - summary.num_events
-    summary.patients_with_multiple_slides = {bag.patient_id: len(bag.slides) for bag in bags if len(bag.slides) > 1}
-    return bags, summary
-
-
-def _match(
-    slides_by_patient: dict[str, list[SlideRecord]],
-    survival: dict[str, SurvivalRecord],
-    summary: CohortSummary,
-) -> list[PatientBag]:
-    """Intersect slide and survival patients, recording both sides of the mismatch."""
-    summary.unmatched_wsi_patients = sorted(set(slides_by_patient) - set(survival))
-    summary.patients_without_wsi = sorted(set(survival) - set(slides_by_patient))
-
-    bags = []
-    for patient_id in sorted(set(slides_by_patient) & set(survival)):
-        label = survival[patient_id]
-        bags.append(
-            PatientBag(
-                patient_id=patient_id,
-                slides=tuple(sorted(slides_by_patient[patient_id], key=lambda slide: slide.slide_id)),
-                duration=label.duration,
-                event=label.event,
-            )
-        )
-    return bags
+    cohort = slides.merge(survival, on="patient_id", how="inner")
+    cohort = cohort.sort_values(["patient_id", "slide_id"], ignore_index=True)[COHORT_COLUMNS]
+    cohort.attrs.update(
+        endpoint=endpoint,
+        num_clinical_patients=len(records),
+        slides=slides,
+        survival=survival,
+        invalid_features=invalid,
+        unparsed_files=slides.attrs.get("unparsed", []),
+        clinical_exclusions={reason: ids for reason, ids in exclusions.items() if ids},
+    )
+    return cohort

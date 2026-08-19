@@ -17,16 +17,15 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from kalecancer.loaddata.wsi_dataset import BagBatch, BagSample
 from kalecancer.utils.io import ensure_dir, write_csv
 
 
-def attention_records(sample: BagSample, attention: torch.Tensor) -> list[dict]:
+def attention_records(sample: dict, attention: torch.Tensor) -> list[dict]:
     """Join a bag's attention weights to its patch coordinates.
 
     Args:
         sample: The bag the attention was computed for.
-        attention: ``(num_patches,)`` weights, aligned with ``sample.features``.
+        attention: ``(num_patches,)`` weights, aligned with ``sample["features"]``.
 
     Returns:
         One record per patch with its slide, coordinate and attention weight.
@@ -35,18 +34,19 @@ def attention_records(sample: BagSample, attention: torch.Tensor) -> list[dict]:
         ValueError: If the attention length does not match the number of patches.
     """
     attention = attention.detach().cpu().flatten()
-    if len(attention) != len(sample.coords):
+    num_patches = len(sample["coords"])
+    if len(attention) != num_patches:
         raise ValueError(
-            f"attention has {len(attention)} weights but the bag has {len(sample.coords)} patches; "
+            f"attention has {len(attention)} weights but the bag has {num_patches} patches; "
             "they must stay aligned for coordinates to be meaningful"
         )
 
-    coords = sample.coords.cpu()
-    slide_index = sample.slide_index.cpu()
+    coords = sample["coords"].cpu()
+    slide_index = sample["slide_index"].cpu()
     return [
         {
-            "patient_id": sample.patient_id,
-            "slide_id": sample.slide_ids[int(slide_index[i])],
+            "patient_id": sample["group_id"],
+            "slide_id": sample["slide_ids"][int(slide_index[i])],
             "x": int(coords[i, 0]),
             "y": int(coords[i, 1]),
             "attention": float(attention[i]),
@@ -73,7 +73,7 @@ def export_attention(
 
     Args:
         model: A trained :class:`~kalecancer.pipeline.WSISurvivalTrainer`.
-        loader: Loader yielding :class:`~kalecancer.loaddata.wsi_dataset.BagBatch`.
+        loader: Loader yielding collated bags.
             Use a loader without patch subsampling so attention covers whole slides.
         out_dir: Directory for the exported files.
         top_k: Number of top patches to summarise per patient.
@@ -86,19 +86,19 @@ def export_attention(
 
     for batch in loader:
         _, attentions = model.predict_risk(batch)
-        for sample, attention in zip(batch.samples, attentions, strict=True):
+        for sample, attention in zip(batch["samples"], attentions, strict=True):
             records = attention_records(sample, attention)
-            write_csv(out_dir / f"{sample.patient_id}.csv", records)
+            write_csv(out_dir / f"{sample['group_id']}.csv", records)
             summary.extend(top_k_patches(records, k=top_k))
 
     write_csv(out_dir / "top_patches.csv", summary)
     return out_dir
 
 
-def collect_attention(model, batch: BagBatch) -> dict[str, list[dict]]:
+def collect_attention(model, batch: dict) -> dict[str, list[dict]]:
     """Attention records for one batch, keyed by patient id."""
     _, attentions = model.predict_risk(batch)
     return {
-        sample.patient_id: attention_records(sample, attention)
-        for sample, attention in zip(batch.samples, attentions, strict=True)
+        sample["group_id"]: attention_records(sample, attention)
+        for sample, attention in zip(batch["samples"], attentions, strict=True)
     }

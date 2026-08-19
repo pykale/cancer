@@ -42,7 +42,7 @@ def predict_split(model, loader: DataLoader, split: str) -> SplitPredictions:
 
     Args:
         model: A trained :class:`~kalecancer.pipeline.WSISurvivalTrainer`.
-        loader: Loader yielding :class:`~kalecancer.loaddata.wsi_dataset.BagBatch`.
+        loader: Loader yielding collated bags.
         split: Name recorded against each prediction.
 
     Returns:
@@ -53,10 +53,10 @@ def predict_split(model, loader: DataLoader, split: str) -> SplitPredictions:
 
     for batch in loader:
         risk, _ = model.predict_risk(batch)
-        patient_ids.extend(sample.patient_id for sample in batch.samples)
+        patient_ids.extend(sample["group_id"] for sample in batch["samples"])
         risks.append(risk.detach().cpu())
-        durations.append(batch.duration)
-        events.append(batch.event)
+        durations.append(batch["duration"])
+        events.append(batch["event"])
 
     return SplitPredictions(
         split=split,

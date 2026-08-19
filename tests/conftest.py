@@ -50,8 +50,7 @@ def clinical_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def cohort_bags(feature_root: Path, clinical_path: Path):
+def cohort(feature_root: Path, clinical_path: Path):
     from kalecancer.loaddata import build_cohort
 
-    bags, _ = build_cohort(feature_root, clinical_path, expected_dim=FEATURE_DIM)
-    return bags
+    return build_cohort(feature_root, clinical_path, expected_dim=FEATURE_DIM)

@@ -17,7 +17,6 @@ import logging
 import torch
 from kale.pipeline.base_nn_trainer import BaseNNTrainer
 
-from kalecancer.loaddata.wsi_dataset import BagBatch
 from kalecancer.model.embed.attention_mil import AttentionMIL
 from kalecancer.survival.cox import CoxHead
 from kalecancer.survival.loss import cox_ph_loss, has_risk_set
@@ -80,11 +79,11 @@ class WSISurvivalTrainer(BaseNNTrainer):
         embeddings, attentions = self.encoder.forward_bags(bags)
         return self.cox_head(embeddings), attentions
 
-    def compute_loss(self, batch: BagBatch, split_name: str = "valid") -> tuple[torch.Tensor, dict]:
+    def compute_loss(self, batch: dict, split_name: str = "valid") -> tuple[torch.Tensor, dict]:
         """Cox partial-likelihood loss over the batch's risk set."""
-        bags = [sample.features.to(self.device) for sample in batch.samples]
-        duration = batch.duration.to(self.device)
-        event = batch.event.to(self.device)
+        bags = [sample["features"].to(self.device) for sample in batch["samples"]]
+        duration = batch["duration"].to(self.device)
+        event = batch["event"].to(self.device)
 
         risk, _ = self.forward(bags)
         loss = cox_ph_loss(risk, event, duration, ties_method=self.ties_method)
@@ -94,18 +93,18 @@ class WSISurvivalTrainer(BaseNNTrainer):
             self._accumulate(split_name, risk, event, duration)
         return loss, {f"{split_name}_loss": loss}
 
-    def training_step(self, batch: BagBatch, batch_idx: int) -> torch.Tensor | None:
-        if not has_risk_set(batch.event):
+    def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor | None:
+        if not has_risk_set(batch["event"]):
             logger.debug("skipping batch %d: no observed events, so no Cox risk set", batch_idx)
             return None
         loss, log_metrics = self.compute_loss(batch, split_name="train")
-        self.log_dict(log_metrics, on_step=False, on_epoch=True, batch_size=len(batch))
+        self.log_dict(log_metrics, on_step=False, on_epoch=True, batch_size=len(batch["samples"]))
         return loss
 
-    def validation_step(self, batch: BagBatch, batch_idx: int) -> None:
+    def validation_step(self, batch: dict, batch_idx: int) -> None:
         self._evaluation_step(batch, "valid")
 
-    def test_step(self, batch: BagBatch, batch_idx: int) -> None:
+    def test_step(self, batch: dict, batch_idx: int) -> None:
         self._evaluation_step(batch, "test")
 
     def on_validation_epoch_end(self) -> None:
@@ -114,7 +113,7 @@ class WSISurvivalTrainer(BaseNNTrainer):
     def on_test_epoch_end(self) -> None:
         self._log_concordance("test")
 
-    def predict_risk(self, batch: BagBatch) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    def predict_risk(self, batch: dict) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Risk scores and attention weights for a batch, without tracking gradients.
 
         The training/evaluation mode is restored on return, so calling this during
@@ -124,15 +123,15 @@ class WSISurvivalTrainer(BaseNNTrainer):
         self.eval()
         try:
             with torch.no_grad():
-                bags = [sample.features.to(self.device) for sample in batch.samples]
+                bags = [sample["features"].to(self.device) for sample in batch["samples"]]
                 return self.forward(bags)
         finally:
             self.train(was_training)
 
-    def _evaluation_step(self, batch: BagBatch, split_name: str) -> None:
+    def _evaluation_step(self, batch: dict, split_name: str) -> None:
         loss, log_metrics = self.compute_loss(batch, split_name=split_name)
-        if has_risk_set(batch.event):
-            self.log_dict(log_metrics, on_step=False, on_epoch=True, batch_size=len(batch))
+        if has_risk_set(batch["event"]):
+            self.log_dict(log_metrics, on_step=False, on_epoch=True, batch_size=len(batch["samples"]))
 
     def _accumulate(self, split_name: str, risk: torch.Tensor, event: torch.Tensor, duration: torch.Tensor) -> None:
         store = self._epoch_outputs.setdefault(split_name, [])

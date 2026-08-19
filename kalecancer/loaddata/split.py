@@ -1,146 +1,172 @@
-"""Leakage-safe, patient-level dataset splitting.
+"""Leakage-safe dataset splitting over a metadata table.
 
-Splits are computed over patients, never over slides or patches. Because a
-:class:`~kalecancer.loaddata.cohort.PatientBag` already pools all of a patient's
-slides, no slide or patch can appear in two splits. Splits are stratified on the
-event indicator so the censoring balance is preserved, and seeded so they are
-reproducible.
+Splits are described by column names rather than by domain concepts, so the same
+utility serves slides grouped by patient, cardiac volumes grouped by subject, or
+plain tabular rows:
+
+    >>> splits = train_val_test_split(metadata, group_key="patient_id", stratify_keys=["event"])
+
+Samples sharing a ``group_key`` value always land in the same split, which is what
+prevents leakage when one subject contributes several samples. Stratification keys
+are combined into a single categorical target, so one, several, or no keys are
+handled identically.
+
+Splitters return positional indices into the table; callers select rows with
+``metadata.iloc[...]``.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
 
-from sklearn.model_selection import StratifiedKFold, train_test_split
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
-from kalecancer.loaddata.cohort import PatientBag
+Split = dict[str, np.ndarray]
 
 
 class SplitError(ValueError):
     """Raised when a requested split cannot be produced."""
 
 
-@dataclass(frozen=True)
-class CohortSplit:
-    """Disjoint patient bags for one experiment."""
+def composite_labels(metadata: pd.DataFrame, stratify_keys: Sequence[str] = (), min_count: int = 2) -> np.ndarray:
+    """Combine stratification columns into a single categorical target.
 
-    train: list[PatientBag]
-    val: list[PatientBag]
-    test: list[PatientBag]
-
-    def sizes(self) -> dict[str, int]:
-        return {"train": len(self.train), "val": len(self.val), "test": len(self.test)}
-
-
-def _stratify_labels(bags: list[PatientBag]) -> list[int]:
-    return [bag.event for bag in bags]
-
-
-def _can_stratify(labels: list[int], num_groups: int) -> bool:
-    """Stratification needs at least ``num_groups`` members in every class."""
-    return len(set(labels)) > 1 and all(labels.count(label) >= num_groups for label in set(labels))
-
-
-def split_patients(
-    bags: list[PatientBag],
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
-    seed: int = 2026,
-) -> CohortSplit:
-    """Split patients into train/validation/test sets.
+    A class with fewer members than the number of splits cannot appear in all of
+    them, so rare combinations are absorbed into the most common class. Stratification
+    then degrades gracefully instead of failing on an unlucky combination.
 
     Args:
-        bags: Matched patient bags.
-        train_ratio: Fraction of patients used for training.
-        val_ratio: Fraction used for validation (model selection).
-        test_ratio: Fraction used for the final held-out evaluation.
+        metadata: Table describing the samples.
+        stratify_keys: Columns to stratify on. Empty gives a constant target, which
+            reduces stratified splitting to plain shuffling.
+        min_count: Smallest class size to keep separate.
+
+    Returns:
+        Integer labels, one per row.
+
+    Raises:
+        SplitError: If a requested column is missing.
+    """
+    missing = [key for key in stratify_keys if key not in metadata.columns]
+    if missing:
+        raise SplitError(f"stratify_keys {missing} are not columns of the metadata: {list(metadata.columns)}")
+
+    if not stratify_keys or metadata.empty:
+        return np.zeros(len(metadata), dtype=np.int64)
+
+    combined = metadata[list(stratify_keys)].astype(str).agg("|".join, axis=1)
+    labels, _ = pd.factorize(combined)
+    counts = pd.Series(labels).value_counts()
+    return np.where(np.isin(labels, counts[counts >= min_count].index), labels, counts.idxmax())
+
+
+def _holdout(
+    metadata: pd.DataFrame,
+    indices: np.ndarray,
+    ratio: float,
+    group_key: str | None,
+    stratify_keys: Sequence[str],
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hold out approximately ``ratio`` of ``indices``, keeping groups intact.
+
+    A K-fold splitter with ``round(1 / ratio)`` folds provides the held-out part,
+    which keeps grouped and ungrouped splitting on one code path.
+    """
+    num_splits = max(2, round(1 / ratio))
+    subset = metadata.iloc[indices]
+    labels = composite_labels(subset, stratify_keys, min_count=num_splits)
+    groups = subset[group_key].to_numpy() if group_key else None
+
+    splitter = StratifiedGroupKFold if group_key else StratifiedKFold
+    folds = splitter(n_splits=num_splits, shuffle=True, random_state=seed)
+    keep, held = next(iter(folds.split(subset, labels, groups)))
+    return indices[keep], indices[held]
+
+
+def _validate(metadata: pd.DataFrame, group_key: str | None, minimum: int) -> None:
+    if group_key is not None and group_key not in metadata.columns:
+        raise SplitError(f"group_key {group_key!r} is not a column of the metadata: {list(metadata.columns)}")
+    units = metadata[group_key].nunique() if group_key else len(metadata)
+    if units < minimum:
+        unit = f"unique {group_key}" if group_key else "rows"
+        raise SplitError(f"need at least {minimum} {unit} to split, got {units}")
+
+
+def train_val_test_split(
+    metadata: pd.DataFrame,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    group_key: str | None = None,
+    stratify_keys: Sequence[str] = (),
+    seed: int = 2026,
+) -> Split:
+    """Split a metadata table into train, validation and test indices.
+
+    Args:
+        metadata: Table describing the samples.
+        val_ratio: Approximate share held out for validation.
+        test_ratio: Approximate share held out for testing.
+        group_key: Column whose values must not be split across sets.
+        stratify_keys: Columns whose distribution should be preserved.
         seed: Seed making the split reproducible.
 
     Returns:
-        Disjoint patient-level splits.
+        Positional indices keyed by ``"train"``, ``"val"`` and ``"test"``.
 
     Raises:
-        SplitError: If the ratios do not sum to 1, or any split would be empty.
+        SplitError: If the ratios are invalid or the table is too small to split.
     """
-    total = train_ratio + val_ratio + test_ratio
-    if abs(total - 1.0) > 1e-6:
-        raise SplitError(f"split ratios must sum to 1.0, got {total}")
-    if len(bags) < 3:
-        raise SplitError(f"need at least 3 patients to build three splits, got {len(bags)}")
+    if not 0 < val_ratio + test_ratio < 1:
+        raise SplitError(f"val_ratio + test_ratio must lie in (0, 1), got {val_ratio + test_ratio}")
+    _validate(metadata, group_key, minimum=3)
 
-    labels = _stratify_labels(bags)
-    try:
-        train_bags, holdout = train_test_split(
-            bags,
-            train_size=train_ratio,
-            random_state=seed,
-            shuffle=True,
-            stratify=labels if _can_stratify(labels, 2) else None,
-        )
-
-        holdout_labels = _stratify_labels(holdout)
-        val_share = val_ratio / (val_ratio + test_ratio)
-        val_bags, test_bags = train_test_split(
-            holdout,
-            train_size=val_share,
-            random_state=seed,
-            shuffle=True,
-            stratify=holdout_labels if _can_stratify(holdout_labels, 2) else None,
-        )
-    except ValueError as error:
-        raise SplitError(
-            f"cannot split {len(bags)} patients into {train_ratio}/{val_ratio}/{test_ratio}: {error}"
-        ) from error
-
-    split = CohortSplit(train=train_bags, val=val_bags, test=test_bags)
-    empty = [name for name, size in split.sizes().items() if size == 0]
-    if empty:
-        raise SplitError(f"split(s) {empty} are empty; adjust the ratios for {len(bags)} patients")
-    return split
+    all_indices = np.arange(len(metadata))
+    remaining, test = _holdout(metadata, all_indices, test_ratio, group_key, stratify_keys, seed)
+    train, val = _holdout(metadata, remaining, val_ratio / (1 - test_ratio), group_key, stratify_keys, seed)
+    return {"train": train, "val": val, "test": test}
 
 
-def stratified_patient_folds(
-    bags: list[PatientBag],
+def k_fold_splits(
+    metadata: pd.DataFrame,
     num_folds: int = 5,
     val_ratio: float = 0.15,
+    group_key: str | None = None,
+    stratify_keys: Sequence[str] = (),
     seed: int = 2026,
-) -> list[CohortSplit]:
-    """Build patient-level cross-validation folds.
+) -> list[Split]:
+    """Build cross-validation folds over a metadata table.
 
-    Each fold holds out one test partition; the validation set is carved out of that
-    fold's training patients, so train, validation and test remain disjoint.
+    Each fold holds out one test partition; validation is carved from that fold's
+    remaining samples, so the three sets stay disjoint.
 
     Args:
-        bags: Matched patient bags.
-        num_folds: Number of cross-validation folds.
-        val_ratio: Fraction of each fold's training patients held out for validation.
+        metadata: Table describing the samples.
+        num_folds: Number of folds.
+        val_ratio: Share of each fold's non-test samples held out for validation.
+        group_key: Column whose values must not be split across sets.
+        stratify_keys: Columns whose distribution should be preserved.
         seed: Seed making the folds reproducible.
 
+    Returns:
+        One index mapping per fold.
+
     Raises:
-        SplitError: If fewer patients than folds are available.
+        SplitError: If ``num_folds`` is below 2 or the table is too small.
     """
     if num_folds < 2:
         raise SplitError(f"num_folds must be at least 2, got {num_folds}")
-    if len(bags) < num_folds:
-        raise SplitError(f"need at least {num_folds} patients for {num_folds} folds, got {len(bags)}")
+    _validate(metadata, group_key, minimum=num_folds)
 
-    labels = _stratify_labels(bags)
-    splitter = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
-    strata = labels if _can_stratify(labels, num_folds) else [0] * len(bags)
+    labels = composite_labels(metadata, stratify_keys, min_count=num_folds)
+    groups = metadata[group_key].to_numpy() if group_key else None
+    splitter = StratifiedGroupKFold if group_key else StratifiedKFold
+    folds = splitter(n_splits=num_folds, shuffle=True, random_state=seed)
 
-    folds = []
-    for fold, (fit_index, test_index) in enumerate(splitter.split(bags, strata)):
-        fit_bags = [bags[i] for i in fit_index]
-        test_bags = [bags[i] for i in test_index]
-
-        fit_labels = _stratify_labels(fit_bags)
-        train_bags, val_bags = train_test_split(
-            fit_bags,
-            test_size=val_ratio,
-            random_state=seed + fold,
-            shuffle=True,
-            stratify=fit_labels if _can_stratify(fit_labels, 2) else None,
-        )
-        folds.append(CohortSplit(train=train_bags, val=val_bags, test=test_bags))
-    return folds
+    splits = []
+    for fold, (fit, test) in enumerate(folds.split(metadata, labels, groups)):
+        train, val = _holdout(metadata, fit, val_ratio, group_key, stratify_keys, seed + fold)
+        splits.append({"train": train, "val": val, "test": test})
+    return splits

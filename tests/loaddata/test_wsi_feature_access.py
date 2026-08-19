@@ -11,10 +11,10 @@ import pytest
 from kalecancer.loaddata import (
     InvalidFeatureFileError,
     SlideIdentifierError,
-    discover_slides,
     inspect_feature_bag,
     parse_patient_id,
     read_feature_bag,
+    slide_table,
 )
 from tests.conftest import FEATURE_DIM, write_bag
 
@@ -36,31 +36,42 @@ def test_parse_patient_id_rejects_unparseable_name() -> None:
         parse_patient_id("slide_without_number")
 
 
-def test_discover_slides_walks_nested_directories(feature_root: Path) -> None:
-    slides, unparsed = discover_slides(feature_root)
+def test_slide_table_walks_nested_directories(feature_root: Path) -> None:
+    slides = slide_table(feature_root)
 
-    assert not unparsed
-    assert [slide.slide_id for slide in slides] == [
+    assert not slides.attrs["unparsed"]
+    assert list(slides.columns) == ["patient_id", "slide_id", "path"]
+    assert list(slides["slide_id"]) == [
         "PrimaryTumor_HE_001",
         "PrimaryTumor_HE_002",
         "PrimaryTumor_HE_003",
         "PrimaryTumor_HE_003_a",
     ]
-    assert [slide.patient_id for slide in slides] == ["001", "002", "003", "003"]
+    assert list(slides["patient_id"]) == ["001", "002", "003", "003"]
 
 
-def test_discover_slides_reports_unparseable_files(feature_root: Path) -> None:
+def test_slide_table_reports_unparseable_files(feature_root: Path) -> None:
     write_bag(feature_root / "Larynx" / "h5_files" / "no_identifier.h5")
 
-    slides, unparsed = discover_slides(feature_root)
+    slides = slide_table(feature_root)
 
     assert len(slides) == 4
-    assert [path.name for path, _ in unparsed] == ["no_identifier.h5"]
+    assert [Path(entry["path"]).name for entry in slides.attrs["unparsed"]] == ["no_identifier.h5"]
 
 
-def test_discover_slides_requires_existing_root(tmp_path: Path) -> None:
+def test_slide_table_is_empty_for_a_directory_without_features(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    slides = slide_table(empty)
+
+    assert slides.empty
+    assert list(slides.columns) == ["patient_id", "slide_id", "path"]
+
+
+def test_slide_table_requires_existing_root(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
-        discover_slides(tmp_path / "absent")
+        slide_table(tmp_path / "absent")
 
 
 def test_read_feature_bag_returns_aligned_features_and_coords(feature_root: Path) -> None:

@@ -12,11 +12,11 @@ Each file holds one slide encoded by a pathology foundation model (e.g. UNI via 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from pathlib import Path
 
 import h5py
 import numpy as np
+import pandas as pd
 
 FEATURES_KEY = "features"
 COORDS_KEY = "coords"
@@ -33,15 +33,6 @@ class InvalidFeatureFileError(ValueError):
 
 class SlideIdentifierError(ValueError):
     """Raised when a patient identifier cannot be parsed from a slide name."""
-
-
-@dataclass(frozen=True)
-class SlideRecord:
-    """A single discovered slide feature file."""
-
-    patient_id: str
-    slide_id: str
-    path: Path
 
 
 def parse_patient_id(slide_id: str, pattern: re.Pattern[str] = DEFAULT_SLIDE_PATTERN) -> str:
@@ -65,11 +56,11 @@ def parse_patient_id(slide_id: str, pattern: re.Pattern[str] = DEFAULT_SLIDE_PAT
     return match.group("patient_id")
 
 
-def discover_slides(
+def slide_table(
     root: str | Path,
     pattern: re.Pattern[str] = DEFAULT_SLIDE_PATTERN,
     extension: str = ".h5",
-) -> tuple[list[SlideRecord], list[tuple[Path, str]]]:
+) -> pd.DataFrame:
     """Recursively discover slide feature files below ``root``.
 
     Directory depth is not assumed: any nesting of subsite or batch folders works.
@@ -80,8 +71,8 @@ def discover_slides(
         extension: Feature file extension.
 
     Returns:
-        Discovered slides sorted by ``(patient_id, slide_id)``, and ``(path, reason)``
-        pairs for files whose identifier could not be parsed.
+        A ``patient_id``/``slide_id``/``path`` table sorted by identifier. Files whose
+        identifier could not be parsed are listed in ``attrs["unparsed"]``.
 
     Raises:
         FileNotFoundError: If ``root`` does not exist.
@@ -90,19 +81,19 @@ def discover_slides(
     if not root.is_dir():
         raise FileNotFoundError(f"feature root does not exist or is not a directory: {root}")
 
-    slides: list[SlideRecord] = []
-    unparsed: list[tuple[Path, str]] = []
+    rows, unparsed = [], []
     for path in sorted(root.rglob(f"*{extension}")):
-        slide_id = path.stem
         try:
-            patient_id = parse_patient_id(slide_id, pattern)
+            patient_id = parse_patient_id(path.stem, pattern)
         except SlideIdentifierError as error:
-            unparsed.append((path, str(error)))
+            unparsed.append({"path": str(path), "reason": str(error)})
             continue
-        slides.append(SlideRecord(patient_id=patient_id, slide_id=slide_id, path=path))
+        rows.append({"patient_id": patient_id, "slide_id": path.stem, "path": path})
 
-    slides.sort(key=lambda record: (record.patient_id, record.slide_id))
-    return slides, unparsed
+    table = pd.DataFrame(rows, columns=["patient_id", "slide_id", "path"])
+    table = table.sort_values(["patient_id", "slide_id"], ignore_index=True)
+    table.attrs["unparsed"] = unparsed
+    return table
 
 
 def _validated_shape(handle: h5py.File, path: Path, expected_dim: int | None) -> tuple[int, int]:

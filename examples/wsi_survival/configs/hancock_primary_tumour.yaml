@@ -3,7 +3,6 @@ DATASET:
   CLINICAL_PATH: "E:/StructuredData/StructuredData/clinical_data.json"
   MAX_PATCHES: 2048
   NUM_WORKERS: 4
-  TRAIN_RATIO: 0.7
   VAL_RATIO: 0.15
   TEST_RATIO: 0.15
 
