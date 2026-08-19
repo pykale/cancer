@@ -24,6 +24,7 @@ classifiers = [
 ]
 dependencies = [
     "torch",
+    "lightning>=2.4",
     "numpy",
     "pandas",
     "scikit-learn",
@@ -32,6 +33,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tabular = [
+    "tabicl>=2.1",
+]
 imaging = [
     "monai",
     "nibabel",
