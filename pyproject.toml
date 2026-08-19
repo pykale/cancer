@@ -30,6 +30,11 @@ dependencies = [
     "scikit-learn",
     "scikit-survival",
     "pyyaml",
+    "certifi",
+    "yacs",
+    "h5py",
+    "pykale",
+    "pytorch-lightning",
 ]
 
 [project.optional-dependencies]
@@ -60,6 +65,9 @@ dev = [
     "twine",
     "lifelines",
 ]
+
+[project.scripts]
+kalecancer = "kalecancer.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/pykale/cancer"

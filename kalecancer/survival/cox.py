@@ -166,3 +166,22 @@ class CoxHead(nn.Module):
         if z.dim() != 2 or z.shape[1] != self.in_features:
             raise ValueError(f"CoxHead expects input of shape (B, {self.in_features}), got {tuple(z.shape)}")
         return self.linear(z)
+
+
+def as_event_mask(events: torch.Tensor) -> torch.Tensor:
+    """Normalise an event indicator to the boolean mask the Cox routines require.
+
+    Accepts the ``1 = event observed`` / ``0 = censored`` convention in any numeric
+    dtype.
+    """
+    return events if events.dtype == torch.bool else events.bool()
+
+
+def has_risk_set(events: torch.Tensor) -> bool:
+    """Whether a batch contains at least one observed event.
+
+    The partial likelihood sums over observed events, so a batch of purely censored
+    subjects carries no gradient and :func:`neg_partial_log_likelihood` rejects it.
+    Callers should skip such batches rather than stepping the optimiser.
+    """
+    return bool(as_event_mask(events).any())

@@ -61,15 +61,15 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import TypeAlias
 
 import numpy as np
+import pandas as pd
 import torch
-from sklearn.model_selection import StratifiedKFold
 from torch import nn
 
+from kalecancer.evaluate.survival_metrics import integrated_brier, kaplan_meier_groups, time_dependent_auc
+from kalecancer.loaddata.split import k_fold_splits
 from kalecancer.survival.baseline import breslow_baseline_hazard, predict_survival_function
 from kalecancer.survival.metrics import concordance_index
 from kalecancer.survival.trainer import fit_survival_model
-
-from .survival_metrics import integrated_brier, kaplan_meier_groups, time_dependent_auc
 
 _DAYS_PER_YEAR = 365.25
 
@@ -118,8 +118,15 @@ def patient_stratified_splits(
             "every fold requires at least one event"
         )
 
-    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    return list(splitter.split(np.zeros(events.shape[0]), events))
+    folds = k_fold_splits(
+        pd.DataFrame({"event": events}),
+        num_folds=n_splits,
+        stratify_keys=["event"],
+        seed=seed,
+    )
+    # The harness fits on everything outside the test partition, so the validation
+    # slice the generic splitter carves out is folded back into the training indices.
+    return [(np.sort(np.concatenate([fold["train"], fold["val"]])), fold["test"]) for fold in folds]
 
 
 def bootstrap_ci(

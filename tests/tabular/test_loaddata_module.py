@@ -13,7 +13,7 @@ import torch
 from kalecancer.loaddata.base import LeakageError
 from kalecancer.loaddata.module import CohortDataModule
 from kalecancer.loaddata.sample import PatientBatch
-from tests.conftest import CONTINUOUS
+from tests.tabular.conftest import CONTINUOUS
 
 
 @pytest.fixture

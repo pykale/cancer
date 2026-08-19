@@ -17,7 +17,7 @@ import torch
 
 from kalecancer.loaddata.protocols import Preprocessor, Target, check_target
 
-PROTOCOLS_FILE = Path(__file__).resolve().parents[1] / "kalecancer" / "loaddata" / "protocols.py"
+PROTOCOLS_FILE = Path(__file__).resolve().parents[2] / "kalecancer" / "loaddata" / "protocols.py"
 
 
 class GoodTarget:

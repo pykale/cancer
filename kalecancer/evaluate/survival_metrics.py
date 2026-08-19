@@ -24,6 +24,17 @@ from sksurv.metrics import cumulative_dynamic_auc, integrated_brier_score
 from sksurv.nonparametric import kaplan_meier_estimator
 
 
+def usable_eval_times(eval_times: np.ndarray, times: np.ndarray) -> np.ndarray:
+    """Keep only evaluation times strictly inside the observed follow-up.
+
+    IPCW weights are undefined beyond what was observed, so horizons outside the
+    range are dropped rather than extrapolated.
+    """
+    eval_times = np.asarray(eval_times, dtype=np.float64)
+    times = np.asarray(times, dtype=np.float64)
+    return eval_times[(eval_times > times.min()) & (eval_times < times.max())]
+
+
 def _to_structured(times: np.ndarray, events: np.ndarray) -> np.ndarray:
     """Build the ``(event: bool, time: float)`` structured array scikit-survival expects."""
     times = np.asarray(times, dtype=np.float64)

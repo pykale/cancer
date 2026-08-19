@@ -15,7 +15,7 @@ from kalecancer.loaddata.base import NotFittedError
 from kalecancer.loaddata.sample import collate_samples
 from kalecancer.loaddata.tabular import TabularCohort
 from kalecancer.survival.survival_target import SurvivalTarget
-from tests.conftest import (
+from tests.tabular.conftest import (
     CATEGORICAL,
     CONTINUOUS,
     EVENT_COLUMN,

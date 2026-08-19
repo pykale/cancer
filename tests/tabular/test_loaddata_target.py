@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from kalecancer.survival.survival_target import SurvivalTarget
-from tests.conftest import EVENT_COLUMN, EVENT_VALUE, TIME_COLUMN
+from tests.tabular.conftest import EVENT_COLUMN, EVENT_VALUE, TIME_COLUMN
 
 
 def bind(target: SurvivalTarget, frame: pd.DataFrame, identifier: str = "patient_id") -> SurvivalTarget:

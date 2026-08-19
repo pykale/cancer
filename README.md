@@ -1,61 +1,48 @@
 # cancer — Multimodal Cancer AI for PyKale
 
-Accessible multimodal machine learning for oncology — combining radiology volumes, whole-slide pathology, and clinical records, with time-to-event prediction.
+Multimodal machine learning for oncology: whole-slide pathology, radiology, and
+clinical records, with time-to-event prediction.
 
-## What this is
+**cancer** is the oncology domain package of the [PyKale](https://github.com/pykale/pykale)
+ecosystem, installed as **`kalecancer`**. It follows PyKale's verb-oriented pipeline
+(`loaddata` → `prepdata` → `model` → `evaluate` → `interpret`), adding a dedicated
+**`survival`** stage. MONAI covers 3D imaging well but provides neither multimodal
+fusion nor survival modelling; this package supplies both for oncology.
 
-**cancer** is the oncology domain package of the [PyKale](https://github.com/pykale/pykale) ecosystem. It is installable on PyPI and in development environments as **`kalecancer`**.
+## Quickstart
 
-The package follows PyKale’s verb-oriented pipeline API (`loaddata` → `prepdata` → `model` → `evaluate` → `interpret`), extended with cancer-specific data types and a dedicated **`survival`** stage for time-to-event modelling.
+No data or credentials needed — patches are fetched from the published
+[HANCOCK dataset](https://hancock.research.fau.eu/) (CC BY 4.0):
 
-## Why it exists
-
-Clinical collaborators — medical physicists, pathologists, and research software engineers — often already use **MONAI** for medical imaging workflows. MONAI excels at 3D radiology preprocessing and model zoo access, but it does **not** provide:
-
-- multimodal **fusion** across imaging and tabular clinical data, or
-- built-in **time-to-event / survival** modelling.
-
-**PyKale** is designed for multimodal learning and transfer learning across modalities. **kalecancer** bridges that gap for oncology: reusing familiar imaging tooling where appropriate, while adding clinical tabular integration and survival analysis as first-class concerns.
-
-## Supported modalities
-
-| Modality | Formats | Description |
-| --- | --- | --- |
-| CT / MRI | DICOM, NIfTI | 3D radiology volumes *(planned loaders)* |
-| Whole-slide pathology | `.svs`, TIFF | Gigapixel 2D slide images *(planned loaders)* |
-| Clinical tabular | CSV | Patient features, outcomes, missing values *(planned loaders)* |
-
-> **Note:** Modality support is being built out module by module. See [Status](#status) below.
-
-## Supported tasks
-
-| Task | Examples | Status |
-| --- | --- | --- |
-| **Classification** | Tumour vs benign, molecular subtype | Planned |
-| **Regression** | Continuous biomarkers, tumour burden | Planned |
-| **Time-to-event / survival** | Overall survival (OS), disease-free survival (DFS) | **Primary focus** — planned |
-
-Survival analysis is the main research driver for this package: jointly modelling imaging, pathology, and clinical variables to predict when an event (e.g. progression or death) occurs.
-
-## Package layout
-
-```
-kalecancer/
-├── auto/          High-level selection and construction (AutoCancer* classes) — planned
-├── loaddata/      Datasets and records: DICOM/CT, WSI, tabular clinical — planned
-├── prepdata/      Reusable transforms: CT windowing, WSI tiling, stain normalisation — planned
-├── model/         Modality encoders, fusion, and task heads — planned
-├── survival/      Cox head, losses, and metrics — planned (cancer-agnostic; destined for PyKale core)
-├── evaluate/      Performance metrics — planned
-├── interpret/     SHAP, Grad-CAM, modality contribution — planned
-└── utils/         Shared helpers — planned
+```bash
+pip install -e .
+kalecancer wsi-survival --source hancock --patients 50 --preset quick
 ```
 
-The **`survival`** submodule is intentionally **cancer-agnostic**: it must not import from other `kalecancer` modules, so it can later move into PyKale core. This boundary is enforced in CI (`tests/test_survival_boundary.py`).
+## Documentation
+
+| If you want to | Read |
+| --- | --- |
+| Run a prediction without writing code | [Quickstart](docs/quickstart.md) |
+| Use your own data, or change the experiment | [WSI survival pipeline](examples/wsi_survival/) |
+| Combine modalities | [Multimodal fusion](docs/multimodal_fusion.md) |
+| Contribute code | [Contributing](#contributing) and [AGENTS.md](AGENTS.md) |
+| Understand the design decisions | [Architecture](docs/architecture.md) |
+
+## What works today
+
+| Capability | Status |
+| --- | --- |
+| WSI survival from precomputed patch features | Attention MIL + Cox head, with metrics and attention export |
+| Survival modelling | Cox loss, Harrell and IPCW C-index, time-dependent AUC, Brier score |
+| Multimodal fusion | Early, late, and hybrid strategies; `concat` / `poe` / `lowrank` |
+| Data access | Local files, or streamed from the public HANCOCK archives |
+| CT / MRI and tabular encoders | Planned |
+| Preprocessing transforms, `auto` classes | Planned |
 
 ## Installation
 
-Requires **Python ≥ 3.10**. Install PyTorch for your platform first, then:
+Requires **Python ≥ 3.10**.
 
 ```bash
 git clone https://github.com/pykale/cancer.git
@@ -63,62 +50,53 @@ cd cancer
 pip install -e .
 ```
 
-### Optional extras
-
-Install only what you need — heavy imaging and pathology libraries are kept out of the core install.
+Heavy libraries are kept out of the core install:
 
 | Extra | Packages | When to use |
 | --- | --- | --- |
-| `imaging` | monai, nibabel, pydicom, SimpleITK | DICOM / NIfTI radiology workflows |
-| `pathology` | openslide-python, tifffile | Whole-slide image reading |
-| `interpret` | shap, captum | Model explanation and attribution |
-| `dev` | pytest, ruff, black, isort, mypy, … | Development and CI |
+| `imaging` | monai, nibabel, pydicom, SimpleITK | DICOM / NIfTI workflows |
+| `pathology` | openslide-python, tifffile | Reading whole-slide images |
+| `interpret` | shap, captum | Model explanation |
+| `dev` | pytest, ruff, black, isort, mypy | Development and CI |
 
-```bash
-pip install -e ".[dev]"                        # development tools
-pip install -e ".[imaging,pathology]"          # radiology + pathology
-pip install -e ".[imaging,pathology,interpret,dev]"  # everything
+## Package layout
+
+```
+kalecancer/
+├── loaddata/    Patch features, clinical labels, cohort matching, splitting
+├── prepdata/    Transforms — planned
+├── model/       Encoders (attention MIL) and multimodal fusion
+├── pipeline/    Trainers and end-to-end runners
+├── survival/    Cox head, loss, metrics, baseline hazard
+├── evaluate/    Metrics and prediction reports
+├── interpret/   Attention export
+├── auto/        High-level construction — planned
+└── utils/       Seeding and artefact writing
 ```
 
-## Planned API (not yet implemented)
-
-The following illustrates the intended high-level workflow. **None of this is available yet** — it documents the design direction only.
-
-```python
-# Planned API — subject to change
-import kalecancer as kc
-
-pipeline = kc.auto.AutoCancerSurvival.from_config("configs/os_lung.yaml")
-pipeline.fit()
-metrics = pipeline.evaluate()
-pipeline.interpret(modality="clinical")
-```
+`survival/` is deliberately cancer-agnostic: it must not import from other
+`kalecancer` modules, so it can move into PyKale core. CI enforces this
+(`tests/test_survival_boundary.py`).
 
 ## Status
 
-**Early development.** The package skeleton, CI, and architectural boundaries are in place; loaders, transforms, models, and metrics are not yet implemented.
-
-A **preliminary version** is targeted for **31 August 2026**.
+Early development. A preliminary version is targeted for **31 August 2026**.
 
 ## Contributing
 
-Contributions are welcome from PyKale maintainers and clinical collaborators.
-
 1. Fork the repository and create a feature branch.
-2. Install with `pip install -e ".[dev]"`.
-3. Run the linters and tests locally (same as CI):
+2. `pip install -e ".[dev]"`.
+3. Run the same checks as CI:
 
    ```bash
-   black --check .
-   isort --check-only .
-   ruff check .
-   pytest --cov=kalecancer
+   black --check . && isort --check-only . && ruff check . && pytest
    ```
 
 4. Open a pull request against `main`.
 
-For architectural questions — especially around the `survival` boundary — see `tests/test_survival_boundary.py` and the module docstrings under `kalecancer/survival/`.
+Conventions and architectural constraints are documented in [AGENTS.md](AGENTS.md),
+which applies to human and automated contributors alike.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). The HANCOCK dataset is licensed separately under CC BY 4.0.
