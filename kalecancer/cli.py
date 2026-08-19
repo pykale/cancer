@@ -50,10 +50,12 @@ def _add_wsi_survival_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--out", type=str, help="directory for results")
     parser.add_argument(
         "--source",
-        choices=["local", "hancock"],
-        help="local paths, or fetch from the published HANCOCK archives",
+        choices=["local", "hancock", "synthetic"],
+        help="local paths, fetch the published HANCOCK archives, or generate a cohort offline",
     )
-    parser.add_argument("--patients", type=int, help="patients to fetch from a remote source; 0 fetches all")
+    parser.add_argument(
+        "--patients", type=int, help="patients to fetch or generate; 0 fetches the whole cohort"
+    )
     parser.add_argument("--region", choices=["primary", "lymph_node"], help="anatomical region to fetch")
     parser.add_argument("--cache-dir", type=str, help="cache for fetched data")
     parser.add_argument(
@@ -168,19 +170,19 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if missing:
             logger.error(
-                "path not found for %s; pass an existing path, use --cfg, or fetch the public data with "
-                "--source hancock",
+                "path not found for %s; pass an existing path, use --cfg, fetch the public data with "
+                "--source hancock, or run offline with --source synthetic",
                 ", ".join(missing),
             )
             return 2
 
-    from kalecancer.loaddata.hancock import HancockError
+    from kalecancer.loaddata.dataset_source import DataSourceError
     from kalecancer.pipeline.wsi_survival_runner import PipelineError, run
 
     cfg.freeze()
     try:
         run(cfg)
-    except (PipelineError, HancockError) as error:
+    except (PipelineError, DataSourceError) as error:
         logger.error("%s", error)
         return 1
     return 0

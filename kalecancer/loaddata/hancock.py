@@ -142,24 +142,3 @@ def fetch_dataset(
         :func:`~kalecancer.loaddata.cohort.build_cohort`.
     """
     return fetch_features(cache_dir, region=region, patients=patients), fetch_clinical(cache_dir)
-
-
-def resolve_dataset(cfg) -> tuple[Path, Path]:
-    """Resolve the configured data source to local paths.
-
-    ``DATASET.SOURCE`` selects between an existing local copy and fetching from
-    HANCOCK. Both return local paths, so the rest of the pipeline is unaffected.
-
-    Raises:
-        HancockError: If the source is unknown.
-    """
-    source = cfg.DATASET.SOURCE
-    if source == "local":
-        return Path(cfg.DATASET.FEATURE_ROOT), Path(cfg.DATASET.CLINICAL_PATH)
-    if source == "hancock":
-        return fetch_dataset(
-            cache_dir=cfg.DATASET.CACHE_DIR or DEFAULT_CACHE_DIR,
-            region=cfg.DATASET.REGION,
-            patients=cfg.DATASET.PATIENTS,
-        )
-    raise HancockError(f"unknown DATASET.SOURCE {source!r}; expected 'local' or 'hancock'")

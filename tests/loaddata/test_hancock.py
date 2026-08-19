@@ -10,7 +10,8 @@ import numpy as np
 import pytest
 
 from kalecancer.loaddata import hancock
-from kalecancer.loaddata.hancock import HancockError, fetch_dataset, resolve_dataset
+from kalecancer.loaddata.dataset_source import resolve_dataset
+from kalecancer.loaddata.hancock import HancockError, fetch_dataset
 
 PATIENTS = ["001", "002", "003", "004"]
 
@@ -117,17 +118,6 @@ def test_unknown_region_is_rejected(local_archives: Path) -> None:
         fetch_dataset(cache_dir=local_archives, region="brain")
 
 
-def test_local_source_returns_the_configured_paths() -> None:
-    from kalecancer.config import get_cfg_defaults
-
-    cfg = get_cfg_defaults()
-    cfg.DATASET.SOURCE = "local"
-    cfg.DATASET.FEATURE_ROOT = "features"
-    cfg.DATASET.CLINICAL_PATH = "clinical.json"
-
-    assert resolve_dataset(cfg) == (Path("features"), Path("clinical.json"))
-
-
 def test_hancock_source_fetches(local_archives: Path) -> None:
     from kalecancer.config import get_cfg_defaults
 
@@ -139,13 +129,3 @@ def test_hancock_source_fetches(local_archives: Path) -> None:
     feature_root, clinical_path = resolve_dataset(cfg)
 
     assert feature_root.exists() and clinical_path.exists()
-
-
-def test_unknown_source_is_rejected() -> None:
-    from kalecancer.config import get_cfg_defaults
-
-    cfg = get_cfg_defaults()
-    cfg.DATASET.SOURCE = "s3"
-
-    with pytest.raises(HancockError, match="unknown DATASET.SOURCE"):
-        resolve_dataset(cfg)

@@ -25,7 +25,7 @@ from kalecancer.evaluate.survival_report import (
 )
 from kalecancer.interpret.attention import export_attention
 from kalecancer.loaddata.cohort import build_cohort
-from kalecancer.loaddata.hancock import resolve_dataset
+from kalecancer.loaddata.dataset_source import resolve_dataset
 from kalecancer.loaddata.split import k_fold_splits, train_val_test_split
 from kalecancer.loaddata.wsi_dataset import WSIFeatureDataset, collate_bags
 from kalecancer.pipeline.wsi_survival_trainer import WSISurvivalTrainer

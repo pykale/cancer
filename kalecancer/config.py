@@ -15,7 +15,8 @@ _C = CfgNode()
 # ---------------------------------------------------------------------------
 _C.DATASET = CfgNode()
 # Where the data comes from: "local" uses FEATURE_ROOT and CLINICAL_PATH, "hancock"
-# fetches from the published HANCOCK archives into CACHE_DIR.
+# fetches the published HANCOCK archives into CACHE_DIR, and "synthetic" generates a
+# cohort locally so the pipeline runs without network access.
 _C.DATASET.SOURCE = "local"
 # Directory of pre-extracted patch features, searched recursively for .h5 files.
 _C.DATASET.FEATURE_ROOT = ""
@@ -23,7 +24,7 @@ _C.DATASET.FEATURE_ROOT = ""
 _C.DATASET.CLINICAL_PATH = ""
 # Anatomical region to fetch: "primary" or "lymph_node".
 _C.DATASET.REGION = "primary"
-# Patients to fetch from a remote source; 0 fetches the whole cohort.
+# Patients to fetch or generate; 0 fetches the whole cohort.
 _C.DATASET.PATIENTS = 0
 # Cache for fetched data. Empty uses ~/.cache/kalecancer.
 _C.DATASET.CACHE_DIR = ""

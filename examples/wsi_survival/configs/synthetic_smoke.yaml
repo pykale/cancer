@@ -1,0 +1,32 @@
+# Offline end-to-end run: the cohort is generated locally, so no network access,
+# licence, or dataset copy is required. Suitable for CI and sandboxed environments.
+#
+# Metrics from this configuration describe the pipeline, not clinical performance.
+DATASET:
+  SOURCE: "synthetic"
+  PATIENTS: 96
+  MAX_PATCHES: 128
+  NUM_WORKERS: 0
+  VAL_RATIO: 0.2
+  TEST_RATIO: 0.2
+
+MODEL:
+  # Small enough to train in seconds; the synthetic patches are generated to match.
+  INPUT_DIM: 64
+  HIDDEN_DIM: 64
+  ATTENTION_DIM: 32
+  DROPOUT: 0.25
+
+SOLVER:
+  SEED: 2026
+  BASE_LR: 0.001
+  MAX_EPOCHS: 10
+  BATCH_SIZE: 32
+  EARLY_STOP: 0
+
+SURVIVAL:
+  ENDPOINT: "OS"
+  EVAL_TIMES: [200.0, 400.0, 800.0]
+
+OUTPUT:
+  OUT_DIR: "outputs/synthetic_smoke"

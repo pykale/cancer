@@ -1,12 +1,21 @@
-# Fast configuration for checking the pipeline end to end on real data.
-# Heavily subsampled patches and few epochs: useful for validating wiring and
-# outputs, not for reporting results.
+# Fast end-to-end check against real data, fetched from the published HANCOCK
+# archives. Heavily subsampled patches, few epochs and a small patient limit:
+# useful for validating wiring and outputs, not for reporting results.
+#
+# Needs outbound access to hancock.research.fau.eu and data.fau.de. Where that is
+# blocked, use configs/synthetic_smoke.yaml, which runs the same pipeline offline.
 DATASET:
-  FEATURE_ROOT: "E:/WSI_UNI_encodings/WSI_PrimaryTumor"
-  CLINICAL_PATH: "E:/StructuredData/StructuredData/clinical_data.json"
+  SOURCE: "hancock"
+  # Only these patients' feature files are transferred, via HTTP range requests
+  # (roughly 11 MB per slide). Smaller cohorts leave too few events in the test
+  # split for the C-index to mean anything.
+  PATIENTS: 150
+  REGION: "primary"
   MAX_PATCHES: 256
   NUM_WORKERS: 4
   VALIDATE_FEATURES: False
+  TEST_RATIO: 0.2
+  VAL_RATIO: 0.15
 
 MODEL:
   INPUT_DIM: 1024
@@ -17,13 +26,15 @@ MODEL:
 SOLVER:
   SEED: 2026
   BASE_LR: 0.0003
-  MAX_EPOCHS: 3
+  MAX_EPOCHS: 10
   BATCH_SIZE: 32
   EARLY_STOP: 0
 
 SURVIVAL:
   ENDPOINT: "OS"
-  EVAL_TIMES: [365.0, 1095.0, 1825.0]
+  # A subset has shorter follow-up than the full cohort, so horizons outside its
+  # observed range are dropped and 5-year points are not usable here.
+  EVAL_TIMES: [365.0, 730.0, 1095.0]
 
 OUTPUT:
   OUT_DIR: "outputs/wsi_survival_quick"

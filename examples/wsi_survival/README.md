@@ -119,10 +119,10 @@ resolved values.
 
 | Section | Settings |
 | --- | --- |
-| `DATASET` | `SOURCE`, `FEATURE_ROOT`, `CLINICAL_PATH`, `REGION`, `PATIENTS`, `CACHE_DIR`, `MAX_PATCHES`, `NUM_WORKERS`, `TRAIN_RATIO` / `VAL_RATIO` / `TEST_RATIO`, `NUM_FOLDS`, `VALIDATE_FEATURES` |
+| `DATASET` | `SOURCE`, `FEATURE_ROOT`, `CLINICAL_PATH`, `REGION`, `PATIENTS`, `CACHE_DIR`, `MAX_PATCHES`, `NUM_WORKERS`, `VAL_RATIO` / `TEST_RATIO`, `NUM_FOLDS`, `STRATIFY_KEYS`, `VALIDATE_FEATURES` |
 | `MODEL` | `INPUT_DIM`, `HIDDEN_DIM`, `ATTENTION_DIM`, `DROPOUT`, `GATED` |
 | `SOLVER` | `SEED`, `BASE_LR`, `WEIGHT_DECAY`, `MAX_EPOCHS`, `BATCH_SIZE`, `EARLY_STOP`, `OPTIMIZER`, `DEVICES` |
-| `SURVIVAL` | `ENDPOINT`, `TIES`, `EVAL_TIMES` |
+| `SURVIVAL` | `ENDPOINT`, `EVAL_TIMES` |
 | `FUSION` | Multimodal only, see [fusion](../../docs/multimodal_fusion.md) |
 | `OUTPUT` | `OUT_DIR`, `TOP_K` |
 
@@ -134,9 +134,36 @@ Ready-made configurations in [`configs/`](configs/):
 | `hancock_primary_tumour_cv.yaml` | 5-fold patient-level cross-validation |
 | `hancock_primary_tumour_dss.yaml` | Disease-specific survival |
 | `hancock_primary_tumour_quick.yaml` | Heavily subsampled smoke run |
+| `synthetic_smoke.yaml` | Offline end-to-end run on a generated cohort |
 
 Setting `DATASET.NUM_FOLDS` above zero runs cross-validation, writing one
 subdirectory per fold plus an aggregate mean and standard deviation.
+
+### Where the data comes from
+
+`DATASET.SOURCE` selects the input; every source hands local paths to the rest of the
+pipeline, so nothing downstream changes.
+
+| Source | Behaviour |
+| --- | --- |
+| `local` | Reads `DATASET.FEATURE_ROOT` and `DATASET.CLINICAL_PATH` |
+| `hancock` | Fetches the published HANCOCK archives into `DATASET.CACHE_DIR` |
+| `synthetic` | Generates a cohort locally; **needs no network access** |
+
+```bash
+kalecancer wsi-survival --cfg examples/wsi_survival/configs/synthetic_smoke.yaml
+```
+
+Use `synthetic` in CI, containers, and sandboxes. The HANCOCK archives are hosted by
+FAU Erlangen, which restricted-egress environments typically cannot resolve, and the
+encodings archive is ~9.7 GB. The generated cohort runs the same loaders, splitting,
+training, evaluation, and attention export, including variable-length bags and
+patients with several slides — but its metrics describe the **pipeline, not clinical
+performance**.
+
+To fetch the real archives from a restricted environment, allow
+`hancock.research.fau.eu` and `data.fau.de` through the network policy and set
+`DATASET.PATIENTS` to keep the download small.
 
 ## Evaluation
 
