@@ -27,6 +27,7 @@ dependencies = [
     "numpy",
     "pandas",
     "scikit-learn",
+    "scikit-survival",
     "pyyaml",
     "certifi",
     "yacs",
@@ -58,12 +59,11 @@ dev = [
     "pytest",
     "pytest-cov",
     "ruff",
-    "black",
-    "isort",
     "pre-commit",
     "mypy",
     "build",
     "twine",
+    "lifelines",
 ]
 
 [project.scripts]
@@ -93,25 +93,34 @@ kalecancer = [
 [tool.setuptools.dynamic]
 version = { file = "kalecancer/_version.txt" }
 
-[tool.black]
-line-length = 120
-target-version = ["py310", "py311", "py312"]
-
-[tool.isort]
-profile = "black"
-line_length = 120
-known_first_party = ["kalecancer", "tests"]
-
 [tool.ruff]
 line-length = 120
 target-version = "py310"
+exclude = [
+    "build",
+    "examples",
+]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
-ignore = ["B008"]
+select = [
+    "E",    # pycodestyle
+    "W",    # pycodestyle
+    "F",    # Pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # bugbear
+    "SIM",  # simplify
+    "T20"   # flake8-print
+]
+ignore = [
+    "B008",
+    "E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["kalecancer", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.mypy]
+ignore_missing_imports = true
