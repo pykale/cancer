@@ -21,13 +21,9 @@ from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold, StratifiedShuffleSplit
 
 Split = dict[str, np.ndarray]
-
-#: Upper bound on the folds a holdout is built from, so the share it can express is
-#: no coarser than one part in this many.
-MAX_HOLDOUT_FOLDS = 20
 
 
 class SplitError(ValueError):
@@ -76,36 +72,41 @@ def _holdout(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Hold out approximately ``ratio`` of ``indices``, keeping groups intact.
 
-    Built from a K-fold splitter so grouped and ungrouped splitting stay on one code
-    path: enough whole folds are merged to reach the requested share. The achievable
-    resolution is one fold, so a small table -- which supports few folds -- gives a
-    coarser share than a large one.
+    The split is decided over independent units -- one per group where grouping
+    applies, otherwise one per row -- and then expanded back to rows, so a group is
+    never divided. Units are drawn by a stratified shuffle rather than assembled from
+    whole folds, which lets the share be met directly instead of being rounded to a
+    fold boundary.
 
     Raises:
         SplitError: If fewer than two independent units are available to split.
     """
     subset = metadata.iloc[indices]
-    units = subset[group_key].nunique() if group_key else len(subset)
-    if units < 2:
+    units = subset.drop_duplicates(group_key) if group_key else subset
+    count = len(units)
+    if count < 2:
         unit = f"unique {group_key}" if group_key else "rows"
-        raise SplitError(f"need at least 2 {unit} to hold part out, got {units}")
+        raise SplitError(f"need at least 2 {unit} to hold part out, got {count}")
 
-    # More folds give a finer share; never more than the data can support.
-    num_splits = max(2, min(MAX_HOLDOUT_FOLDS, units))
-    labels = composite_labels(subset, stratify_keys, min_count=num_splits)
-    groups = subset[group_key].to_numpy() if group_key else None
+    # Both sides keep at least one unit, whatever the ratio asks for.
+    held_count = min(max(round(ratio * count), 1), count - 1)
+    labels = composite_labels(units, stratify_keys, min_count=2)
+    # Stratification needs room for every class on both sides of the split. Where
+    # there is not enough, it is dropped rather than allowed to fail: the split
+    # degrades to a plain shuffle instead of raising on a small table.
+    if min(held_count, count - held_count) < len(np.unique(labels)):
+        labels = np.zeros(count, dtype=np.int64)
 
-    splitter = StratifiedGroupKFold if group_key else StratifiedKFold
-    folds = list(splitter(n_splits=num_splits, shuffle=True, random_state=seed).split(subset, labels, groups))
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=held_count, random_state=seed)
+    _, held_units = next(splitter.split(np.zeros(count), labels))
 
-    # Folds vary in size, so the count is chosen by how many rows it actually holds
-    # out rather than by fold arithmetic. At least one fold is held out, and at least
-    # one is kept, whatever the ratio.
-    sizes = np.cumsum([len(folds[fold][1]) for fold in range(num_splits - 1)])
-    taken = int(np.argmin(np.abs(sizes - ratio * len(subset)))) + 1
-    held = np.concatenate([folds[fold][1] for fold in range(taken)])
-    keep = np.setdiff1d(np.arange(len(subset)), held)
-    return indices[keep], indices[np.sort(held)]
+    if group_key:
+        held_groups = set(units.iloc[held_units][group_key])
+        held = subset[group_key].isin(held_groups).to_numpy()
+    else:
+        held = np.zeros(count, dtype=bool)
+        held[held_units] = True
+    return indices[~held], indices[held]
 
 
 def _validate(metadata: pd.DataFrame, group_key: str | None, minimum: int) -> None:

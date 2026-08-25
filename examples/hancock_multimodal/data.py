@@ -80,7 +80,13 @@ def embed_clinical(cohort: TabularCohort, train_ids: list[str], all_ids: list[st
 
     The context is fold state, like a scaler's mean: built from the training rows so
     the test rows never inform the representation they are scored with.
+
+    Raises:
+        ValueError: If ``cohort`` carries no target to draw context labels from.
     """
+    if cohort.target is None:
+        raise ValueError("embedding needs a labelled cohort: TabICL conditions on labelled context rows")
+
     preprocessor = cohort.fit_preprocessor(train_ids)
     if set(all_ids) & set(preprocessor.fitted_on) != set(train_ids) & set(preprocessor.fitted_on):
         raise AssertionError("preprocessor was fitted on rows outside the training split")

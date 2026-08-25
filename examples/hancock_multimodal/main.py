@@ -100,7 +100,7 @@ def evaluate(model, loader, train_loader, cfg) -> dict:
 
     risk, time, event = risks(loader)
     risk_np, time_np, event_np = risk.double().numpy(), time.double().numpy(), event.bool().numpy()
-    metrics = {
+    metrics: dict = {
         "num_patients": int(len(risk)),
         "num_events": int(event_np.sum()),
         "c_index": concordance_index(risk_np, time_np, event_np),
