@@ -5,6 +5,10 @@ command line and one started from a YAML file are the same run. Presets replace 
 most common configuration edits::
 
     kalecancer wsi-survival --features <dir> --clinical <file> --preset quick
+
+Runs read data already on disk. Downloading a published dataset belongs to the
+experiment that knows its layout, so a fetcher is supplied by the example rather than
+by this command; see ``examples/wsi_survival`` for the HANCOCK archives.
 """
 
 from __future__ import annotations
@@ -49,14 +53,6 @@ def _add_wsi_survival_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--clinical", type=str, help="JSON file of clinical records")
     parser.add_argument("--out", type=str, help="directory for results")
     parser.add_argument(
-        "--source",
-        choices=["local"],
-        help="where the data comes from",
-    )
-    parser.add_argument("--patients", type=int, help="patients to fetch from a remote source; 0 fetches all")
-    parser.add_argument("--region", choices=["primary", "lymph_node"], help="anatomical region to fetch")
-    parser.add_argument("--cache-dir", type=str, help="cache for fetched data")
-    parser.add_argument(
         "--preset",
         choices=sorted(PRESETS),
         default="default",
@@ -96,12 +92,8 @@ def resolve_config(args: argparse.Namespace):
         cfg.merge_from_file(args.cfg)
 
     flags = {
-        "DATASET.SOURCE": args.source,
         "DATASET.FEATURE_ROOT": args.features,
         "DATASET.CLINICAL_PATH": args.clinical,
-        "DATASET.REGION": args.region,
-        "DATASET.PATIENTS": args.patients,
-        "DATASET.CACHE_DIR": args.cache_dir,
         "OUTPUT.OUT_DIR": args.out,
         "SOLVER.MAX_EPOCHS": args.epochs,
         "SOLVER.BATCH_SIZE": args.batch_size,
@@ -109,9 +101,6 @@ def resolve_config(args: argparse.Namespace):
         "DATASET.NUM_FOLDS": args.folds,
         "SURVIVAL.ENDPOINT": args.endpoint,
     }
-    # Supplying explicit paths implies the local source unless stated otherwise.
-    if args.source is None and (args.features or args.clinical):
-        flags["DATASET.SOURCE"] = "local"
     cfg.merge_from_list([item for key, value in flags.items() if value is not None for item in (key, value)])
 
     if args.opts:

@@ -1,4 +1,4 @@
-"""Datasets and records..
+"""Datasets and records.
 
 The layering here is three objects with three lifetimes:
 

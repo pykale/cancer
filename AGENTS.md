@@ -10,13 +10,13 @@ needed, then:
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -e ".[dev,survival]"     # Windows: .venv/Scripts/pip
+.venv/bin/pip install -e ".[dev]"     # Windows: .venv/Scripts/pip
 ```
 
 Verify the install:
 
 ```bash
-.venv/bin/python -c "import kalecancer, torch, kale, torchsurv; print(kalecancer.__version__)"
+.venv/bin/python -c "import kalecancer, torch, kale; print(kalecancer.__version__)"
 ```
 
 ## Commands
@@ -25,23 +25,27 @@ Verify the install:
 | --- | --- |
 | Run tests | `.venv/bin/pytest` |
 | Run tests with coverage | `.venv/bin/pytest --cov=kalecancer --cov-report=term-missing` |
-| Format | `.venv/bin/black . && .venv/bin/isort .` |
+| Format | `.venv/bin/ruff format .` |
 | Lint | `.venv/bin/ruff check .` |
-| Fetch data | `.venv/bin/kalecancer data pull --patients 50` |
-| Run the WSI pipeline | `.venv/bin/kalecancer wsi-survival --source hancock --patients 50 --preset quick` |
+| Run the WSI pipeline on local files | `.venv/bin/kalecancer wsi-survival --features <dir> --clinical <file> --preset quick` |
+| Fetch and run on HANCOCK | `.venv/bin/python examples/wsi_survival/main.py --cfg examples/wsi_survival/configs/hancock_primary_tumour_quick.yaml DATASET.SOURCE hancock DATASET.PATIENTS 50` |
 | Inspect a configuration | `.venv/bin/kalecancer wsi-survival --print-config` |
 
-All four of `black --check .`, `isort --check-only .`, `ruff check .` and `pytest`
-must pass before a change is complete. These are the same checks CI runs.
+Both `pre-commit run --all-files` (ruff, ruff-format, mypy) and `pytest` must pass
+before a change is complete. These are the same checks CI runs.
 
 ## Data
 
-Two sources, selected by `--source`:
+Two sources, selected by `DATASET.SOURCE`:
 
+- `local` reads an existing copy from `DATASET.FEATURE_ROOT` and
+  `DATASET.CLINICAL_PATH`. This is the only source the `kalecancer` command
+  supports, because downloading needs a fetcher that knows the dataset layout.
 - `hancock` fetches the published dataset (CC BY 4.0) over HTTP range requests,
   transferring only the selected patients out of a 9.65 GB archive and caching them.
-  Requires no credentials. Use `--patients N` to keep it small.
-- `local` uses `--features` and `--clinical` for an existing copy.
+  Requires no credentials. Its fetcher lives in `examples/wsi_survival/hancock.py`
+  and is passed to `run(..., fetch=...)` by that example, so use the example script
+  rather than the CLI. Keep it small with `DATASET.PATIENTS N`.
 
 Tests need neither: they build synthetic HDF5 cohorts in a temporary directory, and
 must never reach the network. `tests/conftest.py` shows the pattern, and
@@ -78,7 +82,7 @@ Tests mirror this layout: code in `kalecancer/loaddata/split.py` is tested in
 - Follow [PyKale](https://github.com/pykale/pykale) conventions: verb-oriented stages,
   Google-style docstrings, type hints, YACS configuration.
 - Reuse PyKale APIs where one exists rather than reimplementing.
-- Line length 120. Formatting is enforced by black and isort; do not hand-format.
+- Line length 120. Formatting is enforced by ruff-format; do not hand-format.
 - Comments explain why, not what. Do not restate the code.
 - New configuration belongs in `kalecancer/config.py`, never hardcoded in a module.
 - Dataset paths appear only in example configs and command-line arguments.

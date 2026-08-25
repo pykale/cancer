@@ -1,8 +1,8 @@
 # Overall survival with 5-fold patient-level cross-validation.
 # Folds are stratified on the event indicator; each writes its own fold_<i>/ directory.
 DATASET:
-  FEATURE_ROOT: "E:/WSI_UNI_encodings/WSI_PrimaryTumor"
-  CLINICAL_PATH: "E:/StructuredData/StructuredData/clinical_data.json"
+  SOURCE: "hancock"
+  PATIENTS: 0
   MAX_PATCHES: 2048
   NUM_WORKERS: 4
   NUM_FOLDS: 5

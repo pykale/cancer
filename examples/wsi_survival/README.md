@@ -126,14 +126,17 @@ resolved values.
 | `FUSION` | Multimodal only, see [fusion](../../docs/multimodal_fusion.md) |
 | `OUTPUT` | `OUT_DIR`, `TOP_K` |
 
-Ready-made configurations in [`configs/`](configs/):
+Ready-made configurations in [`configs/`](configs/). The `hancock_*` files fetch the
+published archives, so they need no local copy of the data; `local_primary_tumour.yaml`
+reads files already on disk instead.
 
-| File | Run |
-| --- | --- |
-| `hancock_primary_tumour.yaml` | Overall survival, single split |
-| `hancock_primary_tumour_cv.yaml` | 5-fold patient-level cross-validation |
-| `hancock_primary_tumour_dss.yaml` | Disease-specific survival |
-| `hancock_primary_tumour_quick.yaml` | Heavily subsampled smoke run |
+| File | Source | Run |
+| --- | --- | --- |
+| `hancock_primary_tumour.yaml` | archive | Overall survival, single split |
+| `hancock_primary_tumour_cv.yaml` | archive | 5-fold patient-level cross-validation |
+| `hancock_primary_tumour_dss.yaml` | archive | Disease-specific survival |
+| `hancock_primary_tumour_quick.yaml` | archive | Heavily subsampled smoke run, 50 patients |
+| `local_primary_tumour.yaml` | local files | Overall survival from your own copy |
 
 Setting `DATASET.NUM_FOLDS` above zero runs cross-validation, writing one
 subdirectory per fold plus an aggregate mean and standard deviation.

@@ -1,6 +1,7 @@
 DATASET:
-  FEATURE_ROOT: "E:/WSI_UNI_encodings/WSI_PrimaryTumor"
-  CLINICAL_PATH: "E:/StructuredData/StructuredData/clinical_data.json"
+  SOURCE: "hancock"
+  # 0 fetches the whole published cohort.
+  PATIENTS: 0
   MAX_PATCHES: 2048
   NUM_WORKERS: 4
   VAL_RATIO: 0.15

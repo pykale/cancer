@@ -55,6 +55,11 @@ class HancockDataset(ArchiveDataset):
     def features(self, region: str = "primary", patients: int = 0) -> Path:
         """Fetch patch features and return the directory to use as the feature root.
 
+        The returned directory is the cache for this region, so it contains every
+        patient fetched into it so far, not only the ones this call selected.
+        ``patients`` therefore bounds the transfer rather than the cohort; pass a
+        cache directory of its own to pin a run to a fixed set of patients.
+
         Args:
             region: Anatomical region, see :data:`REGIONS`.
             patients: Number of patients to fetch; 0 fetches the whole region.

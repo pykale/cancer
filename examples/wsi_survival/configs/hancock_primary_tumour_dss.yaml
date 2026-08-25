@@ -2,8 +2,8 @@
 # Patients recorded as "deceased" without a cause cannot be classified for this
 # endpoint and are excluded; see clinical_exclusions in cohort_summary.json.
 DATASET:
-  FEATURE_ROOT: "E:/WSI_UNI_encodings/WSI_PrimaryTumor"
-  CLINICAL_PATH: "E:/StructuredData/StructuredData/clinical_data.json"
+  SOURCE: "hancock"
+  PATIENTS: 0
   MAX_PATCHES: 2048
   NUM_WORKERS: 4
 

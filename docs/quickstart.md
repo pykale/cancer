@@ -12,46 +12,53 @@ same settings.
 ## Install
 
 ```bash
-pip install -e ".[survival]"
+pip install -e .
 ```
 
 ## Get the data
 
 Either use your own files, or fetch the published
 [HANCOCK dataset](https://hancock.research.fau.eu/) (CC BY 4.0), which needs no
-account:
+account.
+
+Downloading belongs to the experiment that knows the dataset's layout, so the fetcher
+lives with the example rather than in the library. Running the example fetches what
+the configuration asks for:
 
 ```bash
-kalecancer data pull --patients 50
+python examples/wsi_survival/main.py \
+    --cfg examples/wsi_survival/configs/hancock_primary_tumour_quick.yaml \
+    DATASET.SOURCE hancock DATASET.PATIENTS 50
 ```
 
 The feature archive is 9.65 GB, but supports HTTP range requests, so only the selected
 patients are transferred — about 640 MB for 60 patients. Files are cached, so repeat
 runs fetch nothing.
 
-| Flag | Purpose |
+| Setting | Purpose |
 | --- | --- |
-| `--patients N` | Patients to fetch; `0` fetches all 709 |
-| `--region primary\|lymph_node` | Anatomical region |
-| `--cache-dir DIR` | Cache location, default `~/.cache/kalecancer` |
+| `DATASET.PATIENTS N` | Patients to fetch; `0` fetches all 709 |
+| `DATASET.REGION primary\|lymph_node` | Anatomical region |
+| `DATASET.CACHE_DIR DIR` | Cache location, default `~/.cache/kalecancer` |
 
-Patients are selected in sorted identifier order, so a given `--patients` always gives
-the same cohort, and a patient's slides are always kept together.
+Patients are selected in sorted identifier order, so a given `DATASET.PATIENTS` always
+gives the same cohort, and a patient's slides are always kept together.
 
 > A 50-patient cohort leaves fewer than 10 patients in the test split. That is enough
 > to confirm the pipeline runs, but not to produce a meaningful metric.
 
 ## Command line
 
-```bash
-# From the published dataset
-kalecancer wsi-survival --source hancock --patients 50 --preset quick
+`kalecancer` runs on data already on disk:
 
-# From your own files
+```bash
 kalecancer wsi-survival \
     --features /path/to/WSI_PrimaryTumor \
-    --clinical /path/to/clinical_data.json
+    --clinical /path/to/clinical_data.json \
+    --preset quick
 ```
+
+Point `--features` at the cache directory above to reuse an already-fetched cohort.
 
 ### Presets
 
@@ -84,26 +91,39 @@ kalecancer wsi-survival --cfg my_run.yaml MODEL.DROPOUT 0.1 SOLVER.BASE_LR 0.000
 
 ```python
 from kalecancer.config import get_cfg_defaults
+from kalecancer.loaddata.clinical_access import endpoint_from_config
 from kalecancer.pipeline.wsi_survival_runner import run
 
 cfg = get_cfg_defaults()
-cfg.DATASET.SOURCE = "hancock"  # or "local" with FEATURE_ROOT and CLINICAL_PATH
-cfg.DATASET.PATIENTS = 50
+cfg.DATASET.FEATURE_ROOT = "/path/to/WSI_PrimaryTumor"
+cfg.DATASET.CLINICAL_PATH = "/path/to/clinical_data.json"
 cfg.SOLVER.MAX_EPOCHS = 30
 cfg.freeze()
 
-metrics = run(cfg)
+metrics = run(cfg, endpoint=endpoint_from_config(cfg))
 print(metrics["test"]["c_index"])
+```
+
+To fetch instead of reading local files, set `cfg.DATASET.SOURCE` and pass the
+example's fetcher, which is what `examples/wsi_survival/main.py` does:
+
+```python
+from hancock import fetch_for  # examples/wsi_survival/hancock.py
+
+metrics = run(cfg, endpoint=endpoint_from_config(cfg), fetch=lambda: fetch_for(cfg))
 ```
 
 Individual stages work on their own:
 
 ```python
-from kalecancer.loaddata import build_cohort, split_patients
+from kalecancer.evaluate.cohort_report import cohort_summary, log_cohort_summary
+from kalecancer.loaddata import build_cohort, train_val_test_split
+from kalecancer.loaddata.clinical_access import endpoint_from_config
 
-bags, summary = build_cohort(feature_root, clinical_path, endpoint="OS")
-summary.log()  # matched patients and every exclusion
-split = split_patients(bags, seed=2026)
+cohort = build_cohort(feature_root, clinical_path, endpoint=endpoint_from_config(cfg))
+log_cohort_summary(cohort_summary(cohort))  # matched patients and every exclusion
+
+split = train_val_test_split(cohort, group_key="patient_id", stratify_keys=["event"], seed=2026)
 ```
 
 ## Coding agent
@@ -115,13 +135,14 @@ data comes from a public archive, an agent needs no local files and no credentia
 **1. Set up**
 
 > Set up this repository following AGENTS.md. Create the virtual environment, install
-> the package with the dev and survival extras, and confirm by running the test suite.
-> Report anything that fails.
+> the package with the dev extra, and confirm by running the test suite. Report
+> anything that fails.
 
 **2. Run it**
 
-> Fetch 50 patients with `kalecancer data pull`, then run the WSI survival pipeline on
-> them with the quick preset. Report the cohort summary and the test C-index.
+> Run `examples/wsi_survival/main.py` with the quick config, overriding
+> `DATASET.SOURCE hancock DATASET.PATIENTS 50` so it fetches its own data. Report the
+> cohort summary and the test C-index.
 
 **3. Check the cohort**
 
@@ -130,8 +151,8 @@ data comes from a public archive, an agent needs no local files and no credentia
 
 **4. Run the experiment**
 
-> Run again with the cv preset and 30 epochs. Report the cross-validated C-index and
-> its standard deviation from `metrics.json`.
+> Run again with `DATASET.NUM_FOLDS 5` and `SOLVER.MAX_EPOCHS 30`. Report the
+> cross-validated C-index and its standard deviation from `metrics.json`.
 
 **5. Interpret**
 

@@ -2,8 +2,11 @@
 # Heavily subsampled patches and few epochs: useful for validating wiring and
 # outputs, not for reporting results.
 DATASET:
-  FEATURE_ROOT: "E:/WSI_UNI_encodings/WSI_PrimaryTumor"
-  CLINICAL_PATH: "E:/StructuredData/StructuredData/clinical_data.json"
+  SOURCE: "hancock"
+  # Bounds the download, not the cohort: the feature root is the cache directory,
+  # so a cache already holding more patients contributes all of them. Give a run
+  # its own CACHE_DIR to pin the cohort to exactly these patients.
+  PATIENTS: 50
   MAX_PATCHES: 256
   NUM_WORKERS: 4
   VALIDATE_FEATURES: False
