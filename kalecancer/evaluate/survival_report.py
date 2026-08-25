@@ -159,7 +159,7 @@ def summarise_folds(fold_metrics: list[dict], split: str = "test") -> dict:
     values: dict[str, list[float]] = {}
     for fold in fold_metrics:
         for name, value in fold.get(split, {}).items():
-            if isinstance(value, (int, float)):
+            if isinstance(value, int | float):
                 values.setdefault(name, []).append(float(value))
 
     summary = {}

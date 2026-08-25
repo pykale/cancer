@@ -407,6 +407,7 @@ class MultimodalFusion(nn.Module):
             )
 
         representation = self.fusion(embeddings, mask) if self.fusion else embeddings[0]
+        assert self.head is not None
         fused = self.head(representation)
         if self.modality_heads is None:
             return MultimodalOutput(prediction=fused, representation=representation)

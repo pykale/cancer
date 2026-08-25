@@ -7,6 +7,7 @@ import http.server
 import socketserver
 import threading
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -70,7 +71,7 @@ def _serve(root: Path, handler_class) -> tuple[str, socketserver.TCPServer]:
 
 
 @pytest.fixture(scope="module")
-def archive_server(tmp_path_factory) -> str:
+def archive_server(tmp_path_factory) -> Iterator[str]:
     """Serve a range-capable host holding a ZIP, and return the archive URL."""
     root = tmp_path_factory.mktemp("served")
     with zipfile.ZipFile(root / "archive.zip", "w") as archive:
@@ -84,7 +85,7 @@ def archive_server(tmp_path_factory) -> str:
 
 
 @pytest.fixture(scope="module")
-def no_range_server(tmp_path_factory) -> str:
+def no_range_server(tmp_path_factory) -> Iterator[str]:
     """Python's stock handler advertises no range support."""
     root = tmp_path_factory.mktemp("norange")
     (root / "archive.zip").write_bytes(b"PK\x03\x04padding")

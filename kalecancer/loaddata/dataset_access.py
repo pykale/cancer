@@ -142,7 +142,10 @@ class ArchiveDataset:
 
         def select(members: list[str]) -> list[str]:
             matched = [name for name in members if name.startswith(prefix) and name.endswith(suffix)]
-            return select_groups(matched, limit, group_pattern) if limit else sorted(matched)
+            if limit:
+                assert group_pattern is not None
+                return select_groups(matched, limit, group_pattern)
+            return sorted(matched)
 
         return self.fetch(archive, select)
 
