@@ -1,6 +1,21 @@
-# kalecancer architecture (planning)
+# kalecancer architecture
 
-This document describes the **intended** design of the `kalecancer` package. It is written in future tense and reflects decisions made so far, not implemented functionality. Items marked **Open question** are unresolved.
+The design of the `kalecancer` package and the reasoning behind it. Much of this
+document was written before implementation and remains in future tense; the table
+below records what is now built. Items marked **Open question** are unresolved.
+
+| Area | State |
+| --- | --- |
+| WSI loading, cohort matching, patient-level splitting | Implemented |
+| Attention MIL encoder | Implemented |
+| Cox head, loss, and survival metrics | Implemented, using TorchSurv |
+| Attention interpretation | Implemented |
+| Multimodal fusion (early, late, hybrid) | Implemented as model APIs; no multimodal cohort loader yet |
+| CT/MRI and tabular encoders, `prepdata` transforms, `auto` classes | Planned |
+
+For usage rather than rationale, see the [quickstart](quickstart.md), the
+[WSI pipeline reference](../examples/wsi_survival/) and the
+[fusion reference](multimodal_fusion.md).
 
 ---
 
@@ -86,52 +101,15 @@ Loaders in `kalecancer.loaddata` will normalise each modality into a typed recor
 
 ## Fusion
 
-Because input shapes are **incommensurable** — a 3D volume, a variable-size tile bag, and a ~50-dimensional vector — **early fusion at the input level will not be the default**. Each modality will be encoded to a fixed-dimensional latent vector first; fusion will operate in that shared latent space.
+Because input shapes are **incommensurable** — a 3D volume, a variable-size tile bag, and a ~50-dimensional vector — fusion at the raw input level is not viable. Each modality is encoded to a fixed-dimensional latent vector first, and fusion operates in that shared latent space.
 
-### Strategy verdicts
+Three strategies are implemented, distinguished by what they combine: **features** (early), **decisions** (late), or both (hybrid). The fusion operator is config-swappable, so the same encoders and task head work with any of them. They build on `kale.embed.multimodal_fusion`, and `ProductOfExperts` is the preferred route when modalities can be missing, because absent experts drop out of the product without retraining a model per combination.
 
-| Strategy | Verdict | Rationale |
-| --- | --- | --- |
-| **Early fusion** | Narrow use only | Viable only when modalities share geometry (e.g. registered PET + CT in the same voxel grid). Not suitable for CT + WSI + tabular. |
-| **Late fusion** | Baseline to beat | Independent per-modality heads, fuse predictions. Simple, interpretable, but ignores cross-modal interactions during representation learning. |
-| **Intermediate (latent) fusion** | **Default for v1** | Encoders produce latent vectors; a fusion module combines them before the task head. Handles incommensurable inputs naturally. |
-| **Hybrid fusion** | **v2** | Intermediate trunk with **auxiliary per-modality heads** — supports both joint prediction and modality-specific supervision / interpretability. |
+Missing modalities are a **first-class requirement**, not an edge case: real cohorts rarely have every modality for every patient. A per-sample modality mask is carried from `loaddata` through to the model, absent modalities are represented by learned placeholders rather than zero-padding, and modality dropout during training builds robustness. This supports the clinically required combinations — imaging plus clinical, pathology plus clinical, and a clinical-only baseline.
 
-### Planned PyKale building blocks
+See [multimodal_fusion.md](multimodal_fusion.md) for the API, the fusion operators, and the per-mechanism behaviour under missing modalities.
 
-We will **build on existing PyKale components** rather than reimplement fusion from scratch:
-
-| Component | Location | Intended use |
-| --- | --- | --- |
-| `Concat` | `kale.embed.multimodal_fusion` | Simple latent concatenation baseline |
-| `LowRankTensorFusion` | `kale.embed.multimodal_fusion` | Tensor-based multimodal interaction |
-| `BimodalInteractionFusion` | `kale.embed.multimodal_fusion` | Two-modality interaction only (e.g. CT + tabular ablation) |
-| `ProductOfExperts` | `kale.embed.multimodal_fusion` | **Intended route for missing modalities** — combines Gaussian experts in closed form and degrades gracefully when one expert is absent |
-| `BANLayer` | `kale.embed.attention` | Candidate for **cross-modal attention** between latent representations |
-
-**ProductOfExperts** is the preferred fusion path when modalities may be missing at inference time, because absent experts can be omitted without retraining a separate model per combination.
-
-Fusion strategy will be **config-swappable** (YAML / dataclass config): the same encoders and task head will plug into `Concat`, `LowRankTensorFusion`, `ProductOfExperts`, or other registered fusion modules without code changes.
-
----
-
-## Missing modalities
-
-Missing modalities will be a **first-class design requirement**, not an edge case. Real HNC cohorts will rarely have CT, WSI, and full tabular data for every patient.
-
-Planned mechanisms:
-
-1. **Per-sample modality mask** — a boolean vector indicating which modalities are present, carried through the pipeline from `loaddata` to `model`.
-2. **Learned "missing" embeddings** — on non-PoE fusion paths, absent modalities will be represented by a learned placeholder embedding rather than zero-padding.
-3. **Modality dropout during training** — random modality dropout will simulate missing-data patterns and improve robustness at inference.
-
-This design will directly support clinically required flexible combinations:
-
-- imaging + tabular (CT + clinical)
-- pathology + tabular (WSI + clinical)
-- tabular-only baseline (clinical features alone)
-
-**ProductOfExperts** fusion will be the primary path for graceful missing-modality handling; other fusion modules will use the mask + missing-embedding pattern.
+`BANLayer` in `kale.embed.attention` remains a candidate for cross-modal attention between latent representations.
 
 ---
 
@@ -149,21 +127,9 @@ Overall survival and disease-free survival **compete** — a patient who dies ca
 
 ### Label contract
 
-From the start, survival labels will follow a fixed contract:
+Survival labels follow a fixed contract: `time` is the time from baseline to event or censoring in a config-defined unit, and `event` is `1` when observed and `0` when censored. Competing-risk models will add an optional `event_type` naming the event category.
 
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `time` | float | Time from baseline to event or censoring (days or months, config-defined) |
-| `event` | bool / int | `1` if event observed, `0` if censored |
-| `event_type` | int (optional) | Event category for competing-risk models (e.g. death vs recurrence) |
-
-### Metrics
-
-| Metric | Purpose |
-| --- | --- |
-| **Harrell's C-index** | Concordance — does the model rank patients who event earlier higher? |
-| **Time-dependent AUC** | Discrimination at specific time horizons |
-| **Integrated Brier score** | Calibration over the follow-up period |
+Metrics and their leakage rules are documented in the [WSI pipeline reference](../examples/wsi_survival/).
 
 ### Reference implementation: TorchSurv
 
@@ -217,21 +183,29 @@ Auto-configuration classes (`kalecancer.auto.AutoCancer*`) will be added once in
 
 ---
 
-## Open questions
+## Resolved questions
 
-The following items are **unresolved** and may change the architecture above.
+| Question | Resolution |
+| --- | --- |
+| **Which public dataset** to validate against | **HANCOCK** (763 head and neck patients, CC BY 4.0). Pre-extracted UNI encodings are part of the release and are streamed directly from the published archives. |
+| **Where `embed` and `predict` live** | Kept merged under `model/`, with a separate `pipeline/` for trainers and runners, mirroring `kale.pipeline`. |
+| **Survival library** | TorchSurv, as planned. `LowRankTensorFusion` is the one PyKale component reimplemented rather than reused, because its parameters are not registered with the module. |
+
+## Open questions
 
 | # | Question | Impact |
 | --- | --- | --- |
-| 1 | **Public dataset not yet confirmed** by clinical partners | Blocks end-to-end public-data validation; synthetic-first strategy mitigates this for now |
-| 2 | **Exact tabular schema**, missingness rate, and **cohort size** unknown | Affects imputation strategy, model capacity, and whether advanced tabular architectures are justified |
-| 3 | **FT-Transformer vs MLP** for tabular encoding — depends on sample size | If N is small (~hundreds), a simple MLP with embeddings is likely sufficient; FT-Transformer may not be warranted |
-| 4 | **Whether `embed` and `predict` should stay merged in `model/` or split** into separate subpackages | Affects package layout and PyKale alignment; current skeleton merges them under `model/` for simplicity |
+| 1 | **Exact tabular schema** and missingness rate for the tabular branch | Affects imputation strategy and model capacity |
+| 2 | **FT-Transformer vs MLP** for tabular encoding — depends on sample size | At a few hundred patients an MLP with embeddings is likely sufficient |
+| 3 | **How patients are matched across modalities** when a multimodal cohort loader is added | Determines whether the fusion APIs need a modality-mask loader or a joined cohort record |
 
 ---
 
 ## Related documents
 
-- [README](../README.md) — installation, package overview, and current status
+- [Quickstart](quickstart.md) — running the pipeline
+- [WSI survival pipeline](../examples/wsi_survival/) — inputs, configuration, outputs
+- [Multimodal fusion](multimodal_fusion.md) — fusion APIs
+- [AGENTS.md](../AGENTS.md) — conventions and constraints for contributors
 - `tests/test_survival_boundary.py` — CI enforcement of the `survival/` isolation rule
 - PyKale fusion modules — [`kale.embed.multimodal_fusion`](https://pykale.readthedocs.io/en/latest/kale.embed.html)

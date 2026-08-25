@@ -61,15 +61,15 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import TypeAlias
 
 import numpy as np
+import pandas as pd
 import torch
-from sklearn.model_selection import StratifiedKFold
 from torch import nn
 
+from kalecancer.evaluate.survival_metrics import integrated_brier, kaplan_meier_groups, time_dependent_auc
+from kalecancer.loaddata.split import k_fold_splits
 from kalecancer.survival.baseline import breslow_baseline_hazard, predict_survival_function
 from kalecancer.survival.metrics import concordance_index
 from kalecancer.survival.trainer import fit_survival_model
-
-from .survival_metrics import integrated_brier, kaplan_meier_groups, time_dependent_auc
 
 _DAYS_PER_YEAR = 365.25
 
@@ -118,8 +118,15 @@ def patient_stratified_splits(
             "every fold requires at least one event"
         )
 
-    splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    return list(splitter.split(np.zeros(events.shape[0]), events))
+    folds = k_fold_splits(
+        pd.DataFrame({"event": events}),
+        num_folds=n_splits,
+        stratify_keys=["event"],
+        seed=seed,
+    )
+    # The harness fits on everything outside the test partition, so the validation
+    # slice the generic splitter carves out is folded back into the training indices.
+    return [(np.sort(np.concatenate([fold["train"], fold["val"]])), fold["test"]) for fold in folds]
 
 
 def bootstrap_ci(
@@ -151,8 +158,11 @@ def bootstrap_ci(
         (non-resampled) data.
 
     Raises:
-        ValueError: If the arrays do not share the same first-dimension length.
+        ValueError: If no array is given, or the arrays do not share the same
+            first-dimension length.
     """
+    if not arrays:
+        raise ValueError("bootstrap_ci needs at least one array to resample")
     arrays = tuple(np.asarray(a) for a in arrays)
     n = arrays[0].shape[0]
     if any(a.shape[0] != n for a in arrays):
@@ -265,8 +275,10 @@ def cross_validate_survival(
             for ``sksurv`` to estimate IPCW weights at the requested
             ``eval_years`` (message names the fold and its event/censoring counts).
     """
-    times_np = times.numpy()
-    events_np = events.numpy()
+    # Detached and moved to host memory: labels may arrive on an accelerator or
+    # carry a graph, and NumPy can read neither.
+    times_np = times.detach().cpu().numpy()
+    events_np = events.detach().cpu().numpy()
     eval_years_arr = np.asarray(eval_years, dtype=np.float64)
     eval_days_all = eval_years_arr * _DAYS_PER_YEAR
 
@@ -299,8 +311,8 @@ def cross_validate_survival(
 
         model.eval()
         with torch.no_grad():
-            train_log_hazard = _call_model(model, _index_inputs(inputs, train_idx_t)).squeeze(-1).numpy()
-            test_log_hazard = _call_model(model, _index_inputs(inputs, test_idx_t)).squeeze(-1).numpy()
+            train_log_hazard = _call_model(model, _index_inputs(inputs, train_idx_t)).squeeze(-1).cpu().numpy()
+            test_log_hazard = _call_model(model, _index_inputs(inputs, test_idx_t)).squeeze(-1).cpu().numpy()
 
         out_of_fold_risk[test_idx] = test_log_hazard
 

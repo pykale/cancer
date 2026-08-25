@@ -24,6 +24,20 @@ from sksurv.metrics import cumulative_dynamic_auc, integrated_brier_score
 from sksurv.nonparametric import kaplan_meier_estimator
 
 
+def usable_eval_times(eval_times: np.ndarray, times: np.ndarray) -> np.ndarray:
+    """Keep only evaluation times strictly inside the observed follow-up.
+
+    IPCW weights are undefined beyond what was observed, so horizons outside the
+    range are dropped rather than extrapolated. An empty ``times`` describes no
+    follow-up at all, so nothing is usable.
+    """
+    eval_times = np.asarray(eval_times, dtype=np.float64)
+    times = np.asarray(times, dtype=np.float64)
+    if times.size == 0:
+        return eval_times[:0]
+    return eval_times[(eval_times > times.min()) & (eval_times < times.max())]
+
+
 def _to_structured(times: np.ndarray, events: np.ndarray) -> np.ndarray:
     """Build the ``(event: bool, time: float)`` structured array scikit-survival expects."""
     times = np.asarray(times, dtype=np.float64)
@@ -124,13 +138,30 @@ def kaplan_meier_groups(
         * ``"log_rank_p_value"``: p-value of the log-rank test
           (``sksurv.compare.compare_survival``) for a difference in
           survival across all groups.
+
+    Raises:
+        ValueError: If ``n_groups`` is below 2, or the risk scores cannot be
+            divided into that many non-empty groups.
     """
     risk = np.asarray(risk)
     times = np.asarray(times, dtype=np.float64)
     events = np.asarray(events, dtype=bool)
+    if n_groups < 2:
+        raise ValueError(f"n_groups must be at least 2 to compare curves, got {n_groups}")
 
     quantile_edges = np.quantile(risk, np.linspace(0.0, 1.0, n_groups + 1))
     group = np.clip(np.digitize(risk, quantile_edges[1:-1], right=True), 0, n_groups - 1)
+
+    # Quantile edges collapse when risk is near-constant or the cohort is smaller than
+    # the requested number of groups, leaving a group with no members. The log-rank
+    # test then fails deep inside scikit-survival, so it is caught here instead, where
+    # the cause can be named.
+    occupied = np.bincount(group, minlength=n_groups)
+    if np.any(occupied == 0):
+        raise ValueError(
+            f"cannot form {n_groups} non-empty risk groups from {risk.shape[0]} subjects with "
+            f"{np.unique(risk).size} distinct risk scores; group sizes would be {occupied.tolist()}"
+        )
 
     structured = _to_structured(times, events)
     _, p_value = compare_survival(structured, group)

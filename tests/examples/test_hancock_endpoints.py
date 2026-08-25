@@ -1,4 +1,4 @@
-"""Tests for ``kalecancer.prepdata.endpoints``."""
+"""Tests for the HANCOCK overall-survival endpoint builder."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import math
 import pytest
 import torch
 
-from kalecancer.prepdata.endpoints import overall_survival_endpoint
+from examples.HANCOCK_tabular.endpoints import overall_survival_endpoint
 
 _TIMES = [100.0, 200.0, 300.0, 400.0, 500.0]
 _EXPECTED_EVENTS = [False, True, False, True, False]

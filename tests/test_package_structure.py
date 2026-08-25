@@ -20,6 +20,7 @@ SUBPACKAGES = (
     "loaddata",
     "prepdata",
     "model",
+    "pipeline",
     "survival",
     "evaluate",
     "interpret",

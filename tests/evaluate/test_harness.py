@@ -237,3 +237,8 @@ def test_single_surviving_eval_year_raises_clear_error() -> None:
             seed=0,
             max_epochs=20,
         )
+
+
+def test_bootstrap_ci_needs_something_to_resample() -> None:
+    with pytest.raises(ValueError, match="at least one array"):
+        bootstrap_ci(lambda: 0.0, n_boot=2)

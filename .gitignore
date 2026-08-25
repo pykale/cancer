@@ -8,6 +8,8 @@ venv/
 dist/
 build/
 *.egg
+.coverage
+.pytest_cache/
 
 # Data and experiment outputs
 data/
