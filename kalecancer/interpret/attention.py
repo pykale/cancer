@@ -102,6 +102,43 @@ def export_attention(
     return out_dir
 
 
+def multimodal_attention(model, batch, modality: str) -> dict[str, torch.Tensor]:
+    """Per-patch attention for one bag modality of a fused model.
+
+    A bag-pooling embedder such as :class:`~kalecancer.model.embed.BagEncoder` keeps
+    its last attention weights; this pairs them with the patients they came from.
+    Unlike :func:`export_attention`, which serves the single-modality WSI trainer,
+    this reads a :class:`~kalecancer.loaddata.sample.PatientBatch` and so works with
+    the multimodal trainers.
+
+    Args:
+        model: A trainer exposing ``model.embedders`` and a gradient-free predict.
+        batch: The batch to run, carrying ``patient_id``.
+        modality: Which modality's embedder to read attention from.
+
+    Returns:
+        Attention weights keyed by patient id, one vector per patient.
+
+    Raises:
+        KeyError: If the model carries no such modality.
+        AttributeError: If that modality's embedder records no attention.
+    """
+    embedders = model.model.embedders
+    if modality not in embedders:
+        raise KeyError(f"model has no modality {modality!r}; available: {sorted(embedders)}")
+
+    predict = getattr(model, "predict_logits", None) or model.predict_risk
+    predict(batch)
+
+    embedder = embedders[modality]
+    if not hasattr(embedder, "last_attention"):
+        raise AttributeError(
+            f"the {modality!r} embedder is a {type(embedder).__name__}, which records no attention; "
+            "only a bag-pooling embedder such as BagEncoder does"
+        )
+    return dict(zip(batch.patient_id, embedder.last_attention, strict=True))
+
+
 def collect_attention(model, batch: dict) -> dict[str, list[dict]]:
     """Attention records for one batch, keyed by patient id."""
     _, attentions = model.predict_risk(batch)

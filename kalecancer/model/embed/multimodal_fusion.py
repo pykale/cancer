@@ -475,3 +475,51 @@ def multimodal_cox_loss(
         [neg_partial_log_likelihood(prediction, times, mask) for prediction in output.modality_predictions.values()]
     )
     return loss + auxiliary_weight * auxiliary.mean()
+
+
+def _binary_cross_entropy(
+    prediction: torch.Tensor, targets: torch.Tensor, pos_weight: torch.Tensor | None
+) -> torch.Tensor:
+    return nn.functional.binary_cross_entropy_with_logits(prediction.reshape(-1), targets, pos_weight=pos_weight)
+
+
+def multimodal_bce_loss(
+    output: MultimodalOutput,
+    labels: torch.Tensor,
+    auxiliary_weight: float = 0.0,
+    pos_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Binary cross-entropy on the prediction, optionally supervising each modality too.
+
+    The counterpart of :func:`multimodal_cox_loss` for a binary endpoint, sharing its
+    auxiliary structure: the extra term keeps every embedder learning when one
+    modality dominates, averaged over modalities so its scale does not depend on how
+    many there are.
+
+    Heads emit logits rather than probabilities, because the fused
+    sigmoid-and-log form is the numerically stable one, and because ranking metrics
+    such as ROC-AUC are unchanged by the sigmoid.
+
+    Unlike the Cox loss, this is a per-sample objective: a batch whose patients are
+    all negative still carries a usable gradient, so no batch needs to be skipped.
+
+    Args:
+        output: Prediction from :class:`MultimodalFusion`.
+        labels: ``(batch,)`` targets, 1 positive and 0 negative.
+        auxiliary_weight: Weight on the mean per-modality loss. 0 disables it.
+        pos_weight: Weight on the positive class, for an imbalanced endpoint. It
+            changes calibration and the optimisation path but not the ranking, so its
+            effect on a rank-based metric is indirect.
+
+    Returns:
+        The scalar loss.
+    """
+    targets = labels.reshape(-1).float()
+    loss = _binary_cross_entropy(output.prediction, targets, pos_weight)
+    if auxiliary_weight <= 0 or not output.modality_predictions:
+        return loss
+
+    auxiliary = torch.stack(
+        [_binary_cross_entropy(prediction, targets, pos_weight) for prediction in output.modality_predictions.values()]
+    )
+    return loss + auxiliary_weight * auxiliary.mean()

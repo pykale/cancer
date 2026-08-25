@@ -53,6 +53,7 @@ pathology = [
 interpret = [
     "shap",
     "captum",
+    "umap-learn",
 ]
 dev = [
     "pytest",

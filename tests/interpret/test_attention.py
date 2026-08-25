@@ -5,8 +5,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kalecancer.interpret import attention_records, top_k_patches
+from kalecancer.interpret import attention_records, multimodal_attention, top_k_patches
 from kalecancer.loaddata import WSIFeatureDataset
+from kalecancer.loaddata.sample import PatientBatch
+from kalecancer.model.embed import AttentionMIL, BagEncoder, MLPEmbedder
 from tests.conftest import FEATURE_DIM
 
 
@@ -73,3 +75,43 @@ def test_top_k_returns_the_most_attended_patches_first(sample) -> None:
 def test_a_negative_top_k_is_refused() -> None:
     with pytest.raises(ValueError, match="negative"):
         top_k_patches([{"attention": 0.5}], k=-1)
+
+
+class _FusedStub:
+    """The minimum surface multimodal_attention reads: embedders and a predict call."""
+
+    def __init__(self, embedders) -> None:
+        self.model = type("Fusion", (), {"embedders": embedders})()
+        self.seen = 0
+
+    def predict_logits(self, batch):
+        self.seen += 1
+        return None
+
+
+def test_multimodal_attention_pairs_weights_with_patients() -> None:
+    encoder = BagEncoder(AttentionMIL(input_dim=FEATURE_DIM, hidden_dim=8, attention_dim=4))
+    bags = [torch.randn(5, FEATURE_DIM), torch.randn(9, FEATURE_DIM)]
+    encoder(bags)
+    batch = PatientBatch(patient_id=["001", "002"], modalities={"imaging": bags}, present={})
+
+    weights = multimodal_attention(_FusedStub({"imaging": encoder}), batch, "imaging")
+
+    assert list(weights) == ["001", "002"]
+    assert [len(w) for w in weights.values()] == [5, 9]
+    assert all(torch.isclose(w.sum(), torch.tensor(1.0), atol=1e-5) for w in weights.values())
+
+
+def test_an_unknown_modality_is_refused() -> None:
+    encoder = BagEncoder(AttentionMIL(input_dim=FEATURE_DIM, hidden_dim=8, attention_dim=4))
+    batch = PatientBatch(patient_id=["001"], modalities={}, present={})
+
+    with pytest.raises(KeyError, match="no modality"):
+        multimodal_attention(_FusedStub({"imaging": encoder}), batch, "clinical")
+
+
+def test_an_embedder_without_attention_is_refused() -> None:
+    batch = PatientBatch(patient_id=["001"], modalities={}, present={})
+
+    with pytest.raises(AttributeError, match="records no attention"):
+        multimodal_attention(_FusedStub({"clinical": MLPEmbedder(4, 8)}), batch, "clinical")

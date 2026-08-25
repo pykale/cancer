@@ -13,6 +13,7 @@ from kalecancer.model.embed.multimodal_fusion import (
     ProductOfExpertsFusion,
     build_fusion,
     modality_dropout,
+    multimodal_bce_loss,
     multimodal_cox_loss,
 )
 from kalecancer.model.embed.protocols import Embedder
@@ -35,5 +36,6 @@ __all__ = [
     "TabICLEmbedder",
     "build_fusion",
     "modality_dropout",
+    "multimodal_bce_loss",
     "multimodal_cox_loss",
 ]
