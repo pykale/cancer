@@ -15,6 +15,7 @@ _SUBMODULES = frozenset(
         "loaddata",
         "prepdata",
         "model",
+        "pipeline",
         "survival",
         "evaluate",
         "interpret",
