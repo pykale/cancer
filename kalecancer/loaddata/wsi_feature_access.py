@@ -113,6 +113,8 @@ def _validated_shape(handle: h5py.File, path: Path, expected_dim: int | None) ->
         )
     if features_shape[0] == 0:
         raise InvalidFeatureFileError(f"{path}: '{FEATURES_KEY}' is empty")
+    if len(coords_shape) != 2 or coords_shape[1] < 2:
+        raise InvalidFeatureFileError(f"{path}: expected 2D '{COORDS_KEY}' (num_patches, 2), got shape {coords_shape}")
     if features_shape[0] != coords_shape[0]:
         raise InvalidFeatureFileError(
             f"{path}: '{FEATURES_KEY}' has {features_shape[0]} rows but '{COORDS_KEY}' has "
@@ -142,17 +144,24 @@ def read_feature_bag(
 
     Raises:
         InvalidFeatureFileError: If a key is missing, the bag is empty, the arrays
-            disagree in length, or the feature dimension is unexpected.
+            disagree in length, the feature dimension is unexpected, or ``indices``
+            falls outside the bag.
     """
     path = Path(path)
     try:
         with h5py.File(path, "r") as handle:
-            _validated_shape(handle, path, expected_dim)
+            num_patches, _ = _validated_shape(handle, path, expected_dim)
             if indices is None:
                 features = handle[FEATURES_KEY][:]
                 coords = handle[COORDS_KEY][:]
             else:
+                # Sorted and deduplicated because HDF5 fancy indexing requires it, and
+                # bounds-checked here so an out-of-range patch is named with its file.
                 selection = np.unique(np.asarray(indices, dtype=np.int64))
+                if selection.size and (selection[0] < 0 or selection[-1] >= num_patches):
+                    raise InvalidFeatureFileError(
+                        f"{path}: patch indices must lie in [0, {num_patches}), got [{selection[0]}, {selection[-1]}]"
+                    )
                 features = handle[FEATURES_KEY][selection]
                 coords = handle[COORDS_KEY][selection]
     except OSError as error:

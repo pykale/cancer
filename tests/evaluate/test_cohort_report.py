@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from kalecancer.evaluate import cohort_summary, split_summary
-from tests.conftest import FEATURE_DIM, write_bag
+from tests.conftest import FEATURE_DIM, OS_ENDPOINT, write_bag
 
 
 def test_summary_counts_groups_and_slides(cohort) -> None:
@@ -25,7 +25,7 @@ def test_summary_reports_both_sides_of_the_mismatch(cohort, feature_root: Path, 
     from kalecancer.loaddata import build_cohort
 
     write_bag(feature_root / "Larynx" / "h5_files" / "PrimaryTumor_HE_999.h5")
-    summary = cohort_summary(build_cohort(feature_root, clinical_path, expected_dim=FEATURE_DIM))
+    summary = cohort_summary(build_cohort(feature_root, clinical_path, endpoint=OS_ENDPOINT, expected_dim=FEATURE_DIM))
 
     assert summary["labelled_without_features"] == ["004"]
     assert summary["features_without_label"] == ["999"]

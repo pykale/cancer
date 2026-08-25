@@ -9,7 +9,17 @@ import h5py
 import numpy as np
 import pytest
 
+from kalecancer.loaddata.clinical_access import EndpointSpec
+
 FEATURE_DIM = 8
+
+#: How the synthetic clinical records below define overall survival.
+OS_ENDPOINT = EndpointSpec(
+    name="OS",
+    time_field="days_to_last_information",
+    status_field="survival_status",
+    event_values=frozenset({"deceased"}),
+)
 
 
 def write_bag(path: Path, num_patches: int = 12, feature_dim: int = FEATURE_DIM, seed: int = 0) -> Path:
@@ -53,4 +63,4 @@ def clinical_path(tmp_path: Path) -> Path:
 def cohort(feature_root: Path, clinical_path: Path):
     from kalecancer.loaddata import build_cohort
 
-    return build_cohort(feature_root, clinical_path, expected_dim=FEATURE_DIM)
+    return build_cohort(feature_root, clinical_path, endpoint=OS_ENDPOINT, expected_dim=FEATURE_DIM)

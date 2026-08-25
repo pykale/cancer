@@ -56,7 +56,14 @@ def attention_records(sample: dict, attention: torch.Tensor) -> list[dict]:
 
 
 def top_k_patches(records: list[dict], k: int = 10) -> list[dict]:
-    """The ``k`` highest-attention patches, most attended first."""
+    """The ``k`` highest-attention patches, most attended first.
+
+    Raises:
+        ValueError: If ``k`` is negative, which would otherwise trim the most
+            attended patches instead of selecting them.
+    """
+    if k < 0:
+        raise ValueError(f"k must not be negative, got {k}")
     return sorted(records, key=lambda record: record["attention"], reverse=True)[:k]
 
 

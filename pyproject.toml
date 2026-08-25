@@ -24,7 +24,6 @@ classifiers = [
 ]
 dependencies = [
     "torch",
-    "lightning>=2.4",
     "numpy",
     "pandas",
     "scikit-learn",

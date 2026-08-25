@@ -67,7 +67,13 @@ def test_batch_size_is_recorded_in_the_hyperparameters(cohort, folds):
     """Per-batch Cox averaging means a metric is not reproducible without it."""
     dm = CohortDataModule(cohort, folds[0], batch_size=16, num_workers=0)
     assert dm.hparams["batch_size"] == 16
-    assert set(dm.hparams) == {"batch_size", "num_workers", "pin_memory", "shuffle", "drop_last"}
+    assert set(dm.hparams) == {
+        "batch_size",
+        "num_workers",
+        "pin_memory",
+        "shuffle",
+        "drop_last",
+    }
 
 
 # =========================================================================== #
@@ -159,7 +165,10 @@ def test_a_legitimately_supplied_preprocessor_is_accepted(cohort, folds):
 def test_a_passthrough_preprocessor_never_trips_the_guard(make_cohort, folds):
     """It bakes in no statistics, so overlap with it means nothing."""
     cohort = make_cohort(
-        continuous=["biomarker"], continuous_transform=None, categorical=[], categorical_transform=None
+        continuous=["biomarker"],
+        continuous_transform=None,
+        categorical=[],
+        categorical_transform=None,
     )
     train_ids, val_ids, test_ids = folds
     prep = cohort.fit_preprocessor(cohort.identifiers)
@@ -234,7 +243,7 @@ def test_repr_reports_the_split_sizes_and_batch_size(cohort, folds):
 
 def test_a_trainer_can_fit_and_test_through_the_data_module(cohort, folds):
     """The end the whole module exists for: Lightning drives it with no adapters."""
-    import lightning as L
+    import pytorch_lightning as L
 
     class Toy(L.LightningModule):
         def __init__(self, n_features: int):

@@ -54,8 +54,7 @@ def cohort_summary(cohort: pd.DataFrame, group_key: str = "patient_id") -> dict:
 def log_cohort_summary(summary: dict) -> None:
     """Log the headline counts and every exclusion category that is non-empty."""
     logger.info(
-        "cohort (%s): %d matched groups / %d slides from %d clinical and %d discovered groups "
-        "(%d events, %d censored)",
+        "cohort (%s): %d matched groups / %d slides from %d clinical and %d discovered groups (%d events, %d censored)",
         summary["endpoint"],
         summary["num_matched_groups"],
         summary["num_matched_slides"],

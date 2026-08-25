@@ -96,11 +96,15 @@ def evaluate_predictions(
     times = predictions.duration.numpy().astype(float)
     events = predictions.event.numpy().astype(bool)
 
-    metrics: dict = {
-        "num_patients": float(len(risk)),
-        "num_events": float(events.sum()),
-        "c_index": concordance_index(risk, times, events),
-    }
+    metrics: dict = {"num_patients": float(len(risk)), "num_events": float(events.sum())}
+    try:
+        metrics["c_index"] = concordance_index(risk, times, events)
+    except ValueError as error:
+        # A split with no observed event, or none preceding another patient, has no
+        # orderable pair. Reporting why beats aborting a finished training run.
+        logger.warning("concordance index unavailable: %s", error)
+        metrics["c_index_error"] = str(error)
+
     if train_predictions is None or not eval_times:
         return metrics
 

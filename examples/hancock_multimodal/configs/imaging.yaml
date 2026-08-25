@@ -1,0 +1,20 @@
+# Primary-tumour slides only: attention MIL over UNI patch features into a Cox head.
+DATASET:
+  MODALITIES: ["imaging"]
+  PATIENTS: 0
+  MAX_PATCHES: 512
+  NUM_WORKERS: 0
+MODEL:
+  INPUT_DIM: 1024
+  HIDDEN_DIM: 128
+  ATTENTION_DIM: 64
+SOLVER:
+  SEED: 2026
+  BASE_LR: 0.0003
+  MAX_EPOCHS: 30
+  BATCH_SIZE: 32
+  EARLY_STOP: 10
+FUSION:
+  FUSION_DIM: 64
+OUTPUT:
+  OUT_DIR: "outputs/hancock_multimodal/imaging"

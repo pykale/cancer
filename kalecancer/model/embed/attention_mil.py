@@ -109,29 +109,42 @@ class AttentionMIL(nn.Module):
         Returns:
             ``(embeddings, attentions)`` where ``embeddings`` is ``(batch, hidden_dim)``
             and ``attentions`` holds one weight vector per bag.
+
+        Raises:
+            ValueError: If ``bags`` is empty.
         """
+        if not bags:
+            raise ValueError("cannot pool an empty batch of bags")
         pooled = [self.forward(bag) for bag in bags]
         embeddings = torch.stack([embedding for embedding, _ in pooled])
         return embeddings, [attention for _, attention in pooled]
 
 
 class BagEncoder(nn.Module):
-    """Adapt a bag-pooling module to the ``(batch, latent_dim)`` encoder interface.
+    """Adapt a bag-pooling module to the :class:`~kalecancer.model.embed.Embedder` interface.
 
     Multimodal fusion expects each modality to yield one vector per patient, whereas
     :class:`AttentionMIL` consumes a list of variable-length bags and also returns
     attention. This wrapper keeps the last attention weights available for
-    interpretation while presenting the plain encoder signature fusion needs.
+    interpretation while presenting the plain embedder signature fusion needs.
 
     Args:
         mil: The bag-pooling module to wrap.
     """
 
+    #: Bags are pooled independently, so mini-batching changes nothing.
+    needs_full_batch = False
+
     def __init__(self, mil: AttentionMIL) -> None:
         super().__init__()
         self.mil = mil
-        self.output_dim = mil.output_dim
+        self.out_dim = mil.output_dim
         self.last_attention: list[torch.Tensor] = []
+
+    @property
+    def output_dim(self) -> int:
+        """Alias of :attr:`out_dim`, matching :class:`AttentionMIL`."""
+        return self.out_dim
 
     def forward(self, bags: list[torch.Tensor]) -> torch.Tensor:
         embeddings, attention = self.mil.forward_bags(bags)

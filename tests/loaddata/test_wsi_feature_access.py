@@ -134,3 +134,27 @@ def test_read_feature_bag_rejects_unexpected_feature_dim(feature_root: Path) -> 
 
 def test_inspect_feature_bag_returns_shape_without_reading_data(feature_root: Path) -> None:
     assert inspect_feature_bag(feature_root / "Larynx" / "h5_files" / "PrimaryTumor_HE_002.h5") == (15, FEATURE_DIM)
+
+
+def test_coordinates_must_be_two_dimensional(tmp_path: Path) -> None:
+    path = tmp_path / "PrimaryTumor_HE_009.h5"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("features", data=np.zeros((4, FEATURE_DIM), dtype=np.float32))
+        handle.create_dataset("coords", data=np.zeros(4, dtype=np.int32))
+
+    with pytest.raises(InvalidFeatureFileError, match="coords"):
+        inspect_feature_bag(path)
+
+
+def test_patch_indices_outside_the_bag_are_reported_with_the_file(tmp_path: Path) -> None:
+    path = write_bag(tmp_path / "PrimaryTumor_HE_010.h5", num_patches=4)
+
+    with pytest.raises(InvalidFeatureFileError, match=r"\[0, 4\)"):
+        read_feature_bag(path, indices=np.array([0, 99]))
+
+
+def test_negative_patch_indices_are_refused(tmp_path: Path) -> None:
+    path = write_bag(tmp_path / "PrimaryTumor_HE_011.h5", num_patches=4)
+
+    with pytest.raises(InvalidFeatureFileError):
+        read_feature_bag(path, indices=np.array([-1, 2]))

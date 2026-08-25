@@ -50,8 +50,8 @@ def _add_wsi_survival_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--out", type=str, help="directory for results")
     parser.add_argument(
         "--source",
-        choices=["local", "hancock"],
-        help="local paths, or fetch from the published HANCOCK archives",
+        choices=["local"],
+        help="where the data comes from",
     )
     parser.add_argument("--patients", type=int, help="patients to fetch from a remote source; 0 fetches all")
     parser.add_argument("--region", choices=["primary", "lymph_node"], help="anatomical region to fetch")
@@ -74,41 +74,11 @@ def _add_wsi_survival_parser(subparsers: argparse._SubParsersAction) -> None:
     )
 
 
-def _add_data_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("data", help="fetch datasets into the local cache")
-    actions = parser.add_subparsers(dest="data_command", required=True)
-
-    pull = actions.add_parser("pull", help="fetch a dataset without training")
-    pull.add_argument("--source", choices=["hancock"], default="hancock", help="dataset to fetch")
-    pull.add_argument("--patients", type=int, default=0, help="patients to fetch; 0 fetches all")
-    pull.add_argument("--region", choices=["primary", "lymph_node"], default="primary", help="anatomical region")
-    pull.add_argument("--cache-dir", type=str, default=None, help="cache directory")
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kalecancer", description="Multimodal cancer AI for the PyKale ecosystem")
     subparsers = parser.add_subparsers(dest="command", required=True)
     _add_wsi_survival_parser(subparsers)
-    _add_data_parser(subparsers)
     return parser
-
-
-def _run_data_pull(args: argparse.Namespace) -> int:
-    from kalecancer.loaddata.hancock import DEFAULT_CACHE_DIR, HancockError, fetch_dataset
-
-    try:
-        feature_root, clinical_path = fetch_dataset(
-            cache_dir=args.cache_dir or DEFAULT_CACHE_DIR,
-            region=args.region,
-            patients=args.patients,
-        )
-    except HancockError as error:
-        logger.error("%s", error)
-        return 1
-
-    logger.info("features:  %s", feature_root)
-    logger.info("clinical:  %s", clinical_path)
-    return 0
 
 
 def resolve_config(args: argparse.Namespace):
@@ -152,9 +122,6 @@ def resolve_config(args: argparse.Namespace):
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = build_parser().parse_args(argv)
-    if args.command == "data":
-        return _run_data_pull(args)
-
     cfg = resolve_config(args)
     if args.print_config:
         print(cfg.dump())  # noqa: T201 - stdout is this command's output
@@ -168,19 +135,19 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if missing:
             logger.error(
-                "path not found for %s; pass an existing path, use --cfg, or fetch the public data with "
-                "--source hancock",
+                "path not found for %s; pass an existing path or use --cfg",
                 ", ".join(missing),
             )
             return 2
 
-    from kalecancer.loaddata.hancock import HancockError
+    from kalecancer.loaddata.clinical_access import endpoint_from_config
+    from kalecancer.loaddata.dataset_access import DatasetAccessError
     from kalecancer.pipeline.wsi_survival_runner import PipelineError, run
 
     cfg.freeze()
     try:
-        run(cfg)
-    except (PipelineError, HancockError) as error:
+        run(cfg, endpoint=endpoint_from_config(cfg))
+    except (PipelineError, DatasetAccessError) as error:
         logger.error("%s", error)
         return 1
     return 0

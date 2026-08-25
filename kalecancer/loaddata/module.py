@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Literal
 
-import lightning as L
+import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 
 from kalecancer.loaddata.base import Cohort, Identifiers, LeakageError
@@ -26,7 +26,7 @@ from kalecancer.loaddata.view import CohortView
 BatchSize = int | Literal["full"]
 
 
-class CohortDataModule(L.LightningDataModule):
+class CohortDataModule(pl.LightningDataModule):
     """Wraps one fold's views in DataLoaders. Fits nothing that outlives the fold.
 
     Args:
@@ -56,7 +56,7 @@ class CohortDataModule(L.LightningDataModule):
     Example:
         >>> train_ids, test_ids = cohort.split(test_size=0.2, random_state=0, stratify=True)
         >>> dm = CohortDataModule(cohort, train_ids, test_ids=test_ids, batch_size="full")
-        >>> L.Trainer(max_epochs=50).fit(model, datamodule=dm)
+        >>> pl.Trainer(max_epochs=50).fit(model, datamodule=dm)
     """
 
     def __init__(
@@ -186,7 +186,11 @@ class CohortDataModule(L.LightningDataModule):
         Independent of :meth:`check_no_leak`, which cannot see this for a passthrough
         cohort -- the rows would still be evaluated as held out having been trained on.
         """
-        named = [("train", self.train_ids), ("validation", self.val_ids), ("test", self.test_ids)]
+        named = [
+            ("train", self.train_ids),
+            ("validation", self.val_ids),
+            ("test", self.test_ids),
+        ]
         present = [(label, ids) for label, ids in named if ids is not None]
         for i, (left_label, left) in enumerate(present):
             for right_label, right in present[i + 1 :]:

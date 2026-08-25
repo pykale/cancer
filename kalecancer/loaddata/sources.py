@@ -119,6 +119,19 @@ def open_remote_zip(url: str, timeout: float = 120.0) -> tuple[zipfile.ZipFile, 
     return archive, handle
 
 
+def _member_target(destination: Path, member: str) -> Path:
+    """Resolve ``member`` inside ``destination``, refusing paths that escape it.
+
+    Archive member names are attacker-controlled when the archive is remote, and a
+    name such as ``../config`` would otherwise be written outside the cache.
+    """
+    root = destination.resolve()
+    target = (root / member).resolve()
+    if target != root and root not in target.parents:
+        raise RemoteArchiveError(f"archive member {member!r} would be written outside {destination}")
+    return target
+
+
 def extract_members(
     archive: zipfile.ZipFile,
     members: list[str],
@@ -136,19 +149,40 @@ def extract_members(
 
     Returns:
         The extracted paths, in the order requested.
+
+    Raises:
+        RemoteArchiveError: If a member is absent, or names a path outside
+            ``destination``.
     """
     destination = Path(destination)
     paths = []
     for index, member in enumerate(members, start=1):
-        target = destination / member
+        try:
+            info = archive.getinfo(member)
+        except KeyError as error:
+            raise RemoteArchiveError(f"archive has no member named {member!r}") from error
+
+        target = _member_target(destination, member)
+        if info.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            paths.append(target)
+            continue
         if skip_existing and target.exists():
             paths.append(target)
             continue
 
+        # Written beside the target and renamed once complete, so an interrupted
+        # transfer cannot leave a truncated file that the next run treats as cached.
         target.parent.mkdir(parents=True, exist_ok=True)
-        with archive.open(member) as source, target.open("wb") as output:
-            while chunk := source.read(READ_BUFFER):
-                output.write(chunk)
+        partial = target.with_name(target.name + ".part")
+        try:
+            with archive.open(member) as source, partial.open("wb") as output:
+                while chunk := source.read(READ_BUFFER):
+                    output.write(chunk)
+            partial.replace(target)
+        finally:
+            partial.unlink(missing_ok=True)
+
         paths.append(target)
         logger.info("fetched %d/%d %s", index, len(members), member)
     return paths

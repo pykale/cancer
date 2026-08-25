@@ -108,7 +108,12 @@ def collate_bags(samples: list[dict]) -> dict:
     Bags stay in a list rather than a padded tensor, because padding to the largest
     bag wastes most of the tensor when sizes vary by orders of magnitude. Labels are
     stacked so a Cox risk set spans the batch.
+
+    Raises:
+        ValueError: If ``samples`` is empty.
     """
+    if not samples:
+        raise ValueError("cannot collate an empty batch")
     return {
         "samples": samples,
         "duration": torch.stack([sample["duration"] for sample in samples]),

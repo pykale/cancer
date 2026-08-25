@@ -68,3 +68,8 @@ def test_top_k_returns_the_most_attended_patches_first(sample) -> None:
     assert [record["attention"] for record in top] == sorted((record["attention"] for record in top), reverse=True)
     # The largest weight was assigned to the final patch.
     assert top[0]["x"] == int(sample["coords"][-1, 0])
+
+
+def test_a_negative_top_k_is_refused() -> None:
+    with pytest.raises(ValueError, match="negative"):
+        top_k_patches([{"attention": 0.5}], k=-1)

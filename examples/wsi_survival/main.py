@@ -15,7 +15,9 @@ import argparse
 import logging
 
 from config import get_cfg_defaults
+from hancock import fetch_for
 
+from kalecancer.loaddata.clinical_access import endpoint_from_config
 from kalecancer.pipeline.wsi_survival_runner import run
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -41,7 +43,9 @@ def main() -> None:
         cfg.merge_from_list(args.opts)
     cfg.freeze()
 
-    run(cfg)
+    # The dataset belongs to this experiment; the runner only needs paths and an
+    # endpoint, both described by the configuration.
+    run(cfg, endpoint=endpoint_from_config(cfg), fetch=lambda: fetch_for(cfg))
 
 
 if __name__ == "__main__":

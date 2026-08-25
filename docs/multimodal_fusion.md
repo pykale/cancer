@@ -64,22 +64,18 @@ from kalecancer.model.embed import AttentionMIL, BagEncoder
 
 encoders = {
     "wsi": BagEncoder(AttentionMIL(input_dim=1024, hidden_dim=256)),
-    "clinical": TabularEncoder(...),          # any module returning (batch, dim)
+    "clinical": TabularEncoder(...),  # any module returning (batch, dim)
 }
 latent_dims = {"wsi": 256, "clinical": 64}
 
 # Early: encode each modality, fuse the features, predict once.
-model = build_multimodal_survival(
-    "early", encoders=encoders, latent_dims=latent_dims, fusion="poe", fused_dim=64
-)
+model = build_multimodal_survival("early", encoders=encoders, latent_dims=latent_dims, fusion="poe", fused_dim=64)
 
 # Late: encode and predict per modality, then combine the risks.
 model = build_multimodal_survival("late", encoders=encoders, latent_dims=latent_dims)
 
 # Hybrid: the early trunk plus a head on every modality.
-model = build_multimodal_survival(
-    "hybrid", encoders=encoders, latent_dims=latent_dims, fusion="poe", fused_dim=64
-)
+model = build_multimodal_survival("hybrid", encoders=encoders, latent_dims=latent_dims, fusion="poe", fused_dim=64)
 
 output = model({"wsi": bags, "clinical": table}, mask)
 loss = multimodal_cox_loss(output, event, duration, auxiliary_weight=0.3)

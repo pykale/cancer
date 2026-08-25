@@ -5,7 +5,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from kalecancer.evaluate.survival_metrics import integrated_brier, kaplan_meier_groups, time_dependent_auc
+from kalecancer.evaluate.survival_metrics import (
+    integrated_brier,
+    kaplan_meier_groups,
+    time_dependent_auc,
+    usable_eval_times,
+)
 from kalecancer.survival.baseline import breslow_baseline_hazard, predict_survival_function
 from kalecancer.survival.synthetic import make_synthetic_survival
 
@@ -97,3 +102,21 @@ def test_eval_times_outside_follow_up_range_raises() -> None:
 
     with pytest.raises(ValueError):
         time_dependent_auc(train_times, train_events, test_times, test_events, true_risk_test, out_of_range_eval_times)
+
+
+def test_no_evaluation_time_is_usable_without_follow_up() -> None:
+    assert usable_eval_times(np.array([365.0, 730.0]), np.array([])).size == 0
+
+
+def test_risk_groups_that_cannot_be_filled_are_reported() -> None:
+    constant_risk = np.zeros(20)
+    times = np.linspace(10.0, 200.0, 20)
+    events = np.ones(20, dtype=bool)
+
+    with pytest.raises(ValueError, match="non-empty risk groups"):
+        kaplan_meier_groups(constant_risk, times, events, n_groups=2)
+
+
+def test_a_single_risk_group_is_refused() -> None:
+    with pytest.raises(ValueError, match="at least 2"):
+        kaplan_meier_groups(np.arange(20.0), np.linspace(10.0, 200.0, 20), np.ones(20, dtype=bool), n_groups=1)

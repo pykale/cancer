@@ -2,8 +2,10 @@
 
 Labels follow one contract throughout ``kalecancer``: ``duration`` is the time to
 event or censoring, and ``event`` is ``1`` when the event was observed and ``0`` when
-the patient was censored. Source files record outcomes as free text, so an endpoint
-declares which field to read and which values count as an event.
+the patient was censored. Source files record outcomes as free text, so the caller supplies an
+:class:`EndpointSpec` naming the columns and the values that count as an event.
+Those definitions belong to a dataset, so they live with the experiment rather
+than here.
 """
 
 from __future__ import annotations
@@ -21,8 +23,13 @@ class ClinicalDataError(ValueError):
 
 @dataclass(frozen=True)
 class EndpointSpec:
-    """How to derive ``(duration, event)`` for one survival endpoint."""
+    """How to derive ``(duration, event)`` for one survival endpoint.
 
+    Attributes:
+        name: Identifier used when reporting the cohort, e.g. ``"OS"``.
+    """
+
+    name: str
     time_field: str
     status_field: str
     event_values: frozenset[str]
@@ -30,23 +37,27 @@ class EndpointSpec:
     #: are excluded rather than silently treated as censored.
     unknown_values: frozenset[str] = field(default_factory=frozenset)
 
+    def __post_init__(self) -> None:
+        # Status text is compared case-insensitively, so the values are folded once
+        # here: a spec written with "Deceased" would otherwise match nothing and
+        # silently mark every patient censored.
+        object.__setattr__(self, "event_values", frozenset(value.strip().lower() for value in self.event_values))
+        object.__setattr__(self, "unknown_values", frozenset(value.strip().lower() for value in self.unknown_values))
 
-ENDPOINTS: dict[str, EndpointSpec] = {
-    # Overall survival: death from any cause.
-    "OS": EndpointSpec(
-        time_field="days_to_last_information",
-        status_field="survival_status",
-        event_values=frozenset({"deceased"}),
-    ),
-    # Disease-specific survival: death attributed to the tumour. Records stating only
-    # "deceased" carry no cause and cannot be classified.
-    "DSS": EndpointSpec(
-        time_field="days_to_last_information",
-        status_field="survival_status_with_cause",
-        event_values=frozenset({"deceased tumor specific"}),
-        unknown_values=frozenset({"deceased"}),
-    ),
-}
+
+def endpoint_from_config(cfg) -> EndpointSpec:
+    """Build an endpoint from a ``SURVIVAL`` configuration section.
+
+    Keeps the column names that identify a dataset out of the library: they arrive
+    as configuration, alongside the paths.
+    """
+    return EndpointSpec(
+        name=cfg.SURVIVAL.ENDPOINT,
+        time_field=cfg.SURVIVAL.TIME_FIELD,
+        status_field=cfg.SURVIVAL.STATUS_FIELD,
+        event_values=frozenset(value.lower() for value in cfg.SURVIVAL.EVENT_VALUES),
+        unknown_values=frozenset(value.lower() for value in cfg.SURVIVAL.UNKNOWN_VALUES),
+    )
 
 
 SURVIVAL_COLUMNS = ["patient_id", "duration", "event"]
@@ -70,14 +81,14 @@ def load_clinical_records(path: str | Path) -> list[dict]:
 
 def survival_table(
     records: list[dict],
-    endpoint: str = "OS",
+    endpoint: EndpointSpec,
     patient_id_field: str = "patient_id",
 ) -> tuple[pd.DataFrame, dict[str, list[str]]]:
     """Convert clinical records into a table of validated survival labels.
 
     Args:
         records: Raw patient objects, e.g. from :func:`load_clinical_records`.
-        endpoint: Key into :data:`ENDPOINTS`.
+        endpoint: How this dataset's columns define the endpoint.
         patient_id_field: Field holding the patient identifier. Read as a string so
             zero padding matches the identifiers used elsewhere.
 
@@ -86,12 +97,10 @@ def survival_table(
         columns, and the identifiers excluded per reason.
 
     Raises:
-        ClinicalDataError: If the endpoint is unknown, an identifier is missing, or a
-            patient appears more than once.
+        ClinicalDataError: If an identifier is missing, or a patient appears more
+            than once.
     """
-    if endpoint not in ENDPOINTS:
-        raise ClinicalDataError(f"unknown endpoint {endpoint!r}; available: {sorted(ENDPOINTS)}")
-    spec = ENDPOINTS[endpoint]
+    spec = endpoint
 
     if any(patient_id_field not in record for record in records):
         raise ClinicalDataError(f"every clinical record needs a {patient_id_field!r} field")

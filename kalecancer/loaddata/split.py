@@ -25,6 +25,10 @@ from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
 Split = dict[str, np.ndarray]
 
+#: Upper bound on the folds a holdout is built from, so the share it can express is
+#: no coarser than one part in this many.
+MAX_HOLDOUT_FOLDS = 20
+
 
 class SplitError(ValueError):
     """Raised when a requested split cannot be produced."""
@@ -72,18 +76,36 @@ def _holdout(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Hold out approximately ``ratio`` of ``indices``, keeping groups intact.
 
-    A K-fold splitter with ``round(1 / ratio)`` folds provides the held-out part,
-    which keeps grouped and ungrouped splitting on one code path.
+    Built from a K-fold splitter so grouped and ungrouped splitting stay on one code
+    path: enough whole folds are merged to reach the requested share. The achievable
+    resolution is one fold, so a small table -- which supports few folds -- gives a
+    coarser share than a large one.
+
+    Raises:
+        SplitError: If fewer than two independent units are available to split.
     """
-    num_splits = max(2, round(1 / ratio))
     subset = metadata.iloc[indices]
+    units = subset[group_key].nunique() if group_key else len(subset)
+    if units < 2:
+        unit = f"unique {group_key}" if group_key else "rows"
+        raise SplitError(f"need at least 2 {unit} to hold part out, got {units}")
+
+    # More folds give a finer share; never more than the data can support.
+    num_splits = max(2, min(MAX_HOLDOUT_FOLDS, units))
     labels = composite_labels(subset, stratify_keys, min_count=num_splits)
     groups = subset[group_key].to_numpy() if group_key else None
 
     splitter = StratifiedGroupKFold if group_key else StratifiedKFold
-    folds = splitter(n_splits=num_splits, shuffle=True, random_state=seed)
-    keep, held = next(iter(folds.split(subset, labels, groups)))
-    return indices[keep], indices[held]
+    folds = list(splitter(n_splits=num_splits, shuffle=True, random_state=seed).split(subset, labels, groups))
+
+    # Folds vary in size, so the count is chosen by how many rows it actually holds
+    # out rather than by fold arithmetic. At least one fold is held out, and at least
+    # one is kept, whatever the ratio.
+    sizes = np.cumsum([len(folds[fold][1]) for fold in range(num_splits - 1)])
+    taken = int(np.argmin(np.abs(sizes - ratio * len(subset)))) + 1
+    held = np.concatenate([folds[fold][1] for fold in range(taken)])
+    keep = np.setdiff1d(np.arange(len(subset)), held)
+    return indices[keep], indices[np.sort(held)]
 
 
 def _validate(metadata: pd.DataFrame, group_key: str | None, minimum: int) -> None:
@@ -93,6 +115,39 @@ def _validate(metadata: pd.DataFrame, group_key: str | None, minimum: int) -> No
     if units < minimum:
         unit = f"unique {group_key}" if group_key else "rows"
         raise SplitError(f"need at least {minimum} {unit} to split, got {units}")
+
+
+def holdout_split(
+    metadata: pd.DataFrame,
+    ratio: float = 0.15,
+    group_key: str | None = None,
+    stratify_keys: Sequence[str] = (),
+    seed: int = 2026,
+) -> Split:
+    """Split a metadata table in two.
+
+    For when a third set is not wanted: carving a validation set out of a fixed
+    training half, for instance, where the test set is already decided.
+
+    Args:
+        metadata: Table describing the samples.
+        ratio: Approximate share held out.
+        group_key: Column whose values must not be split across sets.
+        stratify_keys: Columns whose distribution should be preserved.
+        seed: Seed making the split reproducible.
+
+    Returns:
+        Positional indices keyed by ``"fit"`` and ``"holdout"``.
+
+    Raises:
+        SplitError: If the ratio is invalid or the table is too small to split.
+    """
+    if not 0 < ratio < 1:
+        raise SplitError(f"ratio must lie in (0, 1), got {ratio}")
+    _validate(metadata, group_key, minimum=2)
+
+    fit, holdout = _holdout(metadata, np.arange(len(metadata)), ratio, group_key, stratify_keys, seed)
+    return {"fit": fit, "holdout": holdout}
 
 
 def train_val_test_split(

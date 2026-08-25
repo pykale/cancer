@@ -145,7 +145,5 @@ class WSISurvivalTrainer(BaseNNTrainer):
             logger.warning("no events in the %s split; skipping the C-index", split_name)
             return
 
-        index = concordance_index(
-            risk.double().numpy(), duration.double().numpy(), as_event_mask(event).numpy()
-        )
+        index = concordance_index(risk.double().numpy(), duration.double().numpy(), as_event_mask(event).numpy())
         self.log(f"{split_name}_c_index", index, prog_bar=True)

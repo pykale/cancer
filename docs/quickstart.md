@@ -87,7 +87,7 @@ from kalecancer.config import get_cfg_defaults
 from kalecancer.pipeline.wsi_survival_runner import run
 
 cfg = get_cfg_defaults()
-cfg.DATASET.SOURCE = "hancock"      # or "local" with FEATURE_ROOT and CLINICAL_PATH
+cfg.DATASET.SOURCE = "hancock"  # or "local" with FEATURE_ROOT and CLINICAL_PATH
 cfg.DATASET.PATIENTS = 50
 cfg.SOLVER.MAX_EPOCHS = 30
 cfg.freeze()
@@ -102,7 +102,7 @@ Individual stages work on their own:
 from kalecancer.loaddata import build_cohort, split_patients
 
 bags, summary = build_cohort(feature_root, clinical_path, endpoint="OS")
-summary.log()                       # matched patients and every exclusion
+summary.log()  # matched patients and every exclusion
 split = split_patients(bags, seed=2026)
 ```
 

@@ -196,3 +196,34 @@ def test_a_url_that_is_not_a_zip_is_reported(archive_server: str) -> None:
 
     with pytest.raises(RemoteArchiveError, match="not a readable ZIP archive"):
         open_remote_zip(not_an_archive)
+
+
+def test_a_member_escaping_the_destination_is_refused(tmp_path: Path) -> None:
+    archive_path = tmp_path / "escaping.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("../outside.txt", "should never be written")
+
+    with zipfile.ZipFile(archive_path) as archive, pytest.raises(RemoteArchiveError, match="outside"):
+        extract_members(archive, ["../outside.txt"], tmp_path / "cache")
+
+    assert not (tmp_path / "outside.txt").exists()
+
+
+def test_a_directory_member_becomes_a_directory(tmp_path: Path) -> None:
+    archive_path = tmp_path / "with_dir.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("folder/", "")
+
+    with zipfile.ZipFile(archive_path) as archive:
+        extracted = extract_members(archive, ["folder/"], tmp_path / "cache")
+
+    assert extracted[0].is_dir()
+
+
+def test_an_absent_member_is_named_in_the_error(tmp_path: Path) -> None:
+    archive_path = tmp_path / "small.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("present.txt", "here")
+
+    with zipfile.ZipFile(archive_path) as archive, pytest.raises(RemoteArchiveError, match="absent.txt"):
+        extract_members(archive, ["absent.txt"], tmp_path / "cache")

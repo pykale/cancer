@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from kalecancer.loaddata.clinical_access import load_clinical_records, survival_table
+from kalecancer.loaddata.clinical_access import EndpointSpec, load_clinical_records, survival_table
 from kalecancer.loaddata.wsi_feature_access import (
     DEFAULT_SLIDE_PATTERN,
     InvalidFeatureFileError,
@@ -36,7 +36,7 @@ COHORT_COLUMNS = ["patient_id", "slide_id", "path", "duration", "event"]
 def build_cohort(
     feature_root: str | Path,
     clinical_path: str | Path,
-    endpoint: str = "OS",
+    endpoint: EndpointSpec,
     expected_dim: int | None = None,
     slide_pattern: re.Pattern[str] = DEFAULT_SLIDE_PATTERN,
     validate_features: bool = True,
@@ -46,7 +46,7 @@ def build_cohort(
     Args:
         feature_root: Directory of slide feature files, searched recursively.
         clinical_path: JSON file of clinical records.
-        endpoint: Survival endpoint, see :data:`~kalecancer.loaddata.clinical_access.ENDPOINTS`.
+        endpoint: How this dataset's columns define the survival endpoint.
         expected_dim: Feature dimension every slide must provide, if it should be checked.
         slide_pattern: Regular expression exposing a ``patient_id`` named group.
         validate_features: Read each file's header and drop unreadable slides.
@@ -77,7 +77,7 @@ def build_cohort(
     cohort = slides.merge(survival, on="patient_id", how="inner")
     cohort = cohort.sort_values(["patient_id", "slide_id"], ignore_index=True)[COHORT_COLUMNS]
     cohort.attrs.update(
-        endpoint=endpoint,
+        endpoint=endpoint.name,
         num_clinical_patients=len(records),
         slides=slides,
         survival=survival,

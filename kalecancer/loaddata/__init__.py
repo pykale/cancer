@@ -17,7 +17,6 @@ works and imports it on demand.
 
 from kalecancer.loaddata.base import Cohort, LeakageError, NotFittedError
 from kalecancer.loaddata.clinical_access import (
-    ENDPOINTS,
     ClinicalDataError,
     EndpointSpec,
     load_clinical_records,
@@ -26,7 +25,13 @@ from kalecancer.loaddata.clinical_access import (
 from kalecancer.loaddata.cohort import COHORT_COLUMNS, build_cohort
 from kalecancer.loaddata.protocols import Preprocessor, Target
 from kalecancer.loaddata.sample import PatientBatch, PatientSample, collate_samples
-from kalecancer.loaddata.split import SplitError, composite_labels, k_fold_splits, train_val_test_split
+from kalecancer.loaddata.split import (
+    SplitError,
+    composite_labels,
+    holdout_split,
+    k_fold_splits,
+    train_val_test_split,
+)
 from kalecancer.loaddata.tabular import TabularCohort
 from kalecancer.loaddata.view import CohortView
 from kalecancer.loaddata.wsi_dataset import WSIFeatureDataset, collate_bags
@@ -41,7 +46,6 @@ from kalecancer.loaddata.wsi_feature_access import (
 
 __all__ = [
     "COHORT_COLUMNS",
-    "ENDPOINTS",
     "ClinicalDataError",
     "Cohort",
     "CohortDataModule",
@@ -62,6 +66,7 @@ __all__ = [
     "collate_bags",
     "collate_samples",
     "composite_labels",
+    "holdout_split",
     "inspect_feature_bag",
     "k_fold_splits",
     "load_clinical_records",

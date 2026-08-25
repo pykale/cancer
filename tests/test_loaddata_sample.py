@@ -26,7 +26,7 @@ def sample(pid: str, *, tiles: int | None = None, target: bool = True) -> Patien
         patient_id=pid,
         modalities=modalities,
         present=present,
-        target={"time": torch.tensor(1.0), "event": torch.tensor(0.0)} if target else {},
+        target=({"time": torch.tensor(1.0), "event": torch.tensor(0.0)} if target else {}),
     )
 
 
@@ -47,7 +47,7 @@ def test_default_collate_cannot_handle_a_patient_sample():
 
 def test_lightning_can_move_a_batch_to_a_device():
     """``transfer_batch_to_device`` recurses into dataclasses, so we need no hook."""
-    from lightning.fabric.utilities.apply_func import move_data_to_device
+    from pytorch_lightning.utilities import move_data_to_device
 
     moved = move_data_to_device(collate_samples([sample("a"), sample("b")]), "cpu")
     assert isinstance(moved, PatientBatch)

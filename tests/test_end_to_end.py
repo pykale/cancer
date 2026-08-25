@@ -14,9 +14,9 @@ from kalecancer.interpret import export_attention
 from kalecancer.loaddata import WSIFeatureDataset, build_cohort, collate_bags, train_val_test_split
 from kalecancer.pipeline import WSISurvivalTrainer
 from kalecancer.utils import set_seed
-from tests.conftest import FEATURE_DIM, write_bag
+from tests.conftest import FEATURE_DIM, OS_ENDPOINT, write_bag
 
-NUM_PATIENTS = 24
+NUM_PATIENTS = 48
 
 
 @pytest.fixture
@@ -49,10 +49,12 @@ def test_pipeline_trains_evaluates_and_exports_attention(synthetic_cohort, tmp_p
     set_seed(0)
     out_dir = tmp_path / "outputs"
 
-    cohort = build_cohort(feature_root, clinical_path, expected_dim=FEATURE_DIM)
+    cohort = build_cohort(feature_root, clinical_path, endpoint=OS_ENDPOINT, expected_dim=FEATURE_DIM)
     assert cohort_summary(cohort)["num_matched_groups"] == NUM_PATIENTS
 
-    split = train_val_test_split(cohort, val_ratio=0.2, test_ratio=0.2, group_key="patient_id", seed=0)
+    split = train_val_test_split(
+        cohort, val_ratio=0.2, test_ratio=0.2, group_key="patient_id", stratify_keys=["event"], seed=0
+    )
 
     def loader(name, shuffle=False, max_patches=None):
         dataset = WSIFeatureDataset(cohort.iloc[split[name]], expected_dim=FEATURE_DIM, max_patches=max_patches)
@@ -96,7 +98,7 @@ def test_pipeline_trains_evaluates_and_exports_attention(synthetic_cohort, tmp_p
 
 def test_risk_scores_are_one_per_patient(synthetic_cohort) -> None:
     feature_root, clinical_path = synthetic_cohort
-    cohort = build_cohort(feature_root, clinical_path, expected_dim=FEATURE_DIM)
+    cohort = build_cohort(feature_root, clinical_path, endpoint=OS_ENDPOINT, expected_dim=FEATURE_DIM)
     dataset = WSIFeatureDataset(cohort, expected_dim=FEATURE_DIM)
     loader = DataLoader(dataset, batch_size=5, collate_fn=collate_bags, num_workers=0)
 

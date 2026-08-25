@@ -112,3 +112,8 @@ def test_missing_columns_are_reported(cohort) -> None:
 def test_invalid_max_patches_is_rejected(cohort) -> None:
     with pytest.raises(ValueError, match="must be a positive number"):
         WSIFeatureDataset(cohort, max_patches=0)
+
+
+def test_collating_an_empty_batch_is_refused() -> None:
+    with pytest.raises(ValueError, match="empty batch"):
+        collate_bags([])

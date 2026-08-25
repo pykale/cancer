@@ -1,9 +1,12 @@
-"""Latent-level fusion of per-modality representations.
+"""Multimodal fusion: where modalities meet, and how they are combined.
 
-Each block takes one latent vector per modality and returns a single fused
-representation of ``output_dim``. Because every block exposes the same interface and
-the same output width, the fusion method is swappable from configuration without
-touching the encoders or the task head.
+Two independent choices, so either can change from configuration alone:
+
+**stage** -- *where* fusion happens, see :class:`MultimodalFusion`.
+
+**method** -- *how* the vectors are combined, see :data:`FUSION_METHODS`. Each block
+takes one latent per modality and returns a single representation of ``output_dim``,
+so swapping the method leaves the embedders and the task head untouched.
 
 Absent modalities are first-class: a boolean modality mask is carried through, and
 each block degrades in a way appropriate to its mechanism.
@@ -11,11 +14,14 @@ each block degrades in a way appropriate to its mechanism.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 
 import torch
 from kale.embed.multimodal_fusion import Concat, ProductOfExperts
 from torch import nn
+
+from kalecancer.survival.cox import as_event_mask, neg_partial_log_likelihood
 
 #: Log-variance assigned to an absent expert, making its precision negligible.
 ABSENT_LOG_VAR = 20.0
@@ -209,3 +215,262 @@ def build_fusion(method: str, input_dims: Sequence[int], output_dim: int, **kwar
     if method not in FUSION_METHODS:
         raise KeyError(f"unknown fusion method {method!r}; available: {sorted(FUSION_METHODS)}")
     return FUSION_METHODS[method](input_dims, output_dim, **kwargs)
+
+
+FUSION_STAGES = ("early", "intermediate", "late", "hybrid")
+
+
+@dataclass
+class MultimodalOutput:
+    """What a fusion model returns.
+
+    Attributes:
+        prediction: The model output, from the task head.
+        representation: Fused features, for stages that produce them. ``None`` for
+            late fusion, which never forms a joint representation.
+        modality_predictions: Per-modality outputs, from late fusion's heads or
+            hybrid fusion's auxiliary heads. Empty otherwise.
+    """
+
+    prediction: torch.Tensor
+    representation: torch.Tensor | None = None
+    modality_predictions: dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+def modality_dropout(mask: torch.Tensor, probability: float, generator: torch.Generator | None = None) -> torch.Tensor:
+    """Randomly mark present modalities absent, simulating missing data.
+
+    At least one modality is always kept, so no sample is left with nothing to
+    predict from.
+
+    Args:
+        mask: ``(batch, num_modalities)`` indicator, 1 where present.
+        probability: Chance of dropping each present modality.
+        generator: Optional RNG for reproducibility.
+
+    Returns:
+        A new mask; the input is not modified.
+    """
+    if probability <= 0:
+        return mask
+
+    device = mask.device if generator is None else generator.device
+    keep = (torch.rand(mask.shape, device=device, generator=generator) >= probability).float()
+    dropped = mask * keep.to(mask.device)
+    empty = dropped.sum(dim=1) == 0
+    if bool(empty.any()):
+        dropped[empty, mask[empty].argmax(dim=1)] = 1.0
+    return dropped
+
+
+def _embedder_dim(name: str, embedder: nn.Module) -> int:
+    dim = getattr(embedder, "out_dim", None)
+    if dim is None:
+        raise AttributeError(f"embedder {name!r} must expose 'out_dim'; see kalecancer.model.embed.Embedder")
+    return int(dim)
+
+
+class MultimodalFusion(nn.Module):
+    """Combine several modalities at a configurable stage.
+
+    The stage decides *where* modalities meet; the method decides *how* their vectors
+    are combined. The two are independent, so a configuration can change either alone.
+
+    ================  ========================================================
+    ``early``         Fusion before modality-specific encoding. **Unavailable**:
+                      this pipeline starts from already-extracted features, so
+                      no raw input remains to fuse. Kept as a named stage so a
+                      raw-input pipeline can add it without changing callers.
+    ``intermediate``  Encode each modality, fuse the features, predict once.
+                      The main stage, and where ``method`` applies.
+    ``late``          Encode and predict per modality, combine the predictions.
+    ``hybrid``        An intermediate trunk plus a head on each modality, whose
+                      outputs give auxiliary supervision and, optionally, votes.
+    ================  ========================================================
+
+    Every modality is projected to ``fusion_dim`` first, so embedders of differing
+    widths interoperate and every head sees the same input size.
+
+    Args:
+        embedders: One module per modality, each exposing ``out_dim`` and mapping its
+            input to ``(batch, out_dim)``.
+        head_factory: Called with a width to build a task head, e.g.
+            :class:`~kalecancer.survival.cox.CoxHead`. Injecting it leaves prediction
+            and loss logic where it already lives.
+        stage: One of :data:`FUSION_STAGES`.
+        method: One of :data:`FUSION_METHODS`; used by ``intermediate`` and ``hybrid``.
+        fusion_dim: Width every modality is projected to, and of the fused vector.
+        auxiliary_heads: Hybrid only; attach a head to each modality.
+        combine_predictions: Hybrid only; blend the per-modality predictions into the
+            output instead of using the fused trunk alone.
+        modality_dropout: Probability of dropping each present modality in training.
+        **method_kwargs: Method-specific options, e.g. ``rank`` for ``"lowrank"``.
+
+    Raises:
+        NotImplementedError: If ``stage`` is ``"early"``.
+        ValueError: If ``stage`` is unknown or fewer than two modalities are given.
+    """
+
+    def __init__(
+        self,
+        embedders: Mapping[str, nn.Module],
+        head_factory: Callable[[int], nn.Module],
+        stage: str = "intermediate",
+        method: str = "concat",
+        fusion_dim: int = 256,
+        auxiliary_heads: bool = True,
+        combine_predictions: bool = False,
+        modality_dropout: float = 0.0,
+        **method_kwargs,
+    ) -> None:
+        super().__init__()
+        if stage == "early":
+            raise NotImplementedError(
+                "early fusion combines raw modalities before any modality-specific "
+                "encoding, which this pipeline cannot do because it starts from "
+                "extracted features; use 'intermediate' to fuse those features"
+            )
+        if stage not in FUSION_STAGES:
+            raise ValueError(f"unknown fusion stage {stage!r}; available: {FUSION_STAGES}")
+        if not embedders:
+            raise ValueError("at least one modality is required")
+
+        self.modalities = list(embedders)
+        self.stage = stage
+        self.fusion_dim = fusion_dim
+        self.modality_dropout = modality_dropout
+        self.combine_predictions = combine_predictions
+
+        self.embedders = nn.ModuleDict(dict(embedders))
+        self.projections = nn.ModuleDict(
+            {name: nn.Linear(_embedder_dim(name, embedders[name]), fusion_dim) for name in self.modalities}
+        )
+
+        if stage == "late":
+            self.fusion = None
+            self.head = None
+            self.modality_heads = nn.ModuleDict({name: head_factory(fusion_dim) for name in self.modalities})
+            self.weights = nn.Parameter(torch.zeros(len(self.modalities)))
+            return
+
+        # With one modality there is nothing to fuse: the projection is the
+        # representation, which lets a unimodal baseline share this code path.
+        self.fusion = (
+            build_fusion(method, [fusion_dim] * len(self.modalities), fusion_dim, **method_kwargs)
+            if len(self.modalities) > 1
+            else None
+        )
+        self.head = head_factory(self.fusion.output_dim if self.fusion else fusion_dim)
+        self.modality_heads = (
+            nn.ModuleDict({name: head_factory(fusion_dim) for name in self.modalities})
+            if stage == "hybrid" and auxiliary_heads
+            else None
+        )
+        # Only created where it is used: an unused parameter would still be decayed
+        # by the optimiser and would trip distributed training's unused-parameter check.
+        # The fused trunk always votes; each modality votes only when present.
+        self.weights = nn.Parameter(torch.zeros(1 + len(self.modalities))) if combine_predictions else None
+
+    def forward(
+        self,
+        modalities: Mapping[str, torch.Tensor],
+        present: Mapping[str, torch.Tensor] | None = None,
+    ) -> MultimodalOutput:
+        """Embed, fuse and predict.
+
+        Args:
+            modalities: One entry per modality, keyed by name. Each is whatever that
+                modality's embedder accepts.
+            present: ``(batch,)`` boolean per modality, as carried by
+                :class:`~kalecancer.loaddata.sample.PatientBatch`. ``None`` treats
+                every modality as present.
+
+        Raises:
+            KeyError: If a configured modality is absent from ``modalities``.
+        """
+        missing = set(self.modalities) - set(modalities)
+        if missing:
+            raise KeyError(f"missing input for modalities {sorted(missing)}")
+
+        embeddings = [self.projections[name](self.embedders[name](modalities[name])) for name in self.modalities]
+        mask = self._resolve_mask(present, embeddings[0])
+
+        if self.stage == "late":
+            predictions = {
+                name: self.modality_heads[name](embedding)
+                for name, embedding in zip(self.modalities, embeddings, strict=True)
+            }
+            stacked = torch.stack([predictions[name] for name in self.modalities])
+            return MultimodalOutput(
+                prediction=self._combine(stacked, mask.t(), self.weights),
+                modality_predictions=predictions,
+            )
+
+        representation = self.fusion(embeddings, mask) if self.fusion else embeddings[0]
+        fused = self.head(representation)
+        if self.modality_heads is None:
+            return MultimodalOutput(prediction=fused, representation=representation)
+
+        predictions = {
+            name: self.modality_heads[name](embedding)
+            for name, embedding in zip(self.modalities, embeddings, strict=True)
+        }
+        if not self.combine_predictions:
+            return MultimodalOutput(
+                prediction=fused,
+                representation=representation,
+                modality_predictions=predictions,
+            )
+
+        stacked = torch.stack([fused] + [predictions[name] for name in self.modalities])
+        available = torch.cat([torch.ones(mask.shape[0], 1, device=mask.device), mask], dim=1)
+        return MultimodalOutput(
+            prediction=self._combine(stacked, available.t(), self.weights),
+            representation=representation,
+            modality_predictions=predictions,
+        )
+
+    def _resolve_mask(self, present: Mapping[str, torch.Tensor] | None, reference: torch.Tensor) -> torch.Tensor:
+        batch_size, device = reference.shape[0], reference.device
+        if present is None:
+            mask = torch.ones(batch_size, len(self.modalities), device=device)
+        else:
+            mask = torch.stack([present[name].to(device).float() for name in self.modalities], dim=1)
+        return modality_dropout(mask, self.modality_dropout) if self.training else mask
+
+    @staticmethod
+    def _combine(stacked: torch.Tensor, availability: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """Weighted mean over the leading axis, ignoring unavailable contributors."""
+        combined = torch.softmax(weights, dim=0).unsqueeze(1) * availability
+        combined = combined / combined.sum(dim=0, keepdim=True).clamp_min(torch.finfo(combined.dtype).eps)
+        while combined.dim() < stacked.dim():
+            combined = combined.unsqueeze(-1)
+        return (stacked * combined).sum(dim=0)
+
+
+def multimodal_cox_loss(
+    output: MultimodalOutput,
+    times: torch.Tensor,
+    events: torch.Tensor,
+    auxiliary_weight: float = 0.0,
+) -> torch.Tensor:
+    """Cox loss on the prediction, optionally supervising each modality too.
+
+    The auxiliary term keeps every embedder learning when one modality dominates. It
+    is averaged over modalities so its scale does not depend on how many there are.
+
+    Args:
+        output: Prediction from :class:`MultimodalFusion`.
+        times: ``(batch,)`` event or censoring times.
+        events: ``(batch,)`` indicator, 1 observed and 0 censored.
+        auxiliary_weight: Weight on the mean per-modality loss. 0 disables it.
+    """
+    mask = as_event_mask(events)
+    loss = neg_partial_log_likelihood(output.prediction, times, mask)
+    if auxiliary_weight <= 0 or not output.modality_predictions:
+        return loss
+
+    auxiliary = torch.stack(
+        [neg_partial_log_likelihood(prediction, times, mask) for prediction in output.modality_predictions.values()]
+    )
+    return loss + auxiliary_weight * auxiliary.mean()

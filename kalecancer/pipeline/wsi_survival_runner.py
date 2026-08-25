@@ -7,6 +7,7 @@ splitting, training, evaluation, and attention export.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import pandas as pd
@@ -24,8 +25,9 @@ from kalecancer.evaluate.survival_report import (
     summarise_folds,
 )
 from kalecancer.interpret.attention import export_attention
+from kalecancer.loaddata.clinical_access import EndpointSpec
 from kalecancer.loaddata.cohort import build_cohort
-from kalecancer.loaddata.hancock import resolve_dataset
+from kalecancer.loaddata.dataset_access import resolve_paths
 from kalecancer.loaddata.split import k_fold_splits, train_val_test_split
 from kalecancer.loaddata.wsi_dataset import WSIFeatureDataset, collate_bags
 from kalecancer.pipeline.wsi_survival_trainer import WSISurvivalTrainer
@@ -33,8 +35,6 @@ from kalecancer.utils.io import ensure_dir, write_json
 from kalecancer.utils.seed import seed_worker, set_seed
 
 logger = logging.getLogger(__name__)
-
-GROUP_KEY = "patient_id"
 
 
 class PipelineError(RuntimeError):
@@ -53,7 +53,7 @@ def _build_loader(dataset: WSIFeatureDataset, cfg: CfgNode, shuffle: bool) -> Da
     )
 
 
-def _build_datasets(cohort: pd.DataFrame, split: dict, cfg: CfgNode) -> dict[str, WSIFeatureDataset]:
+def _build_datasets(cohort: pd.DataFrame, split: dict, cfg: CfgNode, group_key: str) -> dict[str, WSIFeatureDataset]:
     """Training subsamples patches to bound memory; evaluation keeps whole bags.
 
     ``train_eval`` re-reads the training patients without subsampling, so the baseline
@@ -64,7 +64,7 @@ def _build_datasets(cohort: pd.DataFrame, split: dict, cfg: CfgNode) -> dict[str
     def dataset(name: str, max_patches: int | None = None) -> WSIFeatureDataset:
         return WSIFeatureDataset(
             cohort.iloc[split[name]],
-            group_key=GROUP_KEY,
+            group_key=group_key,
             expected_dim=cfg.MODEL.INPUT_DIM,
             max_patches=max_patches,
             seed=cfg.SOLVER.SEED,
@@ -78,7 +78,9 @@ def _build_datasets(cohort: pd.DataFrame, split: dict, cfg: CfgNode) -> dict[str
     }
 
 
-def run_split(cohort: pd.DataFrame, split: dict, cfg: CfgNode, out_dir: str | Path) -> dict:
+def run_split(
+    cohort: pd.DataFrame, split: dict, cfg: CfgNode, out_dir: str | Path, group_key: str = "patient_id"
+) -> dict:
     """Train and evaluate one train/validation/test split.
 
     Args:
@@ -91,8 +93,8 @@ def run_split(cohort: pd.DataFrame, split: dict, cfg: CfgNode, out_dir: str | Pa
         Metrics keyed by split name.
     """
     out_dir = ensure_dir(out_dir)
-    logger.info("split sizes: %s", split_summary(cohort, split, GROUP_KEY))
-    datasets = _build_datasets(cohort, split, cfg)
+    logger.info("split sizes: %s", split_summary(cohort, split, group_key))
+    datasets = _build_datasets(cohort, split, cfg, group_key)
 
     train_loader = _build_loader(datasets["train"], cfg, shuffle=True)
     val_loader = _build_loader(datasets["val"], cfg, shuffle=False)
@@ -147,11 +149,17 @@ def run_split(cohort: pd.DataFrame, split: dict, cfg: CfgNode, out_dir: str | Pa
     return metrics
 
 
-def run(cfg: CfgNode) -> dict:
+def run(
+    cfg: CfgNode,
+    endpoint: EndpointSpec,
+    fetch: Callable[[], tuple[Path, Path]] | None = None,
+) -> dict:
     """Run the WSI survival pipeline described by ``cfg``.
 
     Args:
         cfg: Pipeline configuration, see :func:`kalecancer.config.get_cfg_defaults`.
+        endpoint: How the clinical columns define the survival endpoint.
+        fetch: Supplies the data when ``DATASET.SOURCE`` is not ``"local"``.
 
     Returns:
         Metrics for the run; cross-validation additionally reports fold aggregates.
@@ -163,15 +171,16 @@ def run(cfg: CfgNode) -> dict:
     out_dir = ensure_dir(cfg.OUTPUT.OUT_DIR)
     (out_dir / "config.yaml").write_text(cfg.dump(), encoding="utf-8")
 
-    feature_root, clinical_path = resolve_dataset(cfg)
+    group_key = cfg.DATASET.GROUP_KEY
+    feature_root, clinical_path = resolve_paths(cfg, fetch)
     cohort = build_cohort(
         feature_root=feature_root,
         clinical_path=clinical_path,
-        endpoint=cfg.SURVIVAL.ENDPOINT,
+        endpoint=endpoint,
         expected_dim=cfg.MODEL.INPUT_DIM,
         validate_features=cfg.DATASET.VALIDATE_FEATURES,
     )
-    summary = cohort_summary(cohort, GROUP_KEY)
+    summary = cohort_summary(cohort, group_key)
     log_cohort_summary(summary)
     write_json(out_dir / "cohort_summary.json", summary)
 
@@ -181,25 +190,29 @@ def run(cfg: CfgNode) -> dict:
         )
 
     split_options = {
-        "group_key": GROUP_KEY,
+        "group_key": group_key,
         "stratify_keys": list(cfg.DATASET.STRATIFY_KEYS),
         "val_ratio": cfg.DATASET.VAL_RATIO,
         "seed": cfg.SOLVER.SEED,
     }
     if cfg.DATASET.NUM_FOLDS:
         folds = k_fold_splits(cohort, num_folds=cfg.DATASET.NUM_FOLDS, **split_options)
-        fold_metrics = [run_split(cohort, split, cfg, out_dir / f"fold_{index}") for index, split in enumerate(folds)]
+        fold_metrics = [
+            run_split(cohort, split, cfg, out_dir / f"fold_{index}", group_key) for index, split in enumerate(folds)
+        ]
         cross_validated = summarise_folds(fold_metrics)
         metrics = {"cross_validated": cross_validated, "folds": fold_metrics}
         write_json(out_dir / "metrics.json", metrics)
-        logger.info(
-            "cross-validated test C-index: %.4f +/- %.4f",
-            cross_validated["c_index"]["mean"],
-            cross_validated["c_index"]["std"],
-        )
+        # A fold whose test split holds no comparable pair reports no C-index, so the
+        # headline is only logged when at least one fold produced one.
+        c_index = cross_validated.get("c_index")
+        if c_index:
+            logger.info("cross-validated test C-index: %.4f +/- %.4f", c_index["mean"], c_index["std"])
+        else:
+            logger.warning("no fold produced a C-index; see %s", out_dir / "metrics.json")
     else:
         split = train_val_test_split(cohort, test_ratio=cfg.DATASET.TEST_RATIO, **split_options)
-        metrics = run_split(cohort, split, cfg, out_dir)
+        metrics = run_split(cohort, split, cfg, out_dir, group_key)
 
     logger.info("artefacts written to %s", out_dir)
     return metrics
