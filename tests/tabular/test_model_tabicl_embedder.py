@@ -12,7 +12,7 @@ pins the ordering ones, which the real model could not do any better.
 
 The properties that genuinely need the real weights -- how much a context change
 moves a representation, and that the rows being embedded do not see each other --
-are measured in ``examples/HANCOCK_tabular/`` and recorded in the module docstring.
+are measured in ``examples/hancock_tabular_survival/`` and recorded in the module docstring.
 """
 
 from __future__ import annotations

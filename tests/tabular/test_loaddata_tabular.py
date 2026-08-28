@@ -11,10 +11,9 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from torch.utils.data import DataLoader
 
-from kalecancer.loaddata.base import NotFittedError
-from kalecancer.loaddata.sample import collate_samples
-from kalecancer.loaddata.tabular import TabularCohort
-from kalecancer.survival.survival_target import SurvivalTarget
+from kalecancer.loaddata import SurvivalTarget
+from kalecancer.loaddata.multimodal_access import collate_samples
+from kalecancer.loaddata.tabular_access import NotFittedError, TabularCohort
 from tests.tabular.conftest import (
     CATEGORICAL,
     CONTINUOUS,

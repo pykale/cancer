@@ -66,9 +66,6 @@ dev = [
     "lifelines",
 ]
 
-[project.scripts]
-kalecancer = "kalecancer.cli:main"
-
 [project.urls]
 Homepage = "https://github.com/pykale/cancer"
 Repository = "https://github.com/pykale/cancer"

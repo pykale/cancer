@@ -1,0 +1,28 @@
+DATASET:
+  SOURCE: "hancock"
+  # 0 fetches the whole published cohort.
+  PATIENTS: 0
+  MAX_PATCHES: 2048
+  NUM_WORKERS: 4
+  VAL_RATIO: 0.15
+  TEST_RATIO: 0.15
+
+MODEL:
+  INPUT_DIM: 1024
+  HIDDEN_DIM: 256
+  ATTENTION_DIM: 128
+  DROPOUT: 0.25
+
+SOLVER:
+  SEED: 2026
+  BASE_LR: 0.0001
+  MAX_EPOCHS: 30
+  BATCH_SIZE: 16
+  EARLY_STOP: 10
+
+SURVIVAL:
+  ENDPOINT: "OS"
+  EVAL_TIMES: [365.0, 1095.0, 1825.0]
+
+OUTPUT:
+  OUT_DIR: "outputs/hancock_wsi_survival"

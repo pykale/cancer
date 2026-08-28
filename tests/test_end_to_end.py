@@ -9,12 +9,35 @@ import pytest
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 
-from kalecancer.evaluate import cohort_summary, evaluate_predictions, predict_split, save_survival_report
+from examples.hancock.cohort import build_cohort, cohort_summary
+from kalecancer.evaluate import evaluate_predictions, predict_split, save_predictions
 from kalecancer.interpret import export_attention
-from kalecancer.loaddata import WSIFeatureDataset, build_cohort, collate_bags, train_val_test_split
-from kalecancer.pipeline import WSISurvivalTrainer
+from kalecancer.loaddata import ColumnTarget, FeatureBagSource, HoldOut, MultimodalDataset, collate_ragged
+from kalecancer.model.embed import BagEncoder
+from kalecancer.model.layers import AttentionMIL
+from kalecancer.pipeline import CohortTrainer, SurvivalTask
 from kalecancer.utils import set_seed
 from tests.conftest import FEATURE_DIM, OS_ENDPOINT, write_bag
+
+#: The modality name the bag source and the embedder agree on.
+MODALITY = "wsi"
+
+
+def bag_dataset(cohort, max_patches: int | None = None, group_key: str = "patient_id") -> MultimodalDataset:
+    """A whole-slide cohort: one bag source, as the runner builds it."""
+    paths = {group: list(rows["path"]) for group, rows in cohort.groupby(group_key)}
+    source = FeatureBagSource(paths, feature_dim=FEATURE_DIM, max_patches=max_patches, seed=0, with_coordinates=True)
+    target = ColumnTarget(
+        cohort.drop_duplicates(group_key), columns={"time": "duration", "event": "event"}, id_column=group_key
+    )
+    return MultimodalDataset(sorted(paths), {MODALITY: source}, target=target)
+
+
+def bag_trainer(**kwargs) -> CohortTrainer:
+    """A whole-slide model: one bag modality and a Cox head, on the one trainer."""
+    encoder = BagEncoder(AttentionMIL(input_dim=FEATURE_DIM, hidden_dim=8, attention_dim=4))
+    return CohortTrainer({MODALITY: encoder}, task=SurvivalTask(), fusion_dim=8, **kwargs)
+
 
 NUM_PATIENTS = 48
 
@@ -52,15 +75,14 @@ def test_pipeline_trains_evaluates_and_exports_attention(synthetic_cohort, tmp_p
     cohort = build_cohort(feature_root, clinical_path, endpoint=OS_ENDPOINT, expected_dim=FEATURE_DIM)
     assert cohort_summary(cohort)["num_matched_groups"] == NUM_PATIENTS
 
-    split = train_val_test_split(
-        cohort, val_ratio=0.2, test_ratio=0.2, group_key="patient_id", stratify_keys=["event"], seed=0
-    )
+    splitter = HoldOut(test_size=0.2, val_size=0.2, group_by="patient_id", stratify_by=["event"], random_state=0)
+    split = next(splitter.split(cohort))
 
     def loader(name, shuffle=False, max_patches=None):
-        dataset = WSIFeatureDataset(cohort.iloc[split[name]], expected_dim=FEATURE_DIM, max_patches=max_patches)
-        return DataLoader(dataset, batch_size=8, shuffle=shuffle, collate_fn=collate_bags, num_workers=0)
+        dataset = bag_dataset(cohort.iloc[split[name]], max_patches=max_patches)
+        return DataLoader(dataset, batch_size=8, shuffle=shuffle, collate_fn=collate_ragged, num_workers=0)
 
-    model = WSISurvivalTrainer(input_dim=FEATURE_DIM, hidden_dim=8, attention_dim=4, max_epochs=2)
+    model = bag_trainer(max_epochs=2)
     trainer = pl.Trainer(
         max_epochs=2, accelerator="cpu", devices=1, logger=False, enable_checkpointing=False, enable_progress_bar=False
     )
@@ -75,8 +97,8 @@ def test_pipeline_trains_evaluates_and_exports_attention(synthetic_cohort, tmp_p
         for prediction in predictions
     }
 
-    predictions_path, metrics_path = save_survival_report(out_dir, predictions, metrics)
-    attention_dir = export_attention(model, loader("test"), out_dir / "attention", top_k=3)
+    predictions_path, metrics_path = save_predictions(out_dir, predictions, metrics)
+    attention_dir = export_attention(model, loader("test"), out_dir / "attention", modality=MODALITY, top_k=3)
 
     assert predictions_path.exists() and metrics_path.exists()
     assert 0.0 <= metrics["test"]["c_index"] <= 1.0
@@ -87,24 +109,25 @@ def test_pipeline_trains_evaluates_and_exports_attention(synthetic_cohort, tmp_p
     assert prediction_ids == expected
 
     # Attention is exported per test patient, one row per patch of the full bag.
-    dataset = WSIFeatureDataset(cohort.iloc[split["test"]], expected_dim=FEATURE_DIM)
+    dataset = bag_dataset(cohort.iloc[split["test"]])
     for index in range(len(dataset)):
         sample = dataset[index]
-        exported = (attention_dir / f"{sample['group_id']}.csv").read_text(encoding="utf-8").strip().splitlines()
+        exported = (attention_dir / f"{sample.patient_id}.csv").read_text(encoding="utf-8").strip().splitlines()
         assert exported[0] == "patient_id,slide_id,x,y,attention"
-        assert len(exported) - 1 == sample["features"].shape[0]
+        assert len(exported) - 1 == sample.modalities[MODALITY].shape[0]
     assert (attention_dir / "top_patches.csv").exists()
 
 
 def test_risk_scores_are_one_per_patient(synthetic_cohort) -> None:
     feature_root, clinical_path = synthetic_cohort
     cohort = build_cohort(feature_root, clinical_path, endpoint=OS_ENDPOINT, expected_dim=FEATURE_DIM)
-    dataset = WSIFeatureDataset(cohort, expected_dim=FEATURE_DIM)
-    loader = DataLoader(dataset, batch_size=5, collate_fn=collate_bags, num_workers=0)
+    dataset = bag_dataset(cohort)
+    loader = DataLoader(dataset, batch_size=5, collate_fn=collate_ragged, num_workers=0)
 
-    model = WSISurvivalTrainer(input_dim=FEATURE_DIM, hidden_dim=8, attention_dim=4)
+    model = bag_trainer()
     batch = next(iter(loader))
-    risk, attentions = model.predict_risk(batch)
+    risk = model.predict(batch).prediction.reshape(-1)
+    attentions = model.embedders[MODALITY].last_attention
 
-    assert risk.shape == (len(batch["samples"]),)
-    assert [len(attention) for attention in attentions] == [sample["features"].shape[0] for sample in batch["samples"]]
+    assert risk.shape == (len(batch),)
+    assert [len(a) for a in attentions] == [bag.shape[0] for bag in batch.modalities[MODALITY]]

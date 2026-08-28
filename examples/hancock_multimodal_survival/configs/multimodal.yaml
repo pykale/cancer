@@ -1,0 +1,24 @@
+# Both modalities. Change FUSION.STAGE to late or hybrid, or FUSION.METHOD to poe,
+# without touching the example code.
+DATASET:
+  MODALITIES: ["clinical", "imaging"]
+  PATIENTS: 0
+  MAX_PATCHES: 512
+  NUM_WORKERS: 0
+MODEL:
+  INPUT_DIM: 1024
+  HIDDEN_DIM: 128
+  ATTENTION_DIM: 64
+SOLVER:
+  SEED: 2026
+  BASE_LR: 0.0003
+  MAX_EPOCHS: 30
+  BATCH_SIZE: 32
+  EARLY_STOP: 10
+FUSION:
+  STAGE: "intermediate"
+  METHOD: "concat"
+  FUSION_DIM: 64
+  AUXILIARY_WEIGHT: 0.3
+OUTPUT:
+  OUT_DIR: "outputs/hancock_multimodal_survival/multimodal"

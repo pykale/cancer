@@ -1,4 +1,4 @@
-"""Every name in kalecancer.survival/.evaluate's __all__ must be importable."""
+"""Every name a package advertises in ``__all__`` must actually be importable."""
 
 from __future__ import annotations
 
@@ -7,9 +7,10 @@ import importlib
 import pytest
 
 import kalecancer.evaluate
-import kalecancer.survival
+import kalecancer.loaddata
+import kalecancer.model
 
-PACKAGES = (kalecancer.survival, kalecancer.evaluate)
+PACKAGES = (kalecancer.loaddata, kalecancer.model, kalecancer.evaluate)
 
 
 @pytest.mark.parametrize("package", PACKAGES, ids=lambda pkg: pkg.__name__)

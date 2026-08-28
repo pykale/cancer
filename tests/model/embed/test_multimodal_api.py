@@ -6,8 +6,9 @@ import pytest
 import torch
 from torch import nn
 
-from kalecancer.model.embed import FUSION_STAGES, ConcatFusion, MultimodalFusion, multimodal_cox_loss
-from kalecancer.survival import CoxHead
+from kalecancer.model.embed import FUSION_STAGES, ConcatFusion, MultimodalFusion
+from kalecancer.model.predict import CoxHead
+from kalecancer.model.predict.losses import multimodal_cox_loss
 
 BATCH = 8
 RAW_DIMS = {"tabular": 10, "imaging": 64}
@@ -184,6 +185,7 @@ def test_hybrid_defaults_to_the_fused_trunk(embedders, modalities) -> None:
 
     output = model(modalities)
 
+    assert model.head is not None
     assert torch.allclose(output.prediction, model.head(output.representation), atol=1e-6)
 
 

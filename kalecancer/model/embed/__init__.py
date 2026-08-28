@@ -1,7 +1,12 @@
-"""Modality embedders (one modality in, one vector per sample out) and the fusion wrappers that combine them."""
+"""Modality embedders, and the fusion that combines them.
 
-from kalecancer.model.embed.attention_mil import AttentionMIL, BagEncoder, GatedAttention
-from kalecancer.model.embed.mlp import MLPEmbedder
+An embedder is one modality in, one vector per patient out. The blocks doing the
+transformation live in :mod:`kalecancer.model.layers`; what is added here is the
+contract fusion relies on. Fusion then combines several such vectors into one,
+whatever their modalities were.
+"""
+
+from kalecancer.model.embed.encoders import BagEncoder, MLPEmbedder
 from kalecancer.model.embed.multimodal_fusion import (
     FUSION_METHODS,
     FUSION_STAGES,
@@ -13,21 +18,15 @@ from kalecancer.model.embed.multimodal_fusion import (
     ProductOfExpertsFusion,
     build_fusion,
     modality_dropout,
-    multimodal_bce_loss,
-    multimodal_cox_loss,
 )
-from kalecancer.model.embed.protocols import Embedder
 from kalecancer.model.embed.tabicl import TabICLEmbedder
 
 __all__ = [
     "FUSION_METHODS",
     "FUSION_STAGES",
-    "AttentionMIL",
     "BagEncoder",
     "ConcatFusion",
-    "Embedder",
     "FusionBlock",
-    "GatedAttention",
     "LowRankFusion",
     "MLPEmbedder",
     "MultimodalFusion",
@@ -36,6 +35,4 @@ __all__ = [
     "TabICLEmbedder",
     "build_fusion",
     "modality_dropout",
-    "multimodal_bce_loss",
-    "multimodal_cox_loss",
 ]

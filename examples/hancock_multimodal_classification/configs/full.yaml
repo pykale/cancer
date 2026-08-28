@@ -1,0 +1,33 @@
+# The full comparison matrix: two endpoints x three published splits x three
+# modality settings, five repeats each. Hours of compute; resumable with --force
+# omitted, and shardable with --splits / --targets.
+DATASET:
+  SOURCE: "hancock"
+  PATIENTS: 0
+  MAX_PATCHES: 512
+  NUM_WORKERS: 0
+  VAL_RATIO: 0.15
+
+MODEL:
+  INPUT_DIM: 1024
+  HIDDEN_DIM: 256
+  ATTENTION_DIM: 128
+  DROPOUT: 0.25
+
+FUSION:
+  STAGE: "intermediate"
+  METHOD: "concat"
+  FUSION_DIM: 128
+
+SOLVER:
+  SEED: 2026
+  BASE_LR: 0.0003
+  MAX_EPOCHS: 20
+  BATCH_SIZE: 32
+  EARLY_STOP: 5
+
+CLASSIFY:
+  REPEATS: 5
+
+OUTPUT:
+  OUT_DIR: "outputs/hancock_multimodal_classification"

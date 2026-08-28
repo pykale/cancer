@@ -9,10 +9,8 @@ from kalecancer.model.embed import (
     FUSION_METHODS,
     ConcatFusion,
     LowRankFusion,
-    MultimodalOutput,
     ProductOfExpertsFusion,
     build_fusion,
-    multimodal_bce_loss,
 )
 
 INPUT_DIMS = [16, 8]
@@ -178,49 +176,3 @@ def test_three_modalities_are_supported() -> None:
 
     for method, kwargs in METHODS:
         assert build_fusion(method, dims, OUTPUT_DIM, **kwargs)(inputs).shape == (BATCH, OUTPUT_DIM)
-
-
-def test_bce_loss_is_finite_and_differentiable() -> None:
-    output = MultimodalOutput(prediction=torch.randn(6, 1, requires_grad=True), representation=None)
-    labels = torch.tensor([0.0, 1.0, 0.0, 1.0, 1.0, 0.0])
-
-    loss = multimodal_bce_loss(output, labels)
-    loss.backward()
-
-    assert torch.isfinite(loss)
-
-
-def test_bce_auxiliary_supervision_changes_the_objective() -> None:
-    prediction = torch.randn(6, 1)
-    labels = torch.tensor([0.0, 1.0, 0.0, 1.0, 1.0, 0.0])
-    output = MultimodalOutput(
-        prediction=prediction,
-        representation=None,
-        modality_predictions={"alpha": torch.randn(6, 1), "beta": torch.randn(6, 1)},
-    )
-
-    plain = multimodal_bce_loss(output, labels, auxiliary_weight=0.0)
-    auxiliary = multimodal_bce_loss(output, labels, auxiliary_weight=0.5)
-
-    assert not torch.isclose(plain, auxiliary)
-
-
-def test_bce_auxiliary_weight_is_ignored_without_modality_predictions() -> None:
-    output = MultimodalOutput(prediction=torch.randn(6, 1), representation=None)
-    labels = torch.tensor([0.0, 1.0, 0.0, 1.0, 1.0, 0.0])
-
-    assert torch.isclose(
-        multimodal_bce_loss(output, labels, auxiliary_weight=0.0),
-        multimodal_bce_loss(output, labels, auxiliary_weight=0.9),
-    )
-
-
-def test_positive_weighting_raises_the_cost_of_missing_positives() -> None:
-    """A weighted loss penalises the same wrong answer on a positive more heavily."""
-    output = MultimodalOutput(prediction=torch.full((4, 1), -2.0), representation=None)
-    labels = torch.tensor([1.0, 1.0, 0.0, 0.0])
-
-    plain = multimodal_bce_loss(output, labels)
-    weighted = multimodal_bce_loss(output, labels, pos_weight=torch.tensor(4.0))
-
-    assert weighted > plain

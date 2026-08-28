@@ -1,0 +1,31 @@
+# One cell, few epochs: checks the wiring end to end on real data. Useful for
+# validating the pipeline, not for reporting results.
+DATASET:
+  SOURCE: "hancock"
+  PATIENTS: 0
+  MAX_PATCHES: 128
+  NUM_WORKERS: 0
+
+MODEL:
+  INPUT_DIM: 1024
+  HIDDEN_DIM: 128
+  ATTENTION_DIM: 64
+  DROPOUT: 0.25
+
+FUSION:
+  STAGE: "intermediate"
+  METHOD: "concat"
+  FUSION_DIM: 64
+
+SOLVER:
+  SEED: 2026
+  BASE_LR: 0.0005
+  MAX_EPOCHS: 3
+  BATCH_SIZE: 32
+  EARLY_STOP: 0
+
+CLASSIFY:
+  REPEATS: 1
+
+OUTPUT:
+  OUT_DIR: "outputs/hancock_multimodal_classification_quick"

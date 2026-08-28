@@ -1,1 +1,0 @@
-"""HANCOCK outcome classification example."""

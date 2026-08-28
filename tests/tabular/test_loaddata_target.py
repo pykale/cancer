@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 import torch
 
-from kalecancer.survival.survival_target import SurvivalTarget
+from kalecancer.loaddata import SurvivalTarget
 from tests.tabular.conftest import EVENT_COLUMN, EVENT_VALUE, TIME_COLUMN
 
 

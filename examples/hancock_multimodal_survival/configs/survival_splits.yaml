@@ -1,0 +1,45 @@
+# Survival across all three published splits.
+#
+# Same Cox pipeline as the other configs; only the train/test assignment varies, so
+# the three runs show how far the model carries beyond the patients it was fitted on.
+# Drive the arms and splits with overrides:
+#
+#   DATASET.SPLIT_FILE dataset_split_out.json
+#   DATASET.MODALITIES "['imaging']"
+#   FUSION.STAGE late
+#
+# REQUIRE_MODALITIES keeps every arm on the patients that have slide features, so the
+# unimodal and fused numbers are commensurable.
+DATASET:
+  SOURCE: "hancock"
+  SPLIT_FILE: "dataset_split_in.json"
+  MODALITIES: ["clinical", "imaging"]
+  REQUIRE_MODALITIES: ["imaging"]
+  MAX_PATCHES: 512
+  NUM_WORKERS: 0
+  VAL_RATIO: 0.15
+
+MODEL:
+  INPUT_DIM: 1024
+  HIDDEN_DIM: 256
+  ATTENTION_DIM: 128
+  DROPOUT: 0.25
+
+FUSION:
+  STAGE: "intermediate"
+  METHOD: "concat"
+  FUSION_DIM: 128
+
+SOLVER:
+  SEED: 2026
+  BASE_LR: 0.0003
+  MAX_EPOCHS: 20
+  BATCH_SIZE: 32
+  EARLY_STOP: 5
+
+SURVIVAL:
+  ENDPOINT: "OS"
+  EVAL_TIMES: [365.0, 730.0, 1095.0]
+
+OUTPUT:
+  OUT_DIR: "outputs/hancock_survival_splits"
