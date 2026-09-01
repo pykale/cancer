@@ -108,7 +108,7 @@ def umap_grid(root: Path, out: Path) -> Path:
             groups = (
                 [(0, "living", "#4575b4"), (1, "deceased", "#d73027")]
                 if colour_by == "label"
-                else [("training", "training", "#bdbdbd"), ("test", "test", "#7b3294")]
+                else [(0, "training", "#bdbdbd"), (1, "test", "#7b3294")]
             )
             for value, name, colour in groups:
                 subset = points[points[colour_by] == value]

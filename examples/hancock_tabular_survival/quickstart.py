@@ -35,7 +35,7 @@ cohort = TabularCohort(
     source=DATA_LOC,
     identifier="patient_id",
     target=target,
-    continuous=["age_at_initial_diagnosis", "year_of_initial_diagnosis"],
+    continuous=["age_at_initial_diagnosis"],
     continuous_transform=[SimpleImputer(strategy="median"), StandardScaler()],
     categorical=["sex", "smoking_status", "primarily_metastasis"],
     categorical_transform=[

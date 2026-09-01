@@ -35,7 +35,7 @@ def get_cfg_defaults() -> CfgNode:
 
     # The clinical table: which columns are used, and how each role is encoded.
     cfg.TABULAR = CfgNode()
-    cfg.TABULAR.CONTINUOUS = ["age_at_initial_diagnosis", "year_of_initial_diagnosis"]
+    cfg.TABULAR.CONTINUOUS = ["age_at_initial_diagnosis"]
     cfg.TABULAR.CATEGORICAL = ["sex", "smoking_status", "primarily_metastasis"]
     # TabICL conditions its representation on labelled context rows, taken from the
     # training split only. The checkpoint downloads from Hugging Face on first use.

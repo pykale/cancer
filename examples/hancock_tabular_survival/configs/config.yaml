@@ -27,7 +27,6 @@ features:
   continuous:
     columns:
       - age_at_initial_diagnosis
-      - year_of_initial_diagnosis
     transform:
       - SimpleImputer: {strategy: median}
       - StandardScaler: {}

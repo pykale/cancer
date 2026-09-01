@@ -45,7 +45,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeAlias
 
 import numpy as np
 import pandas as pd
@@ -59,7 +59,7 @@ from kalecancer.loaddata.wsi_access import read_feature_bag
 #: One modality's value in a batch: a stacked tensor, or a list of per-patient bags
 #: that were left ragged rather than padded. Bag-pooling embedders consume the list
 #: form directly, which avoids padding to the largest bag in the batch.
-ModalityValue = Tensor | list[Tensor]
+ModalityValue: TypeAlias = Tensor | list[Tensor]
 
 
 @dataclass(slots=True)
