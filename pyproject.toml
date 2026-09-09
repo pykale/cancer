@@ -32,7 +32,7 @@ dependencies = [
     "certifi",
     "yacs",
     "h5py",
-    "pykale",
+    "pykale>=0.2.0",
     "pytorch-lightning",
 ]
 
