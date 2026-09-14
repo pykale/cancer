@@ -32,7 +32,7 @@ dependencies = [
     "certifi",
     "yacs",
     "h5py",
-    "pykale",
+    "pykale>=0.2.0",
     "pytorch-lightning",
 ]
 
@@ -53,6 +53,7 @@ pathology = [
 interpret = [
     "shap",
     "captum",
+    "umap-learn",
 ]
 dev = [
     "pytest",
@@ -64,9 +65,6 @@ dev = [
     "twine",
     "lifelines",
 ]
-
-[project.scripts]
-kalecancer = "kalecancer.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/pykale/cancer"

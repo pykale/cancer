@@ -27,12 +27,11 @@ KaleCancer enforces the same *standardization* and *minimalism* as PyKale, via g
 - `loaddata` loads data from disk or online resources as input, including cohort matching and leakage-safe splitting
 - `prepdata` preprocesses data to fit machine learning modules below (transforms)
 - `model.embed` embeds data in a new space to learn a new representation (attention multiple-instance learning over patch bags, tabular encoders, and multimodal fusion)
-- `model.predict` predicts a desired output (classification and regression heads, planned)
-- `survival` models time-to-event outcomes: Cox proportional-hazards head, partial-likelihood loss, concordance, and baseline hazard
+- `model.predict` turns a representation into a score: `LinearHead` and `CoxHead`, with the losses that train them
 - `evaluate` evaluates the performance using some metrics, including IPCW time-dependent AUC and the integrated Brier score
 - `interpret` interprets the features and outputs via post-prediction analysis mainly via visualization
-- `pipeline` specifies a machine learning workflow by combining several other modules
 - `auto` selects and constructs a workflow from a configuration alone (`AutoCancer*` classes, planned)
+- `pipeline` specifies a machine learning workflow by combining several other modules: a *trainer* says where the data comes from, a *task* (`SurvivalTask`, `ClassificationTask`) says what is predicted from it, and any trainer takes any task
 
 #### Example usage
 
@@ -72,18 +71,18 @@ Browse through the [**examples**](https://github.com/pykale/cancer/tree/main/exa
 
 ```bash
 # Whole-slide pathology only: attention MIL with a Cox head
-python examples/wsi_survival/main.py --cfg examples/wsi_survival/configs/hancock_primary_tumour_quick.yaml
+python -m examples.hancock_wsi_survival.main --cfg examples/hancock_wsi_survival/configs/hancock_primary_tumour_quick.yaml
 
 # Clinical records only, imaging only, or both, on the official HANCOCK split
-python examples/hancock_multimodal/main.py --cfg examples/hancock_multimodal/configs/tabular.yaml
-python examples/hancock_multimodal/main.py --cfg examples/hancock_multimodal/configs/imaging.yaml
-python examples/hancock_multimodal/main.py --cfg examples/hancock_multimodal/configs/multimodal.yaml
+python -m examples.hancock_multimodal_survival.main --cfg examples/hancock_multimodal_survival/configs/tabular.yaml
+python -m examples.hancock_multimodal_survival.main --cfg examples/hancock_multimodal_survival/configs/imaging.yaml
+python -m examples.hancock_multimodal_survival.main --cfg examples/hancock_multimodal_survival/configs/multimodal.yaml
 
 # How the modalities combine is a configuration change, not a code change
-python examples/hancock_multimodal/main.py --cfg examples/hancock_multimodal/configs/multimodal.yaml FUSION.STAGE late
+python -m examples.hancock_multimodal_survival.main --cfg examples/hancock_multimodal_survival/configs/multimodal.yaml FUSION.STAGE late
 ```
 
-Each example follows the standardized structure of `main.py`, `config.py`, and `configs/*.yaml`, so an experiment is described by its configuration rather than by edited code. See [multimodal fusion](https://github.com/pykale/cancer/blob/main/docs/multimodal_fusion.md) for the fusion stages and methods available, and the [WSI survival pipeline](https://github.com/pykale/cancer/tree/main/examples/wsi_survival) for inputs, configuration, and outputs in detail.
+Each example follows the standardized structure of `main.py`, `config.py`, and `configs/*.yaml`, so an experiment is described by its configuration rather than by edited code. See [multimodal fusion](https://github.com/pykale/cancer/blob/main/docs/multimodal_fusion.md) for the fusion stages and methods available, and the [WSI survival pipeline](https://github.com/pykale/cancer/tree/main/examples/hancock_wsi_survival) for inputs, configuration, and outputs in detail.
 
 Ask questions on [PyKale's GitHub Discussions tab](https://github.com/pykale/pykale/discussions) if you need help or create an [issue](https://github.com/pykale/cancer/issues) if you find something wrong.
 

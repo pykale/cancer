@@ -27,17 +27,32 @@ _C.DATASET.REGION = "primary"
 _C.DATASET.PATIENTS = 0
 # Cache for fetched data. Empty uses ~/.cache/kalecancer.
 _C.DATASET.CACHE_DIR = ""
+# Which published train/test assignment to apply, for a dataset that offers several.
+# Empty here because the filename is the dataset's; an experiment configuration names it.
+_C.DATASET.SPLIT_FILE = ""
 # Read every file's header at start-up to reject invalid bags before training.
 _C.DATASET.VALIDATE_FEATURES = True
 # Cap on patches per bag during training, bounding memory for large slides.
 # Evaluation and interpretation always use the full bag. 0 disables the cap.
 _C.DATASET.MAX_PATCHES = 2048
 _C.DATASET.NUM_WORKERS = 4
-# Share of the cohort held out for validation and testing; training takes the rest.
+# How the test set is chosen. Three modes, in the order they are preferred:
+#
+#   "published"  the dataset's own train/test assignment, so a number is comparable
+#                with other work on the cohort. The default, and what every example
+#                uses; needs a dataset that publishes one.
+#   "cv"         NUM_FOLDS-fold cross-validation over the whole cohort, for when a
+#                single held-out split is too small to be informative.
+#   "random"     a fresh stratified split using the ratios below.
+#
+# Validation is always carved out of the training half, never out of the test set.
+_C.DATASET.SPLIT_MODE = "published"
+# Share of the cohort held out for validation, and for testing when SPLIT_MODE is
+# "random". Validation is taken from the training half in every mode.
 _C.DATASET.VAL_RATIO = 0.15
 _C.DATASET.TEST_RATIO = 0.15
-# Number of cross-validation folds. 0 uses the ratios above instead.
-_C.DATASET.NUM_FOLDS = 0
+# Number of folds when SPLIT_MODE is "cv".
+_C.DATASET.NUM_FOLDS = 5
 # Cohort column whose samples must never be split across sets.
 _C.DATASET.GROUP_KEY = "patient_id"
 # Cohort columns whose distribution is preserved across splits. Samples sharing a
@@ -104,10 +119,12 @@ _C.SURVIVAL = CfgNode()
 # Label for the endpoint, used when reporting the cohort.
 _C.SURVIVAL.ENDPOINT = "OS"
 # Which clinical columns define it, and which values count as an observed event.
-# These name the source dataset's columns, so an experiment configuration sets them.
-_C.SURVIVAL.TIME_FIELD = "days_to_last_information"
-_C.SURVIVAL.STATUS_FIELD = "survival_status"
-_C.SURVIVAL.EVENT_VALUES = ["deceased"]
+# Empty here because these name the source dataset's columns; an experiment
+# configuration sets them, and leaving a dataset's names as the default would apply
+# them silently to a cohort that spells its columns differently.
+_C.SURVIVAL.TIME_FIELD = ""
+_C.SURVIVAL.STATUS_FIELD = ""
+_C.SURVIVAL.EVENT_VALUES = []
 # Status values that cannot be classified for this endpoint; excluded rather than
 # assumed censored.
 _C.SURVIVAL.UNKNOWN_VALUES = []

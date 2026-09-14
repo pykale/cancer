@@ -9,7 +9,7 @@ import h5py
 import numpy as np
 import pytest
 
-from kalecancer.loaddata.clinical_access import EndpointSpec
+from examples.hancock.clinical import EndpointSpec
 
 FEATURE_DIM = 8
 
@@ -61,6 +61,6 @@ def clinical_path(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def cohort(feature_root: Path, clinical_path: Path):
-    from kalecancer.loaddata import build_cohort
+    from examples.hancock.cohort import build_cohort
 
     return build_cohort(feature_root, clinical_path, endpoint=OS_ENDPOINT, expected_dim=FEATURE_DIM)

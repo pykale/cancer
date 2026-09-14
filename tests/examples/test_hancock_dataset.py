@@ -9,9 +9,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from examples.wsi_survival.hancock import HancockDataset
-from kalecancer.loaddata import dataset_access
-from kalecancer.loaddata.dataset_access import DatasetAccessError, resolve_paths
+from examples.hancock.dataset import HancockDataset
+from kalecancer.loaddata import archive_access as dataset_access
+from examples.hancock.dataset import resolve_paths
+from kalecancer.loaddata.archive_access import DatasetAccessError
 
 PATIENTS = ["001", "002", "003", "004"]
 
@@ -136,7 +137,7 @@ def test_local_source_returns_the_configured_paths() -> None:
 def test_a_remote_source_uses_the_supplied_fetcher(local_archives: Path) -> None:
     """The library resolves paths; the experiment supplies the dataset."""
     from kalecancer.config import get_cfg_defaults
-    from examples.wsi_survival.hancock import fetch_for
+    from examples.hancock.dataset import fetch_for
 
     cfg = get_cfg_defaults()
     cfg.DATASET.SOURCE = "hancock"

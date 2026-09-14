@@ -1,7 +1,9 @@
 """KaleCancer: cancer-domain machine learning for the PyKale ecosystem.
 
 Organised as a verb-oriented pipeline (load → prep → model → evaluate → interpret),
-with ``auto`` for high-level construction and ``survival`` for time-to-event tasks.
+with ``auto`` for high-level construction. Time-to-event support is not a stage of
+its own: the head and loss are in ``model.predict``, the metrics in ``evaluate``, and
+the supervision in ``loaddata``.
 """
 
 from importlib import import_module
@@ -16,7 +18,6 @@ _SUBMODULES = frozenset(
         "prepdata",
         "model",
         "pipeline",
-        "survival",
         "evaluate",
         "interpret",
         "utils",

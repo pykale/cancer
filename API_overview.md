@@ -35,7 +35,7 @@ cohort = TabularDataset(
         unit="days",
     ),
 
-    continuous=["age_at_initial_diagnosis", "year_of_initial_diagnosis"],
+    continuous=["age_at_initial_diagnosis"],
     continuous_transform=[SimpleImputer(strategy="median"), StandardScaler()],
 
     categorical=["sex", "smoking_status", "primarily_metastasis"],

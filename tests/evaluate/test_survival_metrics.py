@@ -5,14 +5,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from examples.synthetic_data import make_synthetic_survival
 from kalecancer.evaluate.survival_metrics import (
+    breslow_baseline_hazard,
     integrated_brier,
     kaplan_meier_groups,
+    predict_survival_function,
     time_dependent_auc,
     usable_eval_times,
 )
-from kalecancer.survival.baseline import breslow_baseline_hazard, predict_survival_function
-from kalecancer.survival.synthetic import make_synthetic_survival
 
 _N_TRAIN = 700
 

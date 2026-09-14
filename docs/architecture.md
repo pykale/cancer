@@ -10,11 +10,12 @@ below records what is now built. Items marked **Open question** are unresolved.
 | Attention MIL encoder | Implemented |
 | Cox head, loss, and survival metrics | Implemented, using TorchSurv |
 | Attention interpretation | Implemented |
-| Multimodal fusion (early, late, hybrid) | Implemented as model APIs; no multimodal cohort loader yet |
-| CT/MRI and tabular encoders, `prepdata` transforms, `auto` classes | Planned |
+| Multimodal fusion (early, late, hybrid) | Implemented, with a multimodal cohort loader |
+| Binary classification alongside survival | Implemented, as a swappable `PredictionTask` |
+| CT/MRI encoders | Planned |
 
 For usage rather than rationale, see the [quickstart](quickstart.md), the
-[WSI pipeline reference](../examples/wsi_survival/) and the
+[WSI pipeline reference](../examples/hancock_wsi_survival/) and the
 [fusion reference](multimodal_fusion.md).
 
 ---
@@ -129,7 +130,7 @@ Overall survival and disease-free survival **compete** — a patient who dies ca
 
 Survival labels follow a fixed contract: `time` is the time from baseline to event or censoring in a config-defined unit, and `event` is `1` when observed and `0` when censored. Competing-risk models will add an optional `event_type` naming the event category.
 
-Metrics and their leakage rules are documented in the [WSI pipeline reference](../examples/wsi_survival/).
+Metrics and their leakage rules are documented in the [WSI pipeline reference](../examples/hancock_wsi_survival/).
 
 ### Reference implementation: TorchSurv
 
@@ -179,8 +180,6 @@ Components will be built and tested against **synthetic data first**. This defin
 
 Public data will come first. Private NHS integration will reuse the same contracts proven on synthetic and public data, with additional governance and access controls outside this package.
 
-Auto-configuration classes (`kalecancer.auto.AutoCancer*`) will be added once individual stages stabilise, providing a single entry point for clinical collaborators who prefer config files over composing pipelines manually.
-
 ---
 
 ## Resolved questions
@@ -189,6 +188,8 @@ Auto-configuration classes (`kalecancer.auto.AutoCancer*`) will be added once in
 | --- | --- |
 | **Which public dataset** to validate against | **HANCOCK** (763 head and neck patients, CC BY 4.0). Pre-extracted UNI encodings are part of the release and are streamed directly from the published archives. |
 | **Where `embed` and `predict` live** | Kept merged under `model/`, with a separate `pipeline/` for trainers and runners, mirroring `kale.pipeline`. |
+| **One trainer per task and modality, or one trainer** | One. `CohortTrainer` takes a set of modality embedders and a `PredictionTask`; neither constrains the other, so a whole-slide survival model and a multimodal classifier are the same class with different arguments. A bag of patches is an ordinary modality whose value is a list rather than a stacked tensor, which is what removed the need for a whole-slide trainer. A task decides exactly four things — head, loss, whether a batch carries a gradient, and the epoch metric — so a new endpoint costs a task, not a trainer. |
+| **Where orchestration lives** | In `examples/`, not in the library. Assembling a cohort, choosing splits, naming an endpoint and writing a report are experiment concerns; anything naming a dataset or a configuration key is an experiment. The library supplies the pieces an experiment composes. |
 | **Survival library** | TorchSurv, as planned. `LowRankTensorFusion` is the one PyKale component reimplemented rather than reused, because its parameters are not registered with the module. |
 
 ## Open questions
@@ -204,7 +205,7 @@ Auto-configuration classes (`kalecancer.auto.AutoCancer*`) will be added once in
 ## Related documents
 
 - [Quickstart](quickstart.md) — running the pipeline
-- [WSI survival pipeline](../examples/wsi_survival/) — inputs, configuration, outputs
+- [WSI survival pipeline](../examples/hancock_wsi_survival/) — inputs, configuration, outputs
 - [Multimodal fusion](multimodal_fusion.md) — fusion APIs
 - [AGENTS.md](../AGENTS.md) — conventions and constraints for contributors
 - `tests/test_survival_boundary.py` — CI enforcement of the `survival/` isolation rule

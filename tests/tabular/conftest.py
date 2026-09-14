@@ -20,10 +20,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 
-from kalecancer.loaddata.tabular import TabularCohort
-from kalecancer.loaddata.view import CohortView
-from kalecancer.survival.survival_target import SurvivalTarget
+from kalecancer.loaddata import SurvivalTarget
+from kalecancer.loaddata.tabular_access import CohortView, TabularCohort
 
 N_PATIENTS = 80
 
@@ -95,7 +95,9 @@ def write_table(frame: pd.DataFrame, directory: Path, fmt: str = "csv") -> Path:
 
 def matrix_of(view: CohortView, name: str = "clinical") -> np.ndarray:
     """A view's feature vectors as ``(n_rows, n_features)``, via the public batch path."""
-    return view.batch().modalities[name].numpy()
+    features = view.batch().modalities[name]
+    assert isinstance(features, torch.Tensor), f"{name} is ragged, so it has no matrix form"
+    return features.numpy()
 
 
 def ids_at(cohort: TabularCohort, positions) -> list[str]:

@@ -8,6 +8,9 @@ Two independent choices, so either can change from configuration alone:
 takes one latent per modality and returns a single representation of ``output_dim``,
 so swapping the method leaves the embedders and the task head untouched.
 
+The losses that score a :class:`MultimodalOutput` live in
+:mod:`kalecancer.model.predict.losses`, beside the heads that produced it.
+
 Absent modalities are first-class: a boolean modality mask is carried through, and
 each block degrades in a way appropriate to its mechanism.
 """
@@ -20,8 +23,6 @@ from dataclasses import dataclass, field
 import torch
 from kale.embed.multimodal_fusion import Concat, ProductOfExperts
 from torch import nn
-
-from kalecancer.survival.cox import as_event_mask, neg_partial_log_likelihood
 
 #: Log-variance assigned to an absent expert, making its precision negligible.
 ABSENT_LOG_VAR = 20.0
@@ -295,7 +296,7 @@ class MultimodalFusion(nn.Module):
         embedders: One module per modality, each exposing ``out_dim`` and mapping its
             input to ``(batch, out_dim)``.
         head_factory: Called with a width to build a task head, e.g.
-            :class:`~kalecancer.survival.cox.CoxHead`. Injecting it leaves prediction
+            :class:`~kalecancer.model.predict.losses.CoxHead`. Injecting it leaves prediction
             and loss logic where it already lives.
         stage: One of :data:`FUSION_STAGES`.
         method: One of :data:`FUSION_METHODS`; used by ``intermediate`` and ``hybrid``.
@@ -341,6 +342,13 @@ class MultimodalFusion(nn.Module):
         self.modality_dropout = modality_dropout
         self.combine_predictions = combine_predictions
 
+        # Declared optional up front: which of these a model has depends on its
+        # stage, and mypy otherwise fixes each type from whichever branch runs first.
+        self.fusion: nn.Module | None
+        self.head: nn.Module | None
+        self.modality_heads: nn.ModuleDict | None
+        self.weights: nn.Parameter | None
+
         self.embedders = nn.ModuleDict(dict(embedders))
         self.projections = nn.ModuleDict(
             {name: nn.Linear(_embedder_dim(name, embedders[name]), fusion_dim) for name in self.modalities}
@@ -382,7 +390,7 @@ class MultimodalFusion(nn.Module):
             modalities: One entry per modality, keyed by name. Each is whatever that
                 modality's embedder accepts.
             present: ``(batch,)`` boolean per modality, as carried by
-                :class:`~kalecancer.loaddata.sample.PatientBatch`. ``None`` treats
+                :class:`~kalecancer.loaddata.multimodal_access.PatientBatch`. ``None`` treats
                 every modality as present.
 
         Raises:
@@ -396,6 +404,8 @@ class MultimodalFusion(nn.Module):
         mask = self._resolve_mask(present, embeddings[0])
 
         if self.stage == "late":
+            # Both are built for every late model; only other stages leave them unset.
+            assert self.modality_heads is not None and self.weights is not None
             predictions = {
                 name: self.modality_heads[name](embedding)
                 for name, embedding in zip(self.modalities, embeddings, strict=True)
@@ -423,6 +433,8 @@ class MultimodalFusion(nn.Module):
                 modality_predictions=predictions,
             )
 
+        # combine_predictions is what creates the vote weights, and we are inside it.
+        assert self.weights is not None
         stacked = torch.stack([fused] + [predictions[name] for name in self.modalities])
         available = torch.cat([torch.ones(mask.shape[0], 1, device=mask.device), mask], dim=1)
         return MultimodalOutput(
@@ -447,31 +459,3 @@ class MultimodalFusion(nn.Module):
         while combined.dim() < stacked.dim():
             combined = combined.unsqueeze(-1)
         return (stacked * combined).sum(dim=0)
-
-
-def multimodal_cox_loss(
-    output: MultimodalOutput,
-    times: torch.Tensor,
-    events: torch.Tensor,
-    auxiliary_weight: float = 0.0,
-) -> torch.Tensor:
-    """Cox loss on the prediction, optionally supervising each modality too.
-
-    The auxiliary term keeps every embedder learning when one modality dominates. It
-    is averaged over modalities so its scale does not depend on how many there are.
-
-    Args:
-        output: Prediction from :class:`MultimodalFusion`.
-        times: ``(batch,)`` event or censoring times.
-        events: ``(batch,)`` indicator, 1 observed and 0 censored.
-        auxiliary_weight: Weight on the mean per-modality loss. 0 disables it.
-    """
-    mask = as_event_mask(events)
-    loss = neg_partial_log_likelihood(output.prediction, times, mask)
-    if auxiliary_weight <= 0 or not output.modality_predictions:
-        return loss
-
-    auxiliary = torch.stack(
-        [neg_partial_log_likelihood(prediction, times, mask) for prediction in output.modality_predictions.values()]
-    )
-    return loss + auxiliary_weight * auxiliary.mean()

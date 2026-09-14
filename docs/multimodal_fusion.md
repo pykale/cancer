@@ -2,7 +2,7 @@
 
 Fusion components for combining modalities into a single survival prediction. These
 are staged ahead of the tabular merge: the WSI pipeline in
-[`examples/wsi_survival/`](../examples/wsi_survival/) is unimodal and does not use
+[`examples/hancock_wsi_survival/`](../examples/hancock_wsi_survival/) is unimodal and does not use
 them yet.
 
 The design goal is that a researcher changes **one config value** to compare fusion

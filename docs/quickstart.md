@@ -26,8 +26,8 @@ lives with the example rather than in the library. Running the example fetches w
 the configuration asks for:
 
 ```bash
-python examples/wsi_survival/main.py \
-    --cfg examples/wsi_survival/configs/hancock_primary_tumour_quick.yaml \
+python -m examples.hancock_wsi_survival.main \
+    --cfg examples/hancock_wsi_survival/configs/hancock_primary_tumour_quick.yaml \
     DATASET.SOURCE hancock DATASET.PATIENTS 50
 ```
 
@@ -47,57 +47,55 @@ gives the same cohort, and a patient's slides are always kept together.
 > A 50-patient cohort leaves fewer than 10 patients in the test split. That is enough
 > to confirm the pipeline runs, but not to produce a meaningful metric.
 
-## Command line
+## Running an experiment
 
-`kalecancer` runs on data already on disk:
-
-```bash
-kalecancer wsi-survival \
-    --features /path/to/WSI_PrimaryTumor \
-    --clinical /path/to/clinical_data.json \
-    --preset quick
-```
-
-Point `--features` at the cache directory above to reuse an already-fetched cohort.
-
-### Presets
-
-| Preset | Run |
-| --- | --- |
-| `quick` | 3 epochs on subsampled patches, to check a setup |
-| `default` | Single seeded train/validation/test split |
-| `cv` | 5-fold patient-level cross-validation |
-| `dss` | Disease-specific survival instead of overall survival |
-
-### Common options
-
-| Option | Purpose |
-| --- | --- |
-| `--out DIR` | Where results are written |
-| `--epochs N` | Training epochs |
-| `--batch-size N` | Patients per batch; 16 or more is recommended |
-| `--folds N` | Cross-validation folds; `0` uses a single split |
-| `--endpoint OS\|DSS` | Survival endpoint |
-| `--print-config` | Print the resolved settings and exit |
-
-`--print-config` outputs a complete YAML file. Save it, edit it, and pass it back with
-`--cfg` for a fully reproducible run. Anything can also be overridden directly:
+Experiments are the examples; there is no library command, because a run names a
+dataset, an endpoint and an output layout, none of which generalise. Each example is
+driven by a YAML config:
 
 ```bash
-kalecancer wsi-survival --cfg my_run.yaml MODEL.DROPOUT 0.1 SOLVER.BASE_LR 0.0003
+python -m examples.hancock_wsi_survival.main     --cfg examples/hancock_wsi_survival/configs/hancock_primary_tumour_quick.yaml
 ```
+
+To read data already on disk instead of fetching it, use the local config:
+
+```bash
+python -m examples.hancock_wsi_survival.main     --cfg examples/hancock_wsi_survival/configs/local_primary_tumour.yaml     DATASET.FEATURE_ROOT /path/to/WSI_PrimaryTumor     DATASET.CLINICAL_PATH /path/to/clinical_data.json
+```
+
+Any setting can be overridden as trailing `KEY VALUE` pairs:
+
+```bash
+python -m examples.hancock_wsi_survival.main --cfg my_run.yaml MODEL.DROPOUT 0.1 SOLVER.BASE_LR 0.0003
+```
+
+### Configurations
+
+| Config | Run |
+| --- | --- |
+| `hancock_primary_tumour_quick.yaml` | 3 epochs on subsampled patches, to check a setup |
+| `hancock_primary_tumour.yaml` | The full published split |
+| `hancock_primary_tumour_cv.yaml` | 5-fold patient-level cross-validation |
+| `hancock_primary_tumour_dss.yaml` | Disease-specific survival instead of overall survival |
+| `local_primary_tumour.yaml` | Files already on disk |
+
+The test set comes from HANCOCK's published assignment by default;
+`DATASET.SPLIT_MODE cv` cross-validates instead. See
+[examples/README.md](../examples/README.md).
 
 ## Python
 
 ```python
 from kalecancer.config import get_cfg_defaults
 from kalecancer.loaddata.clinical_access import endpoint_from_config
-from kalecancer.pipeline.wsi_survival_runner import run
+from examples.hancock_wsi_survival.runner import run
 
 cfg = get_cfg_defaults()
 cfg.DATASET.FEATURE_ROOT = "/path/to/WSI_PrimaryTumor"
 cfg.DATASET.CLINICAL_PATH = "/path/to/clinical_data.json"
 cfg.SOLVER.MAX_EPOCHS = 30
+# Local files carry no published assignment, so draw a split rather than apply one.
+cfg.DATASET.SPLIT_MODE = "random"
 cfg.freeze()
 
 metrics = run(cfg, endpoint=endpoint_from_config(cfg))
@@ -105,12 +103,32 @@ print(metrics["test"]["c_index"])
 ```
 
 To fetch instead of reading local files, set `cfg.DATASET.SOURCE` and pass the
-example's fetcher, which is what `examples/wsi_survival/main.py` does:
+example's fetcher, which is what `examples/hancock_wsi_survival/main.py` does:
 
 ```python
-from hancock import fetch_for  # examples/wsi_survival/hancock.py
+from examples.hancock import fetch_for, split_for
 
-metrics = run(cfg, endpoint=endpoint_from_config(cfg), fetch=lambda: fetch_for(cfg))
+metrics = run(
+    cfg,
+    endpoint=endpoint_from_config(cfg),
+    fetch=lambda: fetch_for(cfg),
+    splits=lambda: split_for(cfg),  # the published assignment
+)
+```
+
+Or build the model directly, without the runner. There is one trainer, and what it
+predicts is the task you hand it:
+
+```python
+from kalecancer.model.embed import AttentionMIL, BagEncoder, MLPEmbedder
+from kalecancer.pipeline import ClassificationTask, CohortTrainer, SurvivalTask
+
+embedders = {
+    "wsi": BagEncoder(AttentionMIL(input_dim=1024, hidden_dim=256)),
+    "clinical": MLPEmbedder(in_dim=64, out_dim=256),
+}
+survival = CohortTrainer(embedders, task=SurvivalTask())
+binary = CohortTrainer(embedders, task=ClassificationTask(pos_weight=3.0))
 ```
 
 Individual stages work on their own:
@@ -140,7 +158,7 @@ data comes from a public archive, an agent needs no local files and no credentia
 
 **2. Run it**
 
-> Run `examples/wsi_survival/main.py` with the quick config, overriding
+> Run `examples/hancock_wsi_survival/main.py` with the quick config, overriding
 > `DATASET.SOURCE hancock DATASET.PATIENTS 50` so it fetches its own data. Report the
 > cohort summary and the test C-index.
 
@@ -181,5 +199,5 @@ train full cohorts on a GPU machine.
 
 ## Next
 
-- [WSI survival pipeline](../examples/wsi_survival/) — input formats, full configuration, interpretation
+- [WSI survival pipeline](../examples/hancock_wsi_survival/) — input formats, full configuration, interpretation
 - [Multimodal fusion](multimodal_fusion.md) — combining modalities
