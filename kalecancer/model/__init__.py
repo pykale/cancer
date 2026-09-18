@@ -1,25 +1,27 @@
-"""The model stage, in three parts.
+"""Model: encoders, fusion methods, prediction heads, and the fusion models that wire them together."""
 
-``layers`` holds blocks that transform tensors, ``embed`` adapts them to the contract
-fusion relies on and combines several modalities into one representation, and
-``predict`` turns that representation into a score with the loss that scores it.
-
-A class belongs to exactly one: a block that knows no modality is a layer, a thing
-with ``out_dim`` is an embedder, a thing emitting one number per patient is a head.
-"""
-
-from kalecancer.model.embed import FUSION_METHODS, FUSION_STAGES, MultimodalFusion, MultimodalOutput
-from kalecancer.model.layers import MLP, AttentionMIL, GatedAttention
-from kalecancer.model.predict import CoxHead, LinearHead
+from kalecancer.model.encoders import ABMIL, MLP
+from kalecancer.model.fusion import Concat, MajorityVote, MaskedMean, MeanLogits
+from kalecancer.model.heads import ClassificationHead, CoxHead
+from kalecancer.model.incontext import InContextModule
+from kalecancer.model.models import EarlyFusion, IntermediateFusion, LateFusion, ModelOutput, StageList, Unimodal
+from kalecancer.model.tabicl import TabICLEncoder
 
 __all__ = [
-    "AttentionMIL",
-    "CoxHead",
-    "FUSION_METHODS",
-    "FUSION_STAGES",
-    "GatedAttention",
-    "LinearHead",
+    "ABMIL",
     "MLP",
-    "MultimodalFusion",
-    "MultimodalOutput",
+    "ClassificationHead",
+    "Concat",
+    "CoxHead",
+    "EarlyFusion",
+    "InContextModule",
+    "IntermediateFusion",
+    "LateFusion",
+    "MajorityVote",
+    "MaskedMean",
+    "MeanLogits",
+    "ModelOutput",
+    "StageList",
+    "TabICLEncoder",
+    "Unimodal",
 ]
