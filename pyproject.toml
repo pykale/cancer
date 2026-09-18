@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Multimodal cancer AI for the PyKale ecosystem — CT, whole-slide pathology, and clinical tabular data, with time-to-event prediction"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [{ name = "PyKale" }]
 keywords = ["pykale", "cancer", "multimodal", "survival", "pytorch"]
 classifiers = [
@@ -16,29 +16,30 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Medical Science Apps.",
 ]
 dependencies = [
-    "torch",
-    "numpy",
-    "pandas",
-    "scikit-learn",
-    "scikit-survival",
-    "pyyaml",
-    "certifi",
-    "yacs",
-    "h5py",
+    "certifi>=2026.7.22",
+    "h5py>=3.10",
+    "huggingface-hub>=0.24",
+    "jsonargparse[signatures]>=4.49",
+    "lightning>=2.6,<2.7",
+    "numpy>=1.26",
+    "pandas>=2.2",
     "pykale>=0.2.0",
-    "pytorch-lightning",
+    "pyyaml>=6",
+    "scikit-learn>=1.9.1",
+    "torch>=2.6",
+    "torchsurv>=0.1.6",
 ]
 
 [project.optional-dependencies]
 tabular = [
-    "tabicl>=2.1",
+    # The encoder calls private _train_forward methods; bump only with the parity test passing.
+    "tabicl==2.1.1",
 ]
 imaging = [
     "monai",
@@ -55,6 +56,8 @@ interpret = [
     "captum",
     "umap-learn",
 ]
+
+[dependency-groups]
 dev = [
     "pytest",
     "pytest-cov",
@@ -63,7 +66,11 @@ dev = [
     "mypy",
     "build",
     "twine",
-    "lifelines",
+    "ipykernel>=7.3.0",
+    "ipywidgets>=8.1.9",
+
+    # GPL-licensed, hence used only as a reference implementation in tests, never imported by the library.
+    "scikit-survival>=0.25",
 ]
 
 [project.urls]
@@ -92,7 +99,7 @@ version = { file = "kalecancer/_version.txt" }
 
 [tool.ruff]
 line-length = 120
-target-version = "py310"
+target-version = "py311"
 exclude = [
     "build",
     "examples",
@@ -115,6 +122,9 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["kalecancer", "tests"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"pytorch_lightning".msg = "Use `import lightning.pytorch as L`."
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
