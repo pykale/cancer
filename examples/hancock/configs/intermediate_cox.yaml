@@ -1,0 +1,50 @@
+# The pipeline of survival_intermediate.py as a config. Load it with kalecancer.pipeline.load_pipeline.
+class_path: kalecancer.pipeline.Pipeline
+init_args:
+  model:
+    class_path: kalecancer.model.IntermediateFusion
+    init_args:
+      encoding:
+        clinical:
+          - class_path: kalecancer.model.TabICLEncoder
+            init_args:
+              checkpoint: tabicl-classifier-v2-20260212.ckpt
+              output: row
+              trainable: []
+              context_label: event
+              context_folds: 5
+              random_state: 0
+          - {class_path: torch.nn.Linear, init_args: {in_features: 512, out_features: 64}}
+        wsi:
+          - {class_path: kalecancer.model.ABMIL, init_args: {in_dim: 1024, hidden_dim: 256, attention_dim: 128, dropout: 0.25}}
+          - {class_path: torch.nn.Linear, init_args: {in_features: 256, out_features: 64}}
+      fusion: {class_path: kalecancer.model.Concat}
+      head: {class_path: kalecancer.model.CoxHead, init_args: {in_dim: 128, ties: efron}}
+  transforms:
+    clinical:
+      class_path: kalecancer.prepdata.TableTransform
+      init_args:
+        groups:
+          numeric:
+            columns: [age_at_initial_diagnosis]
+            steps:
+              - {class_path: sklearn.preprocessing.StandardScaler}
+          categorical:
+            columns: [sex, smoking_status, primarily_metastasis]
+            steps:
+              - {class_path: sklearn.impute.SimpleImputer, init_args: {strategy: constant, fill_value: missing}}
+              - {class_path: sklearn.preprocessing.OrdinalEncoder, init_args: {handle_unknown: use_encoded_value, unknown_value: -1}}
+        drop: []
+  optimizer: {class_path: torch.optim.AdamW, init_args: {lr: 0.0003, weight_decay: 0.01}}
+  batch_size: 32
+  drop_last: true
+  max_epochs: 30
+  validation:
+    class_path: sklearn.model_selection.StratifiedShuffleSplit
+    init_args: {n_splits: 1, test_size: 0.15, random_state: 0}
+  early_stopping:
+    class_path: kalecancer.pipeline.EarlyStopping
+    init_args: {metric: {class_path: kalecancer.evaluate.HarrellC}, patience: 5, restore_best: true}
+  accelerator: gpu
+  precision: 32-true
+  random_state: 0
