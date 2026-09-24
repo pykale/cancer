@@ -84,18 +84,18 @@ include-package-data = false
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["kalecancer*"]
-namespaces = true
+namespaces = false
 
+# None of these file types are currently in use, but kept for future proofing
 [tool.setuptools.package-data]
 kalecancer = [
-    "_version.txt",
     "**/*.json",
     "**/*.yaml",
     "**/*.yml",
 ]
 
 [tool.setuptools.dynamic]
-version = { file = "kalecancer/_version.txt" }
+version = { attr = "kalecancer.__version__" }
 
 [tool.ruff]
 line-length = 120
