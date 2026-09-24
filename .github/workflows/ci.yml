@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  # The checkpoint test_tabicl.py needs
+  TABICL_CHECKPOINT: tabicl-classifier-v2-20260212.ckpt
+
 jobs:
 
   pre-commit-check:
@@ -23,21 +27,56 @@ jobs:
         uses: pre-commit/action@v3.0.1
 
   test:
+    name: pytest (${{ matrix.installer }}, Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    env:
+      # makes `uv sync` use the interpreter that setup-python provides
+      UV_PYTHON: ${{ matrix.python-version }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
+        installer: [uv, pip] # test uv and pip
+        include:
+          # uv installs the exact versions in uv.lock into .venv, which is put on PATH for the later steps.
+          - installer: uv
+            install: |
+              uv sync --frozen --extra tabular
+              echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+          # pip resolves from the bounds in pyproject.toml
+          # The dev tools are a dependency group (PEP 735), which needs pip >= 25.1.
+          - installer: pip
+            install: |
+              python -m pip install --upgrade pip
+              python -m pip install -e ".[tabular]" --group dev
     steps:
       - uses: actions/checkout@v4
 
+      # installs pip by default
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+          cache-dependency-path: pyproject.toml
 
-      - name: Install package
-        run: pip install -e ".[dev]"
+      # install uv
+      - uses: astral-sh/setup-uv@v5
+        if: matrix.installer == 'uv'
+        with:
+          enable-cache: true
+
+      - name: Install package, tabular extra and dev tools (${{ matrix.installer }})
+        run: ${{ matrix.install }}
+
+      - name: Cache the TabICL checkpoint
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ env.TABICL_CHECKPOINT }}
+
+      - name: Download the TabICL checkpoint
+        run: python -c "from huggingface_hub import hf_hub_download; hf_hub_download('jingang/TabICL', '$TABICL_CHECKPOINT')"
 
       - name: pytest
-        run: pytest --cov=kalecancer --cov-report=term-missing
+        run: pytest --cov=kalecancer --cov-report=term-missing -rs
