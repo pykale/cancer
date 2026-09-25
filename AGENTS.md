@@ -1,219 +1,128 @@
 # AGENTS.md
 
-Instructions for coding agents working in this repository. Human contributors should
-read [README.md](README.md) and [CONTRIBUTING](README.md#contributing).
+Instructions for coding agents working in this repository.
 
-## Setup
+## Setup and commands
 
-Python 3.10–3.12 is required. Install PyTorch first if a specific CUDA build is
-needed, then:
-
-```bash
-python -m venv .venv
-.venv/bin/pip install -e ".[dev]"     # Windows: .venv/Scripts/pip
-```
-
-Verify the install:
-
-```bash
-.venv/bin/python -c "import kalecancer, torch, kale; print(kalecancer.__version__)"
-```
-
-## Commands
+Python 3.11 or 3.12, managed with [uv](https://docs.astral.sh/uv/) against the committed `uv.lock`.
 
 | Task | Command |
 | --- | --- |
-| Run tests | `.venv/bin/pytest` |
-| Run tests with coverage | `.venv/bin/pytest --cov=kalecancer --cov-report=term-missing` |
-| Format | `.venv/bin/ruff format .` |
-| Lint | `.venv/bin/ruff check .` |
-| Fetch and run on HANCOCK | `.venv/bin/python -m examples.hancock_wsi_survival.main --cfg examples/hancock_wsi_survival/configs/hancock_primary_tumour_quick.yaml DATASET.SOURCE hancock DATASET.PATIENTS 50` |
-
-Both `pre-commit run --all-files` (ruff, ruff-format, mypy) and `pytest` must pass
-before a change is complete. These are the same checks CI runs.
-
-## Data
-
-Two sources, selected by `DATASET.SOURCE`:
-
-- `local` reads an existing copy from `DATASET.FEATURE_ROOT` and
-  `DATASET.CLINICAL_PATH`.
-- `hancock` fetches the published dataset (CC BY 4.0) over HTTP range requests,
-  transferring only the selected patients out of a 9.65 GB archive and caching them.
-  Requires no credentials. Its fetcher lives in `examples/hancock/dataset.py`
-  and is passed to `run(..., fetch=...)` by that example. Keep it small with
-  `DATASET.PATIENTS N`.
-
-Tests need neither: they build synthetic HDF5 cohorts in a temporary directory, and
-must never reach the network. `tests/conftest.py` shows the pattern, and
-`tests/loaddata/test_archive.py` serves archives from a local HTTP server.
-
-A cohort of 50–60 patients leaves fewer than 10 in the test split, which is enough to
-verify the pipeline runs but not to produce a meaningful metric. Report such runs as
-verification, not as results.
-
-There is no GPU in a Codespace or dev container. Use it for development, tests, and
-small demonstration runs; train full cohorts on a GPU machine.
+| Install, with dev tools | `uv sync --all-extras` |
+| Test | `uv run pytest` |
+| Test with coverage | `uv run pytest --cov=kalecancer --cov-report=term-missing` |
+| Format, lint, type-check | `uv run pre-commit run --all-files` |
+| Smallest end-to-end run | `uv run python examples/synthetic/synthetic_survival.py` |
 
 ## Layout
 
-```
+```text
 kalecancer/
-├── auto/        high-level construction (AutoCancer* classes, planned)
-├── loaddata/    access APIs per modality, plus generic splitting
-├── prepdata/    transforms
-├── model/       layers/ blocks, embed/ encoders and fusion, predict/ heads
-├── pipeline/    the trainer and its tasks
-├── evaluate/    metrics and prediction scoring, by task
-├── interpret/   attention export
-├── utils/       seeding, artefact writing, and the cross-package protocols
-└── config.py    configuration schema and defaults
+├── loaddata/   MultimodalDataset, modalities (tables, PatchFeatures), targets, train_test_split
+├── prepdata/   TableTransform: sklearn transforms for table modalities
+├── model/      encoders, fusion methods, heads, and the models that wire them together
+├── pipeline/   Pipeline (fit, predict, evaluate, encode, attention), Lightning training, YAML configs
+├── evaluate/   metrics on prediction frames, cross_validate
+└── interpret/  attention export
 ```
 
-```
-pipeline/
-├── task.py     PredictionTask, SurvivalTask, ClassificationTask
-└── trainer.py  CohortTrainer -- the only trainer
-```
+There is **one** estimator, `Pipeline`. It takes a model, transforms for each modality,
+and training settings, and it works the same for every model and target. Do not add a
+pipeline or trainer for a particular modality, fusion strategy or endpoint.
 
-There is **one** trainer. `CohortTrainer` takes a set of modality embedders and a
-task; neither constrains the other, so a whole-slide survival model is one bag
-modality with a `SurvivalTask`, and a multimodal classifier is two modalities with a
-`ClassificationTask`. Do not add a trainer per modality or per endpoint — there is
-nothing for one to add.
+A model is a `Unimodal`, `EarlyFusion`, `IntermediateFusion` or `LateFusion`, built from
+a list of stages for each modality, a fusion method or combiner, and a head. Extend it
+like this:
 
-A task decides exactly four things: the head, the loss, whether a batch carries a
-gradient, and the epoch metric. A new endpoint is a new `PredictionTask`, never a new
-trainer.
+- **A new combination of modalities** is a different dictionary, never a new class.
+- **A new kind of data** is one class that implements the `Modality` protocol (`ids`,
+  `load`, `collate`) in `loaddata/modalities.py`.
+- **A new block** is a plain `nn.Module` in `model/encoders.py`, used as a stage.
+- **A new endpoint** is a target in `loaddata/targets.py` plus a head in
+  `model/heads.py`. The head owns the output, prediction, loss and target check.
 
-`loaddata/` is one access API per kind of data, and none of them knows a dataset:
+## Component contracts
 
-```
-loaddata/
-├── tabular_access.py     Cohort, CohortView, TabularCohort
-├── wsi_access.py         patch bags from HDF5: discovery, reading, validation
-├── multimodal_access.py  MultimodalDataset, ModalitySource, and the record types
-├── archive_access.py     remote ZIP access, for datasets published as one
-└── splitting.py          HoldOut, CrossValidation, Predefined -- scikit-learn's shape
-```
+The code checks these at construction or during `fit`, so new components must follow them:
 
-One module per kind of data it reads, named for it.
-
-The `Target` and `Preprocessor` contracts live in `multimodal_access.py`, beside the
-targets that implement them. They are not re-exported from any package root: nobody
-calls a protocol, they are implemented and type-checked against. `check_target` is
-the runtime check, since a `Protocol` alone verifies nothing — `tests/loaddata/test_targets.py`
-covers it. Do not add a protocol for something with one implementation.
-
-`evaluate/` is named the same way — by the task it scores and the thing it produces:
-
-```
-evaluate/
-├── classification_metrics.py  ROC-AUC, average precision, F1, mean ROC curve
-├── survival_metrics.py        C-index, IPCW time-dependent AUC, integrated Brier
-├── survival_predictions.py    running a model over a loader, and scoring the result
-└── cross_validation.py        refitting across folds, and resampled intervals
-```
-
-Describing a *cohort* is not in `evaluate/`: what counts as an excluded patient
-depends on how the cohort was built, so it lives with the builder in `examples/`.
-
-**Splitting stays in `loaddata/`, not `prepdata/`.** A splitter decides which samples
-load into which loader; `prepdata/` is fold-local *fitted state*, and the thing that
-creates the folds cannot be state belonging to one. scikit-learn draws the same line
-between `model_selection` and `preprocessing`.
-
-A modality is a named `ModalitySource`, so imaging + tabular, imaging + imaging and
-four of each are the same `MultimodalDataset` with a different dictionary. Adding a
-combination is never a new class; adding a *kind* of data is one `ModalitySource`.
-
-A bag of patches is an ordinary modality whose value is a list rather than a stacked
-tensor; `BagEncoder` pools it. That is why there is no whole-slide trainer.
-
-`model/` is three stages of one pipeline, and a class belongs to exactly one:
-
-```
-model/
-├── layers/    MLP, AttentionMIL, GatedAttention -- blocks that transform tensors
-├── embed/     MLPEmbedder, BagEncoder, TabICLEmbedder, MultimodalFusion
-└── predict/   heads.py: LinearHead, CoxHead;  losses.py: every objective
-```
-
-**There is no `survival/` stage.** Time-to-event support is not a pipeline stage, it
-is one endpoint among others, so its pieces sit with their kind: the head and loss in
-`model/predict/`, the C-index and baseline hazard in `evaluate/survival_metrics.py`,
-and `SurvivalTarget` beside `ColumnTarget` in `loaddata/multimodal_access.py`. A head
-and its loss live in the same package because neither is meaningful alone — `CoxHead`
-is bias-free *because* of its partial likelihood.
-
-A **layer** transforms tensors and knows nothing about modalities; an **embedder**
-adapts a layer to the contract fusion relies on (`out_dim`, `needs_full_batch`, a
-`mask` argument); a **head** turns the fused vector into a score. `MLPEmbedder` is a
-thin subclass of `MLP` and `BagEncoder` wraps `AttentionMIL` for exactly this reason
-— put a new block in `layers/` and adapt it in `embed/`, never both at once.
-
-`CoxHead` and `LinearHead` sit together in `predict/heads.py`, and every loss in
-`predict/losses.py` — including the `multimodal_*` wrappers, which used to live in
-the fusion module.
-
-**Orchestration does not belong here.** Assembling a cohort, choosing splits, naming
-an endpoint and writing a report are experiment concerns, so they live in
-`examples/<name>/runner.py`. If a piece of code names a dataset, an endpoint or a
-configuration key, it is an experiment, not a library component.
-
-## Examples
-
-Named `<dataset>_<modality>_<task>`, with `survival` for right-censored time-to-event
-endpoints and `classification` for binary ones. See [examples/README.md](examples/README.md)
-for the index. Shared HANCOCK archive access lives in `examples/hancock/`, imported by
-every HANCOCK example rather than duplicated into each.
-
-Examples run as modules from the repository root — `python -m examples.<name>.main` —
-so their imports resolve as ordinary packages. Do not add `sys.path` manipulation to an
-example.
-
-Tests mirror this layout: code in `kalecancer/loaddata/splitting.py` is tested in
-`tests/loaddata/test_splitting.py`, and a dataset's own code in
-`tests/examples/`.
-
-## Conventions
-
-- Follow [PyKale](https://github.com/pykale/pykale) conventions: verb-oriented stages,
-  Google-style docstrings, type hints, YACS configuration.
-- Reuse PyKale APIs where one exists rather than reimplementing.
-- Line length 120. Formatting is enforced by ruff-format; do not hand-format.
-- Comments explain why, not what. Do not restate the code.
-- New configuration belongs in `kalecancer/config.py`, never hardcoded in a module.
-- Dataset paths appear only in example configs and command-line arguments.
-- Nothing in `kalecancer/` may name a dataset, an endpoint or an experiment. If it
-  does, it belongs in `examples/`. That covers cohort construction, endpoint column
-  names, slide-filename patterns, and which patients a published split assigns
-  where: `loaddata/` supplies the mechanisms, the dataset supplies the decisions.
-- A predefined partition -- a published split, internal against external, one site
-  held out -- is applied with `Predefined`, but read and named by the dataset.
-- `persistent_workers` loaders must be released with `release_workers` when the
-  split that built them is finished; see its docstring for what happens otherwise.
+- Stages declare their widths as `in_dim`/`out_dim` (or `in_features`/`out_features`).
+  A stage list must end with `(n, d)` vectors.
+- A stage that needs patient ids sets `needs_ids = True`. Only the first stage may be an
+  `InContextModule`; it is fitted on the training rows before training starts.
+- Every module with parameters needs a `reset_parameters()` method, or `keep_weights = True`
+  as in `TabICLEncoder`. `random_state` re-initialises all other parameters.
+- Store every `__init__` argument under an attribute with the same name.
+  `sklearn.base.clone` and `dump_config` both depend on this.
+- Stages run only on patients who have the modality, and their outputs are scattered back
+  with NaN for the others. Fusion selects the defined rows. Never multiply by a mask:
+  selecting rows is what keeps gradients finite.
+- A head's `loss` returns `None` when a batch has no signal (for Cox, no event with anyone
+  else at risk). The Pipeline skips those batches and reports them.
 
 ## Constraints
 
-- Splitting is patient-level. Never split on slides or patches; a patient's slides
-  must never span two splits -- including the train/validation carve, not only
-  train/test.
-- The dataset's published train/test assignment is the default everywhere
-  (`DATASET.SPLIT_MODE="published"`). Re-drawing the test set makes a result
-  incomparable with other work on the cohort, so `cv` and `random` are opt-in.
-  Validation is always carved out of the training half.
-- Censoring-aware quantities (IPCW weights, baseline hazard) are estimated from the
-  training split only. So is every fitted transform: scalers, encoders, and the
-  TabICL context. When cross-validating, all of them are rebuilt per fold -- fitting
-  once outside the fold loop carries every fold's test patients into the others.
-- The event convention is `1` observed, `0` censored, normalised at load time.
-- Risk scores are log partial hazards where higher means higher risk.
+- Split by patient, never by slide or patch. `subset` and `train_test_split` take patient ids.
+- `fit` trains a copy (`model_`) and leaves `model` unchanged. A model that has already
+  been fitted is rejected, so no fold can start from weights trained on other patients.
+  `evaluate` rejects patients used in `fit` unless you pass `allow_seen=True`.
+- Patient ids are strings. Read JSON with `dtype={"patient_id": str}`; otherwise `"001"`
+  becomes `1`.
+- `TimeToEvent.event` is a bool: `True` means observed and `False` means censored. A
+  missing value raises an error rather than being treated as censored.
+- `CoxHead` predicts `log_hazard`, where a higher value means higher risk.
+
+## Conventions
+
+- Nothing in `kalecancer/` may name a dataset, an endpoint column, a file pattern or a
+  published split. These are the dataset's decisions and belong in `examples/`; the library
+  supplies only the mechanisms.
+- Components are configured through their constructor arguments, not a global config.
+  YAML configs use jsonargparse's `class_path`/`init_args` format and are read with
+  `load_pipeline` and written with `dump_config`.
+- Use scikit-learn, Lightning, torchsurv or PyKale where they already cover what you need,
+  instead of writing your own. Import Lightning as `lightning.pytorch as L`; ruff bans
+  `pytorch_lightning`.
+- scikit-survival is GPL-licensed. Use it only as a reference implementation in tests, and
+  never import it from `kalecancer/`. Unless you think it would be hugely beneficial - then we could discuss its import.
+- `tabicl` is pinned to an exact version because `TabICLEncoder` relies on its private
+  internals. Bump it only if `tests/test_tabicl.py` passes.
+- Export public classes from their subpackage's `__init__.py`. Users import from
+  `kalecancer.<stage>`, not from the package root.
+- Use Google-style docstrings, type hints and a line length of 120. ruff-format decides
+  formatting; do not format by hand. Comments explain why, not what.
+
+## Examples
+
+```text
+examples/
+├── synthetic/  synthetic_survival: generated cohort, CPU only, downloads nothing
+└── hancock/    survival_intermediate, from_config, cross_validation, classification_late
+```
+
+Examples are standalone scripts. Run them from the repository root with
+`uv run python examples/<dir>/<script>.py`.
+
+The HANCOCK examples read a local copy of the data from `data/hancock/`, which git
+ignores. They use one of the published splits `in`, `out` or `Oropharynx`. Do not use
+`treatment_outcome` for survival, because its test set was selected by outcome.
+
+The dev container has no GPU, so train full cohorts on a GPU machine.
+
+## Tests
+
+Tests live in a flat `tests/` directory with one file per area, such as
+`test_loaddata.py`, `test_model_fusion.py` and `test_pipeline.py`. They build synthetic
+HDF5 cohorts with `make_cohort` from `tests/conftest.py` and never access the network.
+
+- `test_tabicl.py` is skipped unless the TabICL checkpoint is already in the Hugging Face
+  cache. The `gpu` test is skipped when CUDA is not available.
+- `test_synthetic_example.py` runs the synthetic example and requires a Harrell's C above
+  0.7, so any change to that example must keep it learning.
 
 ## Adding a component
 
-1. Implement it in the matching `kalecancer/` subpackage.
-2. Export it from that subpackage's `__init__.py`.
-3. Add tests in the mirrored `tests/` path, using synthetic data.
-4. Add any new setting to `kalecancer/config.py` with a comment.
-5. Run the format, lint, and test commands above.
+1. Implement it in the matching `kalecancer/` subpackage and export it from that
+   subpackage's `__init__.py`.
+2. Follow the component contracts above.
+3. Add tests with synthetic data to the matching `tests/test_<area>.py`.
+4. Run pre-commit and pytest.
