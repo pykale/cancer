@@ -16,7 +16,7 @@ import torch
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.model_selection import BaseShuffleSplit
 from torch import nn
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader
 
 from kalecancer.evaluate.metrics import EvalContext, Metric
 from kalecancer.interpret.attention import attention as _attention
@@ -286,17 +286,17 @@ class Pipeline(BaseEstimator):
         return fitted
 
     def _loader(self, data: MultimodalDataset, shuffle: bool) -> DataLoader:
-        sampler = None
+        generator = None
         if shuffle:
             # A dedicated generator keeps the order independent of worker settings and of other RNG consumers.
             generator = torch.Generator()
             if self.random_state is not None:
                 generator.manual_seed(self.random_state)
-            sampler = RandomSampler(data, generator=generator)
         return DataLoader(
             data,
             batch_size=self.batch_size,
-            sampler=sampler,
+            shuffle=shuffle,
+            generator=generator,
             drop_last=shuffle and self.drop_last,
             collate_fn=data.collate,
             num_workers=self.num_workers,
