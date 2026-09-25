@@ -1,137 +1,91 @@
-# Multimodal fusion API
+# Multimodal fusion
 
-Fusion components for combining modalities into a single survival prediction. These
-are staged ahead of the tabular merge: the WSI pipeline in
-[`examples/hancock_wsi_survival/`](../examples/hancock_wsi_survival/) is unimodal and does not use
-them yet.
+How modalities are combined into one prediction. Fusion is a choice of model and fusion method, so comparing
+approaches changes the model dictionary, not the encoders, heads or `Pipeline`.
 
-The design goal is that a researcher changes **one config value** to compare fusion
-approaches, without touching encoders, heads, or training code.
+## Models
 
-## Two layers
-
-**Strategy** — *what* gets combined (`kalecancer.model.multimodal`):
-
-| Strategy | Mechanism | When to use |
+| Model | Combines | Structure |
 | --- | --- | --- |
-| `early` | Each modality encoded → **features fused** → one shared head | Learns cross-modal structure before any prediction is made |
-| `late` | Each modality encoded → **predicts independently** → risks combined | The baseline fusion has to beat; fully interpretable per modality |
-| `hybrid` | **Both**: an early-fusion trunk plus late-style per-modality heads | Cross-modal learning while every encoder stays supervised |
+| `Unimodal` | nothing | stages, then head |
+| `EarlyFusion` | raw vectors | fuse, then one stage list, then head |
+| `IntermediateFusion` | encoded features | stages per modality, then fuse, then head |
+| `LateFusion` | branch predictions | branch models trained jointly, then a combiner |
 
-```
-early                          late                        hybrid
-─────                          ────                        ──────
-enc_a ─┐                       enc_a → head_a ─┐           enc_a ─┬─→ head_a ─┐
-       ├→ fuse → head → risk                   ├→ risk            │           │
-enc_b ─┘                       enc_b → head_b ─┘           enc_b ─┼─→ head_b ─┤
-                                                                  └→ fuse → head → risk
-```
+Early fusion needs modalities that are already vectors, such as tables.
 
-Early fusion is **feature-level, not raw-input-level**: modalities are encoded first,
-because a gigapixel slide and a clinical table share no common input space. What makes
-it *early* is that fusion happens **before any prediction**, so the shared head learns
-from cross-modal structure rather than from separate verdicts.
+A `LateFusion` branch is a `Unimodal`, `EarlyFusion` or `IntermediateFusion` model. The loss is the unweighted sum of
+the branch losses, and `predict(..., branch=name)` returns a single branch's predictions.
 
-Hybrid is literally early + late — `HybridFusionSurvival` subclasses
-`EarlyFusionSurvival` and adds the per-modality heads.
+## Fusion methods
 
-**Method** — *how* features combine, used by `early` and `hybrid`
-(`kalecancer.model.embed.multimodal_fusion`):
+| Method | Used by | Combines | Missing modalities |
+| --- | --- | --- | --- |
+| `Concat` | early, intermediate | vectors, concatenated | Not handled: every patient needs every modality |
+| `MaskedMean` | early, intermediate | equal-width vectors, averaged over those present | Handled |
+| `MeanLogits` | late | branch outputs (logits or log-hazards), averaged over present branches | Handled, except Cox with differing subsets |
+| `MajorityVote` | late | each branch's most probable class, ties broken by mean probability | Handled |
 
-| Method | Mechanism | Notes |
-| --- | --- | --- |
-| `concat` | Concatenate then project | Simple, strong baseline |
-| `poe` | Product of Gaussian experts | **Preferred when modalities can be missing** — an absent expert drops out of the product without retraining |
-| `lowrank` | Low-rank tensor factorisation | Models multiplicative interactions at linear parameter cost |
-
-Every method returns the same `output_dim`, so the survival head is unchanged when
-the method changes.
-
-### End-to-end vs pre-extracted features
-
-Encoders here are trained end to end with the survival loss. Some taxonomies reserve
-"early fusion" for fusing features from *separately trained* extractors and call the
-end-to-end version *joint fusion*. Freeze the encoders to get the strict form — which
-is already the case for WSI, whose patch features come from a frozen foundation model.
+`MeanLogits` refuses Cox branches unless every patient has every branch: each branch's log-hazard has an arbitrary
+offset, so averaging different subsets would reorder patients. `MajorityVote` needs classification heads.
 
 ## Usage
 
-All three strategies take the **same arguments**, so switching is a one-word change:
-
 ```python
-from kalecancer.model import build_multimodal_survival, multimodal_cox_loss
-from kalecancer.model.embed import AttentionMIL, BagEncoder
+from torch import nn
 
-encoders = {
-    "wsi": BagEncoder(AttentionMIL(input_dim=1024, hidden_dim=256)),
-    "clinical": TabularEncoder(...),  # any module returning (batch, dim)
-}
-latent_dims = {"wsi": 256, "clinical": 64}
+from kalecancer.model import (
+    ABMIL, MLP, ClassificationHead, Concat, CoxHead, IntermediateFusion, LateFusion, MeanLogits, Unimodal,
+)
+from kalecancer.pipeline import Pipeline
 
-# Early: encode each modality, fuse the features, predict once.
-model = build_multimodal_survival("early", encoders=encoders, latent_dims=latent_dims, fusion="poe", fused_dim=64)
+# Intermediate: encode each modality, concatenate, one Cox head.
+intermediate = IntermediateFusion(
+    encoding={
+        "clinical": [MLP(in_dim=12, hidden_dims=[64], out_dim=64, dropout=0.1)],
+        "wsi": [ABMIL(in_dim=1024, hidden_dim=256, attention_dim=128, dropout=0.25), nn.Linear(256, 64)],
+    },
+    fusion=Concat(),
+    head=CoxHead(in_dim=128, ties="efron"),
+)
 
-# Late: encode and predict per modality, then combine the risks.
-model = build_multimodal_survival("late", encoders=encoders, latent_dims=latent_dims)
+# Late: a classifier per modality, logits averaged.
+late = LateFusion(
+    branches={
+        "clinical": Unimodal("clinical", [MLP(12, [64], 64, 0.1)], ClassificationHead(64, n_classes=2)),
+        "wsi": Unimodal("wsi", [ABMIL(1024, 256, 128, 0.25), nn.Linear(256, 64)], ClassificationHead(64, n_classes=2)),
+    },
+    combine=MeanLogits(),
+)
 
-# Hybrid: the early trunk plus a head on every modality.
-model = build_multimodal_survival("hybrid", encoders=encoders, latent_dims=latent_dims, fusion="poe", fused_dim=64)
-
-output = model({"wsi": bags, "clinical": table}, mask)
-loss = multimodal_cox_loss(output, event, duration, auxiliary_weight=0.3)
+pipeline = Pipeline(model=intermediate, ...)
 ```
 
-`auxiliary_weight` only bites when the model produces per-modality risks, so the same
-loss call works for all three strategies.
+The dataset supplies the modality names and the target. Runnable versions are in
+[examples/hancock/](../examples/hancock/): `survival_intermediate.py` (intermediate, Cox), `classification_late.py`
+(late, classification) and `configs/intermediate_cox.yaml` (the same model as YAML).
 
-`output.risk` is the patient-level log partial hazard; `output.modality_risk` holds
-the per-modality risks from late fusion or the hybrid auxiliary heads.
-
-Encoders are **injected, not built here**, so any modality plugs in as long as it
-returns `(batch, latent_dim)`. `BagEncoder` adapts `AttentionMIL` to that interface
-while keeping attention available on `.last_attention` for interpretation.
-
-## Configuration
-
-```yaml
-FUSION:
-  STRATEGY: hybrid          # early | late | hybrid
-  METHOD: poe               # concat | poe | lowrank   (early and hybrid)
-  FUSED_DIM: 64
-  RANK: 4                   # lowrank only
-  AUXILIARY_HEADS: True     # hybrid only
-  AUXILIARY_WEIGHT: 0.3     # hybrid only
-  COMBINE_RISKS: False      # hybrid only: also merge decisions, not just features
-  MODALITY_DROPOUT: 0.2
-```
-
-`COMBINE_RISKS` decides how completely hybrid merges the two strategies. Left `False`,
-the fused trunk makes the prediction and the per-modality heads only supply auxiliary
-supervision and interpretability. Set `True`, the per-modality risks are blended into
-the final risk as well, combining early and late at the **decision** level too;
-absent modalities do not vote.
+Widths are checked at construction: a stage list must end in `(n, d)` vectors, adjacent `in_dim`/`out_dim` must
+match, and the head's `in_dim` must match the fusion output (`Concat` sums the widths, `MaskedMean` needs them equal).
 
 ## Missing modalities
 
-Missing modalities are a design requirement, not an edge case: real cohorts rarely
-have every modality for every patient. A `(batch, num_modalities)` mask (1 = present)
-is carried into every strategy and fusion block.
+Every model follows one rule, so absence needs no placeholder values:
 
-| Mechanism | Behaviour |
-| --- | --- |
-| Modality mask | Marks which modalities each patient actually has |
-| Learned placeholder | `concat`, `lowrank` and `early` substitute a learned embedding for an absent modality — a zero vector would be indistinguishable from a genuine all-zero latent |
-| Precision zeroing | `poe` gives an absent expert negligible precision, so it leaves the product entirely |
-| Prior expert | `poe` includes a prior so a patient missing *every* modality still yields a defined result instead of `0/0` |
-| No vote | `late` renormalises its weights over present modalities only |
-| Modality dropout | Randomly marks modalities absent during training; always keeps at least one |
+1. Stages run only on patients who have the modality.
+2. Outputs are scattered back into the batch with NaN for the others.
+3. Fusion selects the defined rows. It never multiplies by a mask, since `NaN * 0` is `NaN` and would corrupt
+   gradients.
+4. Heads run on defined rows only. Patients with no prediction get NaN.
 
-## Scope
+Which patients a model can handle is decided by the fusion method and `MultimodalDataset(required_modalities=...)`.
+`model.check(data)` runs at the start of `fit` and raises if the data has missing patterns the fusion cannot handle,
+or patients with none of the modalities. The library does not include modality dropout or learned placeholder
+embeddings.
 
-These are model-level APIs. Patient matching across modalities and a multimodal
-trainer are provided by the multimodal cohort loader, not by this module.
+## Extending
 
-Fusion operates on encoded representations rather than raw inputs, since a 3D volume,
-a variable-size patch bag, and a ~50-dimensional vector share no common input space.
-The Cox risk set spans the mini-batch, so the batch-size requirements of the unimodal
-pipeline apply unchanged.
+ A new fusion method is an `nn.Module` with `handles_missing`, `output_dim(widths)` and
+`forward(z, present)`. A late combiner instead sets `input_space` (`"output"` or `"prediction"`) and implements
+`check_branches`, with `columns` if it works on predictions.
+
