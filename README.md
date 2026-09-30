@@ -1,4 +1,6 @@
-# KaleCancer
+<p align="center">
+  <img src="https://raw.githubusercontent.com/pykale/cancer/main/docs/KaleCancer_Horizontal_PyKale_Background.png" alt="KaleCancer" width="600"/>
+</p>
 
 > *Multimodal machine learning for oncology: whole-slide pathology, radiology, and clinical records, with time-to-event prediction.*
 
