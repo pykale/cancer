@@ -14,7 +14,7 @@ from sklearn.model_selection import train_test_split as _sklearn_train_test_spli
 
 from kalecancer.loaddata.identifiers import _as_ids, _check_leading_zeros, _NotFoundError
 from kalecancer.loaddata.modalities import _as_modality
-from kalecancer.loaddata.targets import Classification, TimeToEvent
+from kalecancer.loaddata.targets import BaseTarget
 
 
 class MultimodalDataset(torch.utils.data.Dataset):
@@ -30,7 +30,7 @@ class MultimodalDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         modalities: Mapping[str, Any],
-        target: TimeToEvent | Classification | None,
+        target: BaseTarget | None,
         required_modalities: Sequence[str],
     ):
         if not modalities:

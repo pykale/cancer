@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Hashable, Sequence
-from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -14,13 +14,27 @@ from torch import Tensor
 from kalecancer.loaddata.identifiers import _as_ids
 
 
-@dataclass(frozen=True)
-class TargetInfo:
-    kind: str
-    classes: tuple | None
+class BaseTarget(ABC):
+    frame: pd.DataFrame
+
+    @property
+    def ids(self) -> pd.Index:
+        return self.frame.index
+
+    @abstractmethod
+    def tensors(self, ids: Sequence[str]) -> dict[str, Tensor]:
+        """The target for ``ids``, in that order, as the tensors the head's loss reads."""
+
+    @abstractmethod
+    def strata(self, ids: Sequence[str]) -> np.ndarray:
+        """One discrete label per patient for stratified splitters"""
+
+    @abstractmethod
+    def counts(self, ids: Sequence[str]) -> dict[str, int]:
+        """Summary counts for ``ids`` to report in fits and folds, such as events or patients per class."""
 
 
-class TimeToEvent:
+class TimeToEvent(BaseTarget):
     """Right-censored time-to-event target.
 
     Args:
@@ -28,8 +42,6 @@ class TimeToEvent:
         event: ``True`` where the event was observed, ``False`` where censored. Missing values raise:
             an unknown outcome is not a censored one.
     """
-
-    kind = "time_to_event"
 
     def __init__(self, time: pd.Series, event: pd.Series):
         self.time = time
@@ -57,10 +69,6 @@ class TimeToEvent:
             {"time": numeric_time.to_numpy(dtype=np.float32), "event": event.to_numpy(dtype=bool)}, index=ids
         )
 
-    @property
-    def ids(self) -> pd.Index:
-        return self.frame.index
-
     def tensors(self, ids: Sequence[str]) -> dict[str, Tensor]:
         rows = self.frame.loc[list(ids)]
         return {
@@ -74,19 +82,14 @@ class TimeToEvent:
     def counts(self, ids: Sequence[str]) -> dict[str, int]:
         return {"events": int(self.frame.loc[list(ids), "event"].sum())}
 
-    def info(self) -> TargetInfo:
-        return TargetInfo(self.kind, None)
 
-
-class Classification:
+class Classification(BaseTarget):
     """Class-label target.
 
     Args:
         labels: Label per patient; every value must be one of ``classes``.
         classes: All classes, in the order that defines class indices and prediction columns.
     """
-
-    kind = "classification"
 
     def __init__(self, labels: pd.Series, classes: Sequence[Hashable]):
         self.labels = labels
@@ -104,10 +107,6 @@ class Classification:
         self._index = {c: k for k, c in enumerate(ordered)}
         self.frame = pd.DataFrame({"label": labels.to_numpy(dtype=object)}, index=ids)
 
-    @property
-    def ids(self) -> pd.Index:
-        return self.frame.index
-
     def tensors(self, ids: Sequence[str]) -> dict[str, Tensor]:
         codes = [self._index[v] for v in self.frame.loc[list(ids), "label"]]
         return {"label": torch.tensor(codes, dtype=torch.int64)}
@@ -118,6 +117,3 @@ class Classification:
     def counts(self, ids: Sequence[str]) -> dict[str, int]:
         observed = Counter(self.frame.loc[list(ids), "label"])
         return {f"label: {c}": observed.get(c, 0) for c in self.classes}
-
-    def info(self) -> TargetInfo:
-        return TargetInfo(self.kind, tuple(self.classes))

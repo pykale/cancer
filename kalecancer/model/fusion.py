@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from kalecancer.loaddata.targets import TargetInfo
+from kalecancer.loaddata.targets import BaseTarget, Classification, TimeToEvent
 
 Stage = Literal["early", "intermediate", "late"]
 _STAGES: tuple[Stage, ...] = ("early", "intermediate", "late")
@@ -40,16 +40,14 @@ class FusionContext:
         required: Patients who must get a combined value, indexed like ``present``. Every patient, except in a
             ``LateFusion`` branch, where only the patients with at least one of the branch's modalities.
         widths: Width of each input, ``None`` where it is not known yet.
-        target: The dataset's target, or ``None`` before there is a dataset.
-        head_kinds: In late fusion, the ``target_kind`` of each branch head. Empty otherwise.
+        head_kinds: In late fusion, the ``target_type`` of each branch head. Empty otherwise.
     """
 
     stage: Stage
     present: pd.DataFrame
     required: pd.Series
     widths: Mapping[str, int | None]
-    target: TargetInfo | None = None
-    head_kinds: Mapping[str, str | None] = field(default_factory=dict)
+    head_kinds: Mapping[str, type[BaseTarget] | None] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Reject a context whose ``required`` or ``widths`` do not line up with ``present``."""
@@ -58,12 +56,15 @@ class FusionContext:
 
     @classmethod
     def without_data(
-        cls, stage: Stage, widths: Mapping[str, int | None], head_kinds: Mapping[str, str | None] | None = None
+        cls,
+        stage: Stage,
+        widths: Mapping[str, int | None],
+        head_kinds: Mapping[str, type[BaseTarget] | None] | None = None,
     ) -> FusionContext:
         """A context with no patients, for the checks a model can run when it is built."""
         present = pd.DataFrame({name: pd.Series(dtype=bool) for name in widths})
         required = pd.Series(dtype=bool, index=present.index)
-        return cls(stage, present, required, dict(widths), None, dict(head_kinds or {}))
+        return cls(stage, present, required, dict(widths), dict(head_kinds or {}))
 
 
 def _check_one_width(method: FusionMethod, widths: Mapping[str, int | None]) -> None:
@@ -71,6 +72,12 @@ def _check_one_width(method: FusionMethod, widths: Mapping[str, int | None]) -> 
     known = {name: width for name, width in widths.items() if width is not None}
     if len(set(known.values())) > 1:
         raise ValueError(f"{type(method).__name__} needs inputs of one width, got {known}")
+
+
+def _heads_predict(context: FusionContext, target_type: type[BaseTarget]) -> bool:
+    """Whether every branch head in ``context`` predicts ``target_type`` or a subclass of it."""
+    kinds = context.head_kinds.values()
+    return bool(kinds) and all(kind is not None and issubclass(kind, target_type) for kind in kinds)
 
 
 def _stack_defined(values: Mapping[str, Tensor], defined: Mapping[str, Tensor]) -> tuple[Tensor, Tensor]:
@@ -206,9 +213,13 @@ class MaskedMean(FusionMethod):
             raise TypeError(f"MaskedMean needs branch heads of one kind, got {kinds}")
         _check_one_width(self, context.widths)
         incomplete = int((~context.present.all(axis=1)).sum())
-        if kinds == {"time_to_event"} and incomplete:
+
+        # NOTE: this checks for TimeToEvent heads, but the issue is with Cox heads
+        # specifically. This will need fixing if another TimeToEvent head is added
+        # that does not have an issue with averaging over branches.
+        if _heads_predict(context, TimeToEvent) and incomplete:
             raise ValueError(
-                f"MaskedMean over Cox heads needs every patient to have every branch, but {incomplete} do not: each "
+                f"MaskedMean over Cox Head needs every patient to have every branch, but {incomplete} do not: each "
                 "branch's log-hazard has an arbitrary offset, so averaging different subsets of branches would "
                 "reorder patients"
             )
@@ -247,18 +258,13 @@ class MajorityVote(FusionMethod):
     def check(self, context: FusionContext) -> None:
         """Also needs classification heads with one output width."""
         super().check(context)
-        kinds = set(context.head_kinds.values())
-        if kinds != {"classification"}:
-            raise TypeError(f"MajorityVote needs classification heads, got {kinds}")
+        if not _heads_predict(context, Classification):
+            raise TypeError(f"MajorityVote needs classification heads, got {set(context.head_kinds.values())}")
         _check_one_width(self, context.widths)
 
-    def columns(self, info: TargetInfo) -> list[str]:
+    def columns(self, target: Classification) -> list[str]:
         """One vote-score column per class."""
-        # assert is temporary fix to keep mypy quiet
-        # real fix requires rethinking TargetInfo
-        assert info.classes is not None, "classification targets always carry classes"
-
-        return [f"vote_score[{c}]" for c in info.classes]
+        return [f"vote_score[{c}]" for c in target.classes]
 
     def forward(self, values: Mapping[str, Tensor], present: Mapping[str, Tensor]) -> Tensor:
         """Score each class from the votes of the branches each row has; with ``tie_break="error"``, raise on a tie."""

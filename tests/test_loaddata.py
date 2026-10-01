@@ -6,7 +6,14 @@ from sklearn.base import clone
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
-from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, TimeToEvent, train_test_split
+from kalecancer.loaddata import (
+    BaseTarget,
+    Classification,
+    MultimodalDataset,
+    PatchFeatures,
+    TimeToEvent,
+    train_test_split,
+)
 from kalecancer.prepdata import ColumnGroup, TableTransform
 
 
@@ -98,11 +105,20 @@ def test_classification_validation(cohort):
 
 
 def test_classification_indices_follow_classes_order(cohort):
-    target = Classification(cohort.labels, classes=["low", "high"])
     ids = ["001", "002", "003"]
     expected = [0 if cohort.labels[pid] == "low" else 1 for pid in ids]
-    assert target.tensors(ids)["label"].tolist() == expected
-    assert target.info().classes == ("low", "high")
+    assert Classification(cohort.labels, classes=["low", "high"]).tensors(ids)["label"].tolist() == expected
+    reversed_order = Classification(cohort.labels, classes=["high", "low"])
+    assert reversed_order.tensors(ids)["label"].tolist() == [1 - k for k in expected]
+
+
+def test_target_subclasses_must_implement_the_target_methods():
+    class Incomplete(BaseTarget):
+        def tensors(self, ids):
+            return {}
+
+    with pytest.raises(TypeError, match=r"abstract methods.*counts.*strata"):
+        Incomplete()
 
 
 # ---------------------------------------------------------------- patch features

@@ -35,7 +35,7 @@ class EvalContext:
     """
 
     train_target: pd.DataFrame
-    classes: tuple | None
+    classes: Sequence[Hashable] | None
 
 
 class Metric(ABC):

@@ -12,6 +12,7 @@ from sklearn.base import clone
 
 from kalecancer.evaluate.metrics import EvalContext, Metric
 from kalecancer.loaddata.dataset import MultimodalDataset
+from kalecancer.loaddata.targets import Classification
 
 
 @dataclass
@@ -57,7 +58,10 @@ def cross_validate(
             raise AssertionError(f"fold {fold}: {len(leaked)} test patients were used in fit")
         prediction = fitted.predict(data.subset(test_ids))
         target = data.target.frame.loc[prediction.index]
-        context = EvalContext(train_target=fitted.train_target_, classes=fitted.target_info_.classes)
+        context = EvalContext(
+            train_target=fitted.train_target_,
+            classes=fitted.target_.classes if isinstance(fitted.target_, Classification) else None,
+        )
         test_counts = {f"test {key}": value for key, value in data.target.counts(test_ids).items()}
         scores = {name: metric(prediction, target, context) for name, metric in metrics.items()}
         rows.append({"fold": fold, "n_test": len(test_ids), **test_counts, **fitted.fit_report_, **scores})

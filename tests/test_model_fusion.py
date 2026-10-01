@@ -166,7 +166,7 @@ def test_stage_lists_must_end_with_vectors(cohort):
         model(whole_batch(data))
 
 
-def test_head_must_match_target_kind(cohort):
+def test_head_must_match_target_type(cohort):
     data = make_data(cohort, required=["clinical", "wsi"], task="classification")
     with pytest.raises(TypeError, match="time-to-event"):
         intermediate().check(data)
@@ -221,7 +221,7 @@ def test_late_fusion_loss_is_sum_of_branch_losses_and_prediction_uses_mean_logit
     torch.testing.assert_close(losses["loss"], branch_sum)
     mean_logits = (output.branches["clinical"].output + output.branches["wsi"].output) / 2
     torch.testing.assert_close(output.prediction, torch.softmax(mean_logits, dim=-1))
-    assert model.columns(data.target.info()) == ["probability[low]", "probability[high]"]
+    assert model.columns(data.target) == ["probability[low]", "probability[high]"]
 
 
 def test_late_fusion_cox_masked_mean_needs_complete_branches(cohort):
@@ -239,7 +239,7 @@ def test_late_fusion_with_missing_branch_rows(cohort):
     wsi = output.branches["wsi"]
     assert int(wsi.defined.sum()) == 30 and torch.isnan(wsi.prediction[~wsi.defined]).all()
     assert bool(output.defined.all()) and torch.isfinite(output.prediction).all()
-    assert model.columns(data.target.info()) == ["vote_score[low]", "vote_score[high]"]
+    assert model.columns(data.target) == ["vote_score[low]", "vote_score[high]"]
     model.loss(output, batch["target"])["loss"].backward()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 

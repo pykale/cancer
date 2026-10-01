@@ -20,7 +20,7 @@ from torch import Tensor, nn
 
 from kalecancer.loaddata.dataset import MultimodalDataset
 from kalecancer.loaddata.modalities import Modality
-from kalecancer.loaddata.targets import TargetInfo
+from kalecancer.loaddata.targets import BaseTarget
 from kalecancer.model.fusion import FusionContext, FusionMethod, Stage
 from kalecancer.model.incontext import InContextModule
 
@@ -150,16 +150,6 @@ def _presence(present: Mapping[str, Tensor]) -> Tensor:
     return torch.stack(list(present.values()), dim=1)
 
 
-def _defined_rows(fusion: FusionMethod, present: pd.DataFrame) -> pd.Series:
-    """``fusion.defined`` for a pandas presence table, as a bool Series indexed by patient."""
-    return pd.Series(fusion.defined(torch.tensor(present.to_numpy(dtype=bool))).numpy(), index=present.index)
-
-
-def _target_info(data: MultimodalDataset) -> TargetInfo | None:
-    """The dataset's ``TargetInfo``, or ``None`` when it has no target."""
-    return None if data.target is None else data.target.info()
-
-
 def _check_fusion(
     fusion: FusionMethod,
     stage: Stage,
@@ -171,7 +161,7 @@ def _check_fusion(
     present = data.present[list(widths)]
     # a LateFusion branch need not cover patients with none of its modalities: another branch predicts for them
     required = present.any(axis=1) if allow_undefined else pd.Series(True, index=present.index)
-    fusion.check(FusionContext(stage, present, required, widths, _target_info(data)))
+    fusion.check(FusionContext(stage, present, required, widths))
 
 
 class _SingleHeadModel(nn.Module):
@@ -210,7 +200,7 @@ class _SingleHeadModel(nn.Module):
     def _check_target(self, data: MultimodalDataset) -> None:
         """Raise if the head cannot predict the dataset's target."""
         if data.target is not None:
-            self.head.check_target(data.target.info())
+            self.head.check_target(data.target)
 
     def _finish(self, rows: Tensor | None, defined: Tensor) -> ModelOutput:
         """Run the head on the rows of the defined patients (``None`` when there are none) and scatter its output
@@ -233,9 +223,9 @@ class _SingleHeadModel(nn.Module):
             value = self.head.loss(output.output[index], {key: t[index] for key, t in target.items()})
         return None if value is None else {"loss": value}
 
-    def columns(self, info: TargetInfo) -> list[str]:
+    def columns(self, target: BaseTarget) -> list[str]:
         """Names of the prediction columns, as the head gives them."""
-        return self.head.columns(info)
+        return self.head.columns(target)
 
 
 class Unimodal(_SingleHeadModel):
@@ -321,7 +311,7 @@ class IntermediateFusion(_SingleHeadModel):
 
     def _defined_for(self, data: MultimodalDataset) -> pd.Series:
         """The patients the fusion method can combine."""
-        return _defined_rows(self.fusion, data.present[self.modalities])
+        return self.fusion.defined_rows(data.present[self.modalities])
 
     def fit(self, train: MultimodalDataset) -> None:
         """Fit each ``InContextModule`` first stage on the training patients who have its modality."""
@@ -378,7 +368,7 @@ class EarlyFusion(_SingleHeadModel):
 
     def _defined_for(self, data: MultimodalDataset) -> pd.Series:
         """The patients the fusion method can combine."""
-        return _defined_rows(self.fusion, data.present[self.modalities])
+        return self.fusion.defined_rows(data.present[self.modalities])
 
     def fit(self, train: MultimodalDataset) -> None:
         """Fit an ``InContextModule`` first stage on the training patients who have every modality."""
@@ -454,12 +444,12 @@ class LateFusion(nn.Module):
         branch predicts for."""
         heads = {name: branch.head for name, branch in self.branches.items()}
         widths = {name: getattr(head, "out_dim", None) for name, head in heads.items()}
-        kinds = {name: getattr(head, "target_kind", None) for name, head in heads.items()}
+        kinds = {name: getattr(head, "target_type", None) for name, head in heads.items()}
         if data is None:
             return FusionContext.without_data("late", widths, kinds)
         # the inputs of late fusion are branches: a patient has one when that branch predicts for them
         covered = pd.DataFrame({name: branch._defined_for(data) for name, branch in self.branches.items()})
-        return FusionContext("late", covered, pd.Series(True, index=covered.index), widths, _target_info(data), kinds)
+        return FusionContext("late", covered, pd.Series(True, index=covered.index), widths, kinds)
 
     def check(self, data: MultimodalDataset) -> None:
         """Raise if a branch cannot be used with ``data``, or ``fusion`` cannot fuse the branches."""
@@ -499,11 +489,11 @@ class LateFusion(nn.Module):
             return None
         return {"loss": torch.stack(list(parts.values())).sum(), **{f"loss/{name}": v for name, v in parts.items()}}
 
-    def columns(self, info: TargetInfo) -> list[str]:
+    def columns(self, target: BaseTarget) -> list[str]:
         """Prediction columns: the heads' when ``fusion`` fuses head outputs, otherwise ``fusion``'s own."""
         if self.fusion.input_space == "output":
-            return self._reference_head.columns(info)
-        return self.fusion.columns(info)
+            return self._reference_head.columns(target)
+        return self.fusion.columns(target)
 
     def stages_for(self, modality: str, branch: str | None = None) -> StageList:
         """The stage list for ``modality``; pass ``branch`` when more than one branch reads it."""

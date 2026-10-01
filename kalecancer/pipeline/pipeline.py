@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 from kalecancer.evaluate.metrics import EvalContext, Metric
 from kalecancer.interpret.attention import attention as _attention
 from kalecancer.loaddata.dataset import MultimodalDataset
+from kalecancer.loaddata.targets import Classification
 from kalecancer.model.models import EarlyFusion, IntermediateFusion, LateFusion, Unimodal
 from kalecancer.pipeline.training import (
     _concatenate,
@@ -166,7 +167,6 @@ class Pipeline(BaseEstimator):
                 _reinitialise(model)
             model.fit(view.subset(train_ids))
 
-            info = data.target.info()
             loader = self._loader(view.subset(train_ids), shuffle=True)
             if len(loader) == 0:
                 raise ValueError(
@@ -184,8 +184,11 @@ class Pipeline(BaseEstimator):
                 param_groups=self.param_groups,
                 monitor=self.early_stopping.metric if self.early_stopping else None,
                 validation_target=data.target.frame.loc[val_ids] if val_ids else None,
-                context=EvalContext(train_target=data.target.frame.loc[train_ids], classes=info.classes),
-                columns=model.columns(info),
+                context=EvalContext(
+                    train_target=data.target.frame.loc[train_ids],
+                    classes=data.target.classes if isinstance(data.target, Classification) else None,
+                ),
+                columns=model.columns(data.target),
             )
             with tempfile.TemporaryDirectory() as root:
                 trainer = self._trainer(callbacks, root)
@@ -203,7 +206,7 @@ class Pipeline(BaseEstimator):
         self.transforms_ = transforms
         self.train_ids_ = train_ids
         self.val_ids_ = val_ids
-        self.target_info_ = info
+        self.target_ = data.target
         self.train_target_ = data.target.frame.loc[train_ids]
         self.history_ = pd.DataFrame(module.history).set_index("epoch") if module.history else pd.DataFrame()
         skipped = int(sum(row["skipped_batches"] for row in module.history))
@@ -352,11 +355,11 @@ class Pipeline(BaseEstimator):
         ids = [pid for batch_ids, _ in results for pid in batch_ids]
         output = _concatenate([out for _, out in results])
         if branch is None:
-            values, columns = output.prediction, self.model_.columns(self.target_info_)
+            values, columns = output.prediction, self.model_.columns(self.target_)
         else:
             values, columns = (
                 output.branches[branch].prediction,
-                self.model_.branches[branch].columns(self.target_info_),
+                self.model_.branches[branch].columns(self.target_),
             )
         frame = pd.DataFrame(values.numpy(), index=pd.Index(ids, name="id"), columns=columns)
         if not frame.index.is_unique:
@@ -383,9 +386,14 @@ class Pipeline(BaseEstimator):
                 "patients, or pass allow_seen=True"
             )
         prediction = self.predict(data, branch=branch)
-        target = data.target.frame.loc[prediction.index]
-        context = EvalContext(train_target=self.train_target_, classes=self.target_info_.classes)
-        return pd.Series({name: metric(prediction, target, context) for name, metric in metrics.items()}, name="score")
+        eval_target = data.target.frame.loc[prediction.index]
+        context = EvalContext(
+            train_target=self.train_target_,
+            classes=self.target_.classes if isinstance(self.target_, Classification) else None,
+        )
+        return pd.Series(
+            {name: metric(prediction, eval_target, context) for name, metric in metrics.items()}, name="score"
+        )
 
     def _single_modality(self, data: MultimodalDataset, modality: str, branch: str | None) -> tuple:
         if modality not in data.modalities:

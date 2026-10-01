@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from kalecancer.loaddata import TargetInfo
+from kalecancer.loaddata import Classification, TimeToEvent
 from kalecancer.model import (
     ABMIL,
     MLP,
@@ -20,8 +20,11 @@ from kalecancer.model import (
     MaskedMean,
 )
 
-SURVIVAL = TargetInfo("time_to_event", None)
-BINARY = TargetInfo("classification", ("low", "high"))
+TARGET_IDS = pd.Index(["001", "002", "003"])
+SURVIVAL = TimeToEvent(
+    pd.Series([10.0, 20.0, 30.0], index=TARGET_IDS), pd.Series([True, False, True], index=TARGET_IDS)
+)
+BINARY = Classification(pd.Series(["low", "high", "low"], index=TARGET_IDS), classes=["low", "high"])
 
 
 # ---------------------------------------------------------------- MLP and ABMIL
@@ -176,9 +179,13 @@ def test_cox_loss_is_computed_in_float32_under_autocast():
     assert mixed.item() == pytest.approx(reference.item(), rel=1e-4)
 
 
-def test_cox_head_checks_target_kind():
+def test_cox_head_checks_target_type():
+    class Subclassed(TimeToEvent):
+        pass
+
     head = CoxHead(in_dim=4, ties="efron")
     head.check_target(SURVIVAL)
+    head.check_target(Subclassed(SURVIVAL.time, SURVIVAL.event))
     with pytest.raises(TypeError, match="time-to-event"):
         head.check_target(BINARY)
     assert head.columns(SURVIVAL) == ["log_hazard"]
@@ -196,7 +203,7 @@ def test_classification_head_contract():
     assert head.predict(logits).sum(dim=1).allclose(torch.ones(5))
     assert head.columns(BINARY) == ["probability[low]", "probability[high]"]
     with pytest.raises(ValueError, match="n_classes=2"):
-        head.check_target(TargetInfo("classification", ("a", "b", "c")))
+        head.check_target(Classification(pd.Series(["a", "b", "c"], index=TARGET_IDS), classes=["a", "b", "c"]))
     with pytest.raises(TypeError, match="classification target"):
         head.check_target(SURVIVAL)
 
@@ -211,9 +218,7 @@ def scatter_nan(values: torch.Tensor, present: torch.Tensor) -> torch.Tensor:
 
 def late_context(covered, kinds, width=1):
     present = pd.DataFrame(covered)
-    return FusionContext(
-        "late", present, pd.Series(True, index=present.index), dict.fromkeys(present, width), None, kinds
-    )
+    return FusionContext("late", present, pd.Series(True, index=present.index), dict.fromkeys(present, width), kinds)
 
 
 def test_concat_defines_only_patients_with_every_input():
@@ -242,7 +247,7 @@ def test_fusion_check_requires_the_patients_the_model_must_cover(method, branch,
 
 
 def test_fusion_methods_reject_stages_they_do_not_support():
-    classification = {"a": "classification", "b": "classification"}
+    classification = {"a": Classification, "b": Classification}
     with pytest.raises(TypeError, match="Concat is for early or intermediate fusion, not late fusion"):
         Concat().check(FusionContext.without_data("late", {"a": 2, "b": 2}, classification))
     with pytest.raises(TypeError, match="MajorityVote is for late fusion, not intermediate fusion"):
@@ -291,14 +296,19 @@ def test_masked_mean_averages_present_rows_with_finite_gradients():
 
 
 def test_masked_mean_in_late_fusion_rejects_cox_heads_with_missing_branches():
-    cox = {"a": "time_to_event", "b": "time_to_event"}
+    class Subclassed(TimeToEvent):
+        pass
+
+    cox = {"a": TimeToEvent, "b": TimeToEvent}
     MaskedMean().check(late_context({"a": [True, True], "b": [True, True]}, cox))
     with pytest.raises(ValueError, match="arbitrary offset"):
         MaskedMean().check(late_context({"a": [True, True], "b": [True, False]}, cox))
-    classification = {"a": "classification", "b": "classification"}
+    with pytest.raises(ValueError, match="arbitrary offset"):
+        MaskedMean().check(late_context({"a": [True, True], "b": [True, False]}, dict.fromkeys(cox, Subclassed)))
+    classification = {"a": Classification, "b": Classification}
     MaskedMean().check(late_context({"a": [True, True], "b": [True, False]}, classification, width=2))
     with pytest.raises(TypeError, match="one kind"):
-        MaskedMean().check(late_context({"a": [True], "b": [True]}, {"a": "time_to_event", "b": "classification"}))
+        MaskedMean().check(late_context({"a": [True], "b": [True]}, {"a": TimeToEvent, "b": Classification}))
 
 
 def test_majority_vote_breaks_ties_by_mean_probability():
@@ -320,7 +330,12 @@ def test_majority_vote_uses_only_defined_branches_and_needs_classification_heads
     defined = {"a": torch.tensor([True]), "b": torch.tensor([False])}
     scores = MajorityVote(tie_break="error")({"a": p_a, "b": p_b}, defined)
     assert scores[0].argmax().item() == 0 and torch.isfinite(scores).all()
-    with pytest.raises(TypeError, match="classification heads"):
-        MajorityVote(tie_break="error").check(
-            late_context({"a": [True], "b": [True]}, {"a": "time_to_event", "b": "time_to_event"})
-        )
+
+    class Subclassed(Classification):
+        pass
+
+    vote = MajorityVote(tie_break="error")
+    vote.check(late_context({"a": [True], "b": [True]}, {"a": Classification, "b": Subclassed}, width=2))
+    for kinds in ({"a": TimeToEvent, "b": TimeToEvent}, {"a": Classification, "b": None}):
+        with pytest.raises(TypeError, match="classification heads"):
+            vote.check(late_context({"a": [True], "b": [True]}, kinds, width=2))

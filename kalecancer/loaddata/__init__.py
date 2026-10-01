@@ -2,14 +2,14 @@
 
 from kalecancer.loaddata.dataset import MultimodalDataset, train_test_split
 from kalecancer.loaddata.modalities import Modality, PatchFeatures
-from kalecancer.loaddata.targets import Classification, TargetInfo, TimeToEvent
+from kalecancer.loaddata.targets import BaseTarget, Classification, TimeToEvent
 
 __all__ = [
+    "BaseTarget",
     "Classification",
     "Modality",
     "MultimodalDataset",
     "PatchFeatures",
-    "TargetInfo",
     "TimeToEvent",
     "train_test_split",
 ]

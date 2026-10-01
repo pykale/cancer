@@ -93,8 +93,8 @@ A new fusion method subclasses `FusionMethod`, declares the `stages` it supports
 - `forward(values, present)`: the combination, called only on the rows `defined` accepts.
 
 To add rules, it overrides `check(context)` and calls `super().check(context)` first. The `FusionContext` holds the
-stage, which patients have which inputs and which must be combined, the input widths, the target and, in late fusion,
-the kind of each branch head. The model builds it, so a fusion method never sees the dataset, and no model needs
+stage, which patients have which inputs and which must be combined, the input widths and, in late fusion, the target
+type each branch head predicts. The model builds it, so a fusion method never sees the dataset, and no model needs
 changing for a new method.
 
 In late fusion the inputs are the branches. `input_space` chooses whether the method receives the branch head outputs

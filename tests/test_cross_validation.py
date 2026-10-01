@@ -5,29 +5,34 @@ import torch
 from sklearn.model_selection import StratifiedKFold
 from torch import nn
 
-from kalecancer.evaluate import HarrellC, cross_validate
-from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent
-from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion
+from kalecancer.evaluate import AUROC, BalancedAccuracy, HarrellC, cross_validate
+from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, TimeToEvent
+from kalecancer.model import ABMIL, ClassificationHead, Concat, CoxHead, IntermediateFusion
 from kalecancer.pipeline import Pipeline
 
 
-def survival_data(cohort):
+def dataset(cohort, task="survival"):
     numeric = cohort.clinical[["age"]].assign(age=lambda f: (f["age"] - 60) / 10)
+    target = (
+        TimeToEvent(cohort.time, cohort.event)
+        if task == "survival"
+        else Classification(cohort.labels, classes=["low", "high"])
+    )
     return MultimodalDataset(
         {"clinical": numeric, "wsi": PatchFeatures(cohort.wsi_files, multiple_files="concatenate")},
-        target=TimeToEvent(cohort.time, cohort.event),
+        target=target,
         required_modalities=["clinical", "wsi"],
     )
 
 
-def small_pipeline():
+def small_pipeline(task="survival"):
     model = IntermediateFusion(
         encoding={
             "clinical": [nn.Linear(1, 2)],
             "wsi": [ABMIL(in_dim=16, hidden_dim=2, attention_dim=2, dropout=0.0)],
         },
         fusion=Concat(),
-        head=CoxHead(in_dim=4, ties="efron"),
+        head=CoxHead(in_dim=4, ties="efron") if task == "survival" else ClassificationHead(in_dim=4, n_classes=2),
     )
     return Pipeline(
         model=model,
@@ -45,7 +50,7 @@ def small_pipeline():
 
 
 def test_every_patient_is_predicted_once_by_a_model_that_never_saw_it(cohort):
-    data = survival_data(cohort)
+    data = dataset(cohort)
     result = cross_validate(
         small_pipeline(),
         data,
@@ -64,7 +69,7 @@ def test_every_patient_is_predicted_once_by_a_model_that_never_saw_it(cohort):
 
 
 def test_stratification_uses_the_target_strata(cohort):
-    data = survival_data(cohort)
+    data = dataset(cohort)
     result = cross_validate(
         small_pipeline(),
         data,
@@ -75,8 +80,21 @@ def test_stratification_uses_the_target_strata(cohort):
     assert events.max() - events.min() <= 1
 
 
+def test_classification_folds_are_scored_against_the_fitted_classes(cohort):
+    result = cross_validate(
+        small_pipeline(task="classification"),
+        dataset(cohort, task="classification"),
+        cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=0),
+        metrics={"auroc": AUROC(positive_class="high"), "bacc": BalancedAccuracy()},
+    )
+    assert list(result.predictions.columns) == ["probability[low]", "probability[high]", "fold"]
+    assert result.folds[["auroc", "bacc"]].stack().between(0.0, 1.0).all()
+    low = result.folds["test label: low"]
+    assert low.max() - low.min() <= 1
+
+
 def test_arguments_are_checked(cohort):
-    data = survival_data(cohort)
+    data = dataset(cohort)
     with pytest.raises(ValueError, match="metrics is empty"):
         cross_validate(small_pipeline(), data, cv=StratifiedKFold(n_splits=3), metrics={})
     unlabelled = MultimodalDataset({"clinical": cohort.clinical[["age"]]}, target=None, required_modalities=[])

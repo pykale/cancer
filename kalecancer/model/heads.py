@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Mapping
-from typing import Literal
+from typing import Final, Literal
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from kalecancer.loaddata.targets import TargetInfo
+from kalecancer.loaddata.targets import BaseTarget, Classification, TimeToEvent
 
 with warnings.catch_warnings():
     # torchsurv applies torch.jit.script when imported, which recent torch deprecates; users cannot act on it
@@ -28,7 +28,7 @@ def _has_comparable_event(time: Tensor, event: Tensor) -> bool:
 class CoxHead(nn.Module):
     """Linear log-hazard trained with the Cox partial likelihood over the patients in each batch."""
 
-    target_kind = "time_to_event"
+    target_type: Final[type[TimeToEvent]] = TimeToEvent
     decomposable_loss = False
 
     def __init__(self, in_dim: int, ties: Literal["efron", "breslow"]):
@@ -47,12 +47,12 @@ class CoxHead(nn.Module):
     def predict(self, output: Tensor) -> Tensor:
         return output
 
-    def columns(self, info: TargetInfo) -> list[str]:
+    def columns(self, target: TimeToEvent) -> list[str]:
         return ["log_hazard"]
 
-    def check_target(self, info: TargetInfo) -> None:
-        if info.kind != self.target_kind:
-            raise TypeError(f"CoxHead needs a time-to-event target, got {info.kind}")
+    def check_target(self, target: BaseTarget) -> None:
+        if not isinstance(target, self.target_type):
+            raise TypeError(f"CoxHead needs a time-to-event target, got {type(target)}")
 
     def loss(self, output: Tensor, target: Mapping[str, Tensor]) -> Tensor | None:
         """Negative partial log-likelihood averaged over events; ``None`` when no event has anyone else at risk."""
@@ -77,7 +77,7 @@ class CoxHead(nn.Module):
 class ClassificationHead(nn.Module):
     """Linear class logits trained with cross-entropy."""
 
-    target_kind = "classification"
+    target_type: Final[type[Classification]] = Classification
     decomposable_loss = True
 
     def __init__(self, in_dim: int, n_classes: int):
@@ -95,23 +95,16 @@ class ClassificationHead(nn.Module):
     def predict(self, output: Tensor) -> Tensor:
         return torch.softmax(output.float(), dim=-1)
 
-    def columns(self, info: TargetInfo) -> list[str]:
-        # assert is temporary fix to keep mypy quiet
-        # real fix requires rethinking TargetInfo
-        assert info.classes is not None, "classification targets always carry classes"
+    def columns(self, target: Classification) -> list[str]:
+        return [f"probability[{c}]" for c in target.classes]
 
-        return [f"probability[{c}]" for c in info.classes]
+    def check_target(self, target: BaseTarget) -> None:
+        if not isinstance(target, self.target_type):
+            raise TypeError(f"ClassificationHead needs a classification target, got {type(target)}")
 
-    def check_target(self, info: TargetInfo) -> None:
-        if info.kind != self.target_kind:
-            raise TypeError(f"ClassificationHead needs a classification target, got {info.kind}")
-
-        # assert is temporary fix to keep mypy quiet
-        # real fix requires rethinking TargetInfo
-        assert info.classes is not None, "classification targets always carry classes"
-        if len(info.classes) != self.n_classes:
+        if len(target.classes) != self.n_classes:
             raise ValueError(
-                f"ClassificationHead has n_classes={self.n_classes} but the target has classes {info.classes}"
+                f"ClassificationHead has n_classes={self.n_classes} but the target has classes {target.classes}"
             )
 
     def loss(self, output: Tensor, target: Mapping[str, Tensor]) -> Tensor | None:

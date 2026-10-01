@@ -41,8 +41,10 @@ like this:
 - **A new fusion method** is one `FusionMethod` subclass in `model/fusion.py`. It declares the `stages` it supports,
   implements `defined`, `output_dim` and `forward`, and adds its own rules by overriding `check(context)`. Models
   never test for a particular fusion method.
-- **A new endpoint** is a target in `loaddata/targets.py` plus a head in
-  `model/heads.py`. The head owns the output, prediction, loss and target check.
+- **A new endpoint** is a `BaseTarget` subclass in `loaddata/targets.py`, implementing
+  `tensors`, `strata` and `counts`, plus a head in `model/heads.py`. The head declares the
+  target class it predicts as `target_type` and owns the output, prediction, loss and
+  target check.
 
 ## Component contracts
 

@@ -56,7 +56,7 @@ flowchart LR
 
 | Subpackage | Contents |
 | --- | --- |
-| `loaddata` | `MultimodalDataset`, `train_test_split`, the `Modality` protocol, `PatchFeatures`, the `TimeToEvent` and `Classification` targets |
+| `loaddata` | `MultimodalDataset`, `train_test_split`, the `Modality` protocol, `PatchFeatures`, `BaseTarget` and the `TimeToEvent` and `Classification` targets |
 | `prepdata` | `TableTransform` and `ColumnGroup`: sklearn transforms for table modalities |
 | `model` | Encoders (`MLP`, `ABMIL`, `TabICLEncoder`), `InContextModule`, fusion methods, heads, and the four models |
 | `pipeline` | `Pipeline`, `EarlyStopping`, Lightning training, `load_pipeline` and `dump_config` |
@@ -100,6 +100,11 @@ yet.
 
 A missing `event` raises an error: an unknown outcome is not a censored one. Each target reports strata (events or
 labels), which drive stratified splitting.
+
+Both subclass `BaseTarget`, and so does a new endpoint. A target implements `tensors` (the values the head's loss
+reads), `strata` (one discrete label per patient for stratified splitters) and `counts` (the summary counts in fit
+reports and cross-validation folds). The fitted pipeline keeps the target itself, so a head can read what it needs from
+it, such as the class order of a `Classification`.
 
 ### Preparing tables
 
@@ -150,8 +155,8 @@ the context minus its own stratified fold rather than against itself.
 
 Every method is a `FusionMethod`. It declares the stages it supports, says through `defined` which patients it can
 combine, and owns the rules for when it can be used in `check`. A model describes the experiment in a
-`FusionContext` (the stage, which patients have which inputs and which must be combined, the input widths, the target
-and, in late fusion, the kind of each branch head) and calls `check` once when it is built and again in
+`FusionContext` (the stage, which patients have which inputs and which must be combined, the input widths and, in late
+fusion, the target type each branch head predicts) and calls `check` once when it is built and again in
 `model.check(data)`. Models never test for a particular method, and they use the same `defined` in the forward pass,
 so the check and training cannot disagree. In late fusion, `MaskedMean` refuses Cox branches over patients with
 different branch subsets because each branch's log-hazard has an arbitrary offset, so averaging different subsets
@@ -175,7 +180,8 @@ patterns in the data.
 ### Heads
 
 A head owns everything endpoint-specific: its output, the prediction, the loss, the target check, and the names of the
-prediction columns.
+prediction columns. It declares the target class it predicts as `target_type`; `check_target` accepts that class or a
+subclass of it, and `columns` reads the target, for example the class order of a `Classification`.
 
 - **`CoxHead`** outputs a `log_hazard` (higher means higher risk) and trains with the Cox partial likelihood from
   TorchSurv, using Efron or Breslow ties. It has no bias because the partial likelihood is invariant to an additive
@@ -203,7 +209,7 @@ state. Training runs on Lightning.
 4. deep-copies the model, re-initialises its parameters when `random_state` is set, and fits any `InContextModule`;
 5. trains with Lightning, optionally early-stopping on a validation metric and restoring the best weights.
 
-It produces `model_`, `transforms_`, `train_ids_`, `val_ids_`, `target_info_`, `train_target_`, `history_` and
+It produces `model_`, `transforms_`, `train_ids_`, `val_ids_`, `target_`, `train_target_`, `history_` and
 `fit_report_`. The remaining methods are `predict` (a frame indexed by patient id, with a `branch` option for late
 fusion), `evaluate`, `encode` and `attention`.
 

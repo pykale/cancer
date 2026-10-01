@@ -47,8 +47,10 @@ def clinical_transform():
 def dataset(cohort, required=("clinical", "wsi"), task="survival", event=None):
     if task == "survival":
         target = TimeToEvent(cohort.time, cohort.event if event is None else event)
-    else:
+    elif task == "classification":
         target = Classification(cohort.labels, classes=["low", "high"])
+    else:
+        target = None
     modalities = {"clinical": cohort.clinical, "wsi": PatchFeatures(cohort.wsi_files, multiple_files="concatenate")}
     return MultimodalDataset(modalities, target=target, required_modalities=list(required))
 
@@ -211,6 +213,19 @@ def test_early_stopping_restores_the_epoch_it_judged_best(cohort):
     assert set(pipe.val_ids_).isdisjoint(pipe.train_ids_)
 
 
+def test_early_stopping_can_monitor_a_classification_metric(cohort):
+    train, _ = split(dataset(cohort, task="classification"))
+    pipe = pipeline(
+        late_classifier(),
+        max_epochs=3,
+        validation=StratifiedShuffleSplit(n_splits=1, test_size=0.3, random_state=0),
+        early_stopping=EarlyStopping(metric=AUROC(positive_class="high"), patience=2, restore_best=True),
+    ).fit(train)
+    history = pipe.history_
+    assert history["val_metric"].between(0.0, 1.0).all()
+    assert pipe.fit_report_["best_score"] == pytest.approx(history["val_metric"].max())
+
+
 def test_validation_arguments_are_checked(cohort):
     train, _ = split(dataset(cohort))
     with pytest.raises(ValueError, match="early_stopping needs validation"):
@@ -269,6 +284,9 @@ def test_late_fusion_branch_predictions_and_metrics(cohort):
     wsi = pipe.predict(test, branch="wsi")
     assert list(fused.columns) == list(wsi.columns) == ["probability[low]", "probability[high]"]
     np.testing.assert_allclose(fused.sum(axis=1), 1.0, rtol=1e-5)
+    # columns come from the target the pipeline was fitted on, so data without a target is named the same way
+    unlabelled = dataset(cohort, task=None).subset(test.ids)
+    pd.testing.assert_frame_equal(pipe.predict(unlabelled), fused)
     scores = pipe.evaluate(test, metrics={"auroc": AUROC(positive_class="high"), "bacc": BalancedAccuracy()})
     assert set(scores.index) == {"auroc", "bacc"}
     with pytest.raises(ValueError, match="branch='pathology'"):
