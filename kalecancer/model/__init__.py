@@ -3,7 +3,7 @@
 from typing import TYPE_CHECKING
 
 from kalecancer.model.encoders import ABMIL, MLP
-from kalecancer.model.fusion import Concat, MajorityVote, MaskedMean, MeanLogits
+from kalecancer.model.fusion import Concat, FusionContext, FusionMethod, MajorityVote, MaskedMean
 from kalecancer.model.heads import ClassificationHead, CoxHead
 from kalecancer.model.incontext import InContextModule
 from kalecancer.model.models import EarlyFusion, IntermediateFusion, LateFusion, ModelOutput, StageList, Unimodal
@@ -18,12 +18,13 @@ __all__ = [
     "Concat",
     "CoxHead",
     "EarlyFusion",
+    "FusionContext",
+    "FusionMethod",
     "InContextModule",
     "IntermediateFusion",
     "LateFusion",
     "MajorityVote",
     "MaskedMean",
-    "MeanLogits",
     "ModelOutput",
     "StageList",
     "TabICLEncoder",

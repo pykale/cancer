@@ -22,7 +22,6 @@ from kalecancer.model import (
     IntermediateFusion,
     LateFusion,
     MaskedMean,
-    MeanLogits,
     Unimodal,
 )
 from kalecancer.pipeline import EarlyStopping, Pipeline
@@ -79,7 +78,7 @@ def late_classifier():
                 ClassificationHead(in_dim=4, n_classes=2),
             ),
         },
-        combine=MeanLogits(),
+        fusion=MaskedMean(),
     )
 
 

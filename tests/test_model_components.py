@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 import torch.nn.functional as F
@@ -12,10 +13,11 @@ from kalecancer.model import (
     ClassificationHead,
     Concat,
     CoxHead,
+    FusionContext,
+    FusionMethod,
     InContextModule,
     MajorityVote,
     MaskedMean,
-    MeanLogits,
 )
 
 SURVIVAL = TargetInfo("time_to_event", None)
@@ -207,12 +209,66 @@ def scatter_nan(values: torch.Tensor, present: torch.Tensor) -> torch.Tensor:
     return full.index_put((present.nonzero().squeeze(1),), values)
 
 
-def test_concat_raises_when_a_patient_lacks_a_modality():
-    z = {"a": torch.randn(3, 2), "b": torch.randn(3, 4)}
-    assert Concat()(z, {"a": torch.ones(3, dtype=torch.bool), "b": torch.ones(3, dtype=torch.bool)}).shape == (3, 6)
+def late_context(covered, kinds, width=1):
+    present = pd.DataFrame(covered)
+    return FusionContext(
+        "late", present, pd.Series(True, index=present.index), dict.fromkeys(present, width), None, kinds
+    )
+
+
+def test_concat_defines_only_patients_with_every_input():
+    everyone = torch.ones(3, dtype=torch.bool)
+    assert Concat()({"a": torch.randn(3, 2), "b": torch.randn(3, 4)}, {"a": everyone, "b": everyone}).shape == (3, 6)
     assert Concat().output_dim({"a": 2, "b": 4}) == 6
-    with pytest.raises(ValueError, match="lack 'b'"):
-        Concat()(z, {"a": torch.ones(3, dtype=torch.bool), "b": torch.tensor([True, False, True])})
+    present = torch.tensor([[True, True], [True, False], [False, False]])
+    assert Concat().defined(present).tolist() == [True, False, False]
+    assert MaskedMean().defined(present).tolist() == [True, True, False]
+
+
+@pytest.mark.parametrize(
+    ("method", "branch", "failing"),
+    [(Concat, False, 2), (Concat, True, 1), (MaskedMean, False, 1), (MaskedMean, True, 0)],
+)
+def test_fusion_check_requires_the_patients_the_model_must_cover(method, branch, failing):
+    present = pd.DataFrame({"clinical": [True, True, False], "wsi": [True, False, False]}, index=["001", "002", "003"])
+    # a LateFusion branch must cover only the patients with some of its modalities
+    required = present.any(axis=1) if branch else pd.Series(True, index=present.index)
+    context = FusionContext("intermediate", present, required, {"clinical": 4, "wsi": 4})
+    if failing:
+        with pytest.raises(ValueError, match=f"cannot combine {failing} patients"):
+            method().check(context)
+    else:
+        method().check(context)
+
+
+def test_fusion_methods_reject_stages_they_do_not_support():
+    classification = {"a": "classification", "b": "classification"}
+    with pytest.raises(TypeError, match="Concat is for early or intermediate fusion, not late fusion"):
+        Concat().check(FusionContext.without_data("late", {"a": 2, "b": 2}, classification))
+    with pytest.raises(TypeError, match="MajorityVote is for late fusion, not intermediate fusion"):
+        MajorityVote(tie_break="error").check(FusionContext.without_data("intermediate", {"a": 2, "b": 2}))
+    MaskedMean().check(FusionContext.without_data("early", {"a": None, "b": None}))
+    MaskedMean().check(FusionContext.without_data("late", {"a": 2, "b": 2}, classification))
+
+
+def test_fusion_method_subclasses_must_implement_defined():
+    class Incomplete(FusionMethod):
+        stages = frozenset({"intermediate"})
+
+        def output_dim(self, widths):
+            return 0
+
+        def forward(self, values, present):
+            return values
+
+    with pytest.raises(TypeError, match=r"abstract method.*defined"):
+        Incomplete()
+
+
+def test_fusion_context_rejects_required_patients_indexed_unlike_present():
+    present = pd.DataFrame({"a": [True, False]}, index=["001", "002"])
+    with pytest.raises(ValueError, match="indexed like present"):
+        FusionContext("intermediate", present, pd.Series(True, index=["001"]), {"a": 2})
 
 
 def test_masked_mean_averages_present_rows_with_finite_gradients():
@@ -228,17 +284,21 @@ def test_masked_mean_averages_present_rows_with_finite_gradients():
     torch.testing.assert_close(fused[0], (a[0] + b[0]) / 2)
     fused.sum().backward()
     assert torch.isfinite(project.weight.grad).all()
-    with pytest.raises(ValueError, match="equal widths"):
+    with pytest.raises(ValueError, match="one width"):
         MaskedMean().output_dim({"a": 2, "b": 3})
+    with pytest.raises(ValueError, match="one width"):
+        MaskedMean().check(FusionContext.without_data("intermediate", {"a": 2, "b": 3}))
 
 
-def test_mean_logits_rejects_cox_heads_with_missing_branches():
-    heads = {"a": CoxHead(in_dim=2, ties="efron"), "b": CoxHead(in_dim=2, ties="efron")}
-    MeanLogits().check_branches(heads, complete=True)
+def test_masked_mean_in_late_fusion_rejects_cox_heads_with_missing_branches():
+    cox = {"a": "time_to_event", "b": "time_to_event"}
+    MaskedMean().check(late_context({"a": [True, True], "b": [True, True]}, cox))
     with pytest.raises(ValueError, match="arbitrary offset"):
-        MeanLogits().check_branches(heads, complete=False)
-    classification = {"a": ClassificationHead(2, 2), "b": ClassificationHead(2, 2)}
-    MeanLogits().check_branches(classification, complete=False)
+        MaskedMean().check(late_context({"a": [True, True], "b": [True, False]}, cox))
+    classification = {"a": "classification", "b": "classification"}
+    MaskedMean().check(late_context({"a": [True, True], "b": [True, False]}, classification, width=2))
+    with pytest.raises(TypeError, match="one kind"):
+        MaskedMean().check(late_context({"a": [True], "b": [True]}, {"a": "time_to_event", "b": "classification"}))
 
 
 def test_majority_vote_breaks_ties_by_mean_probability():
@@ -261,4 +321,6 @@ def test_majority_vote_uses_only_defined_branches_and_needs_classification_heads
     scores = MajorityVote(tie_break="error")({"a": p_a, "b": p_b}, defined)
     assert scores[0].argmax().item() == 0 and torch.isfinite(scores).all()
     with pytest.raises(TypeError, match="classification heads"):
-        MajorityVote(tie_break="error").check_branches({"a": CoxHead(2, "efron")}, complete=True)
+        MajorityVote(tie_break="error").check(
+            late_context({"a": [True], "b": [True]}, {"a": "time_to_event", "b": "time_to_event"})
+        )

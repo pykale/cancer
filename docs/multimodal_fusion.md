@@ -10,7 +10,7 @@ approaches changes the model dictionary, not the encoders, heads or `Pipeline`.
 | `Unimodal` | nothing | stages, then head |
 | `EarlyFusion` | raw vectors | fuse, then one stage list, then head |
 | `IntermediateFusion` | encoded features | stages per modality, then fuse, then head |
-| `LateFusion` | branch predictions | branch models trained jointly, then a combiner |
+| `LateFusion` | branch predictions | branch models trained jointly, then a fusion method |
 
 Early fusion needs modalities that are already vectors, such as tables.
 
@@ -22,12 +22,12 @@ the branch losses, and `predict(..., branch=name)` returns a single branch's pre
 | Method | Used by | Combines | Missing modalities |
 | --- | --- | --- | --- |
 | `Concat` | early, intermediate | vectors, concatenated | Not handled: every patient needs every modality |
-| `MaskedMean` | early, intermediate | equal-width vectors, averaged over those present | Handled |
-| `MeanLogits` | late | branch outputs (logits or log-hazards), averaged over present branches | Handled, except Cox with differing subsets |
+| `MaskedMean` | early, intermediate, late | equal-width vectors, averaged over those present; in late fusion, the branch outputs (logits or log-hazards) | Handled, except Cox late fusion with differing subsets |
 | `MajorityVote` | late | each branch's most probable class, ties broken by mean probability | Handled |
 
-`MeanLogits` refuses Cox branches unless every patient has every branch: each branch's log-hazard has an arbitrary
-offset, so averaging different subsets would reorder patients. `MajorityVote` needs classification heads.
+Each method declares the stages it supports, so a model built with a method for another stage fails at construction.
+In late fusion, `MaskedMean` refuses Cox branches unless every patient has every branch: each branch's log-hazard has
+an arbitrary offset, so averaging different subsets would reorder patients. `MajorityVote` needs classification heads.
 
 ## Usage
 
@@ -35,7 +35,7 @@ offset, so averaging different subsets would reorder patients. `MajorityVote` ne
 from torch import nn
 
 from kalecancer.model import (
-    ABMIL, MLP, ClassificationHead, Concat, CoxHead, IntermediateFusion, LateFusion, MeanLogits, Unimodal,
+    ABMIL, MLP, ClassificationHead, Concat, CoxHead, IntermediateFusion, LateFusion, MaskedMean, Unimodal,
 )
 from kalecancer.pipeline import Pipeline
 
@@ -55,7 +55,7 @@ late = LateFusion(
         "clinical": Unimodal("clinical", [MLP(12, [64], 64, 0.1)], ClassificationHead(64, n_classes=2)),
         "wsi": Unimodal("wsi", [ABMIL(1024, 256, 128, 0.25), nn.Linear(256, 64)], ClassificationHead(64, n_classes=2)),
     },
-    combine=MeanLogits(),
+    fusion=MaskedMean(),
 )
 
 pipeline = Pipeline(model=intermediate, ...)
@@ -79,13 +79,23 @@ Every model follows one rule, so absence needs no placeholder values:
 4. Heads run on defined rows only. Patients with no prediction get NaN.
 
 Which patients a model can handle is decided by the fusion method and `MultimodalDataset(required_modalities=...)`.
-`model.check(data)` runs at the start of `fit` and raises if the data has missing patterns the fusion cannot handle,
-or patients with none of the modalities. The library does not include modality dropout or learned placeholder
+`model.check(data)` runs at the start of `fit`, describes the data to the fusion method, and raises if the data has
+missing patterns the method cannot handle, or patients with none of the modalities. The library does not include modality dropout or learned placeholder
 embeddings.
 
 ## Extending
 
- A new fusion method is an `nn.Module` with `handles_missing`, `output_dim(widths)` and
-`forward(z, present)`. A late combiner instead sets `input_space` (`"output"` or `"prediction"`) and implements
-`check_branches`, with `columns` if it works on predictions.
+A new fusion method subclasses `FusionMethod`, declares the `stages` it supports (`"early"`, `"intermediate"`,
+`"late"`) and implements:
 
+- `defined(present)`: which patients it can combine, from an `(n_patients, n_inputs)` presence matrix;
+- `output_dim(widths)`: the width of its output, given the width of each input;
+- `forward(values, present)`: the combination, called only on the rows `defined` accepts.
+
+To add rules, it overrides `check(context)` and calls `super().check(context)` first. The `FusionContext` holds the
+stage, which patients have which inputs and which must be combined, the input widths, the target and, in late fusion,
+the kind of each branch head. The model builds it, so a fusion method never sees the dataset, and no model needs
+changing for a new method.
+
+In late fusion the inputs are the branches. `input_space` chooses whether the method receives the branch head outputs
+(`"output"`, the default) or their predictions (`"prediction"`, in which case it also implements `columns`).

@@ -32,7 +32,7 @@ flowchart LR
 
     subgraph model["model"]
         STG["Stage lists\nMLP, ABMIL, TabICLEncoder,\nany nn.Module"]
-        FUS["Fusion or combiner\nConcat, MaskedMean,\nMeanLogits, MajorityVote"]
+        FUS["Fusion method\nConcat, MaskedMean,\nMajorityVote"]
         HEAD["Head\nCoxHead,\nClassificationHead"]
         STG --> FUS --> HEAD
     end
@@ -112,14 +112,14 @@ patients who have that modality.
 
 ## Models
 
-A model is built from a list of stages per modality, a fusion method or combiner, and a head.
+A model is built from a list of stages per modality, a fusion method, and a head.
 
 | Model | Structure |
 | --- | --- |
 | `Unimodal` | one modality's stages, then a head |
 | `EarlyFusion` | fuse the raw vector modalities, then one stage list, then a head |
 | `IntermediateFusion` | stages per modality, then a fusion method, then a head |
-| `LateFusion` | branch models (each `Unimodal`, `EarlyFusion` or `IntermediateFusion`) trained jointly, then a combiner |
+| `LateFusion` | branch models (each `Unimodal`, `EarlyFusion` or `IntermediateFusion`) trained jointly, then a fusion method |
 
 Inputs from different modalities are incommensurable in shape, so raw inputs are never fused except when they are
 already vectors (early fusion). Intermediate fusion first encodes each modality to a vector.
@@ -142,17 +142,20 @@ the context minus its own stratified fold rather than against itself.
 
 ### Fusion
 
-| Method | Combines | Handles missing modalities |
-| --- | --- | --- |
-| `Concat` | vectors, concatenated | No: every patient must have every modality |
-| `MaskedMean` | equal-width vectors, averaged over those present | Yes |
-| `MeanLogits` | branch head outputs (logits or log-hazards) | Yes; for Cox, only when every patient has every branch |
-| `MajorityVote` | branch class votes, ties broken by mean probability | Yes |
+| Method | Stages | Combines | Handles missing modalities |
+| --- | --- | --- | --- |
+| `Concat` | early, intermediate | vectors, concatenated | No: every patient must have every modality |
+| `MaskedMean` | early, intermediate, late | equal-width vectors averaged over those present; in late fusion, branch head outputs (logits or log-hazards) | Yes; in Cox late fusion, only when every patient has every branch |
+| `MajorityVote` | late | branch class votes, ties broken by mean probability | Yes |
 
-The first two are early or intermediate fusion methods; the last two are late-fusion combiners. Each declares
-`handles_missing`, and the model checks the dataset against it before training. `MeanLogits` refuses Cox branches over
-patients with different modality subsets because each branch's log-hazard has an arbitrary offset, so averaging
-different subsets would reorder patients.
+Every method is a `FusionMethod`. It declares the stages it supports, says through `defined` which patients it can
+combine, and owns the rules for when it can be used in `check`. A model describes the experiment in a
+`FusionContext` (the stage, which patients have which inputs and which must be combined, the input widths, the target
+and, in late fusion, the kind of each branch head) and calls `check` once when it is built and again in
+`model.check(data)`. Models never test for a particular method, and they use the same `defined` in the forward pass,
+so the check and training cannot disagree. In late fusion, `MaskedMean` refuses Cox branches over patients with
+different branch subsets because each branch's log-hazard has an arbitrary offset, so averaging different subsets
+would reorder patients.
 
 ### Missing modalities
 

@@ -31,13 +31,16 @@ and training settings, and it works the same for every model and target. Do not 
 pipeline or trainer for a particular modality, fusion strategy or endpoint.
 
 A model is a `Unimodal`, `EarlyFusion`, `IntermediateFusion` or `LateFusion`, built from
-a list of stages for each modality, a fusion method or combiner, and a head. Extend it
+a list of stages for each modality, a fusion method, and a head. Extend it
 like this:
 
 - **A new combination of modalities** is a different dictionary, never a new class.
 - **A new kind of data** is one class that implements the `Modality` protocol (`ids`,
   `load`, `collate`) in `loaddata/modalities.py`.
 - **A new block** is a plain `nn.Module` in `model/encoders.py`, used as a stage.
+- **A new fusion method** is one `FusionMethod` subclass in `model/fusion.py`. It declares the `stages` it supports,
+  implements `defined`, `output_dim` and `forward`, and adds its own rules by overriding `check(context)`. Models
+  never test for a particular fusion method.
 - **A new endpoint** is a target in `loaddata/targets.py` plus a head in
   `model/heads.py`. The head owns the output, prediction, loss and target check.
 
@@ -56,6 +59,9 @@ The code checks these at construction or during `fit`, so new components must fo
 - Stages run only on patients who have the modality, and their outputs are scattered back
   with NaN for the others. Fusion selects the defined rows. Never multiply by a mask:
   selecting rows is what keeps gradients finite.
+- A fusion method's `defined(present)` decides which patients it combines, both in `check` and in the forward
+  pass, and its `forward` only receives those rows. Its rules read the `FusionContext` the model passes to
+  `check`, never the dataset.
 - A head's `loss` returns `None` when a batch has no signal (for Cox, no event with anyone
   else at risk). The Pipeline skips those batches and reports them.
 

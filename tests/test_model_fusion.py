@@ -16,7 +16,6 @@ from kalecancer.model import (
     LateFusion,
     MajorityVote,
     MaskedMean,
-    MeanLogits,
     StageList,
     Unimodal,
 )
@@ -154,7 +153,8 @@ def test_masked_mean_keeps_patients_missing_a_modality_with_finite_gradients(coh
 def test_concat_with_a_missing_modality_raises_at_check(cohort):
     data = make_data(cohort, required=["clinical"])
     with pytest.raises(
-        ValueError, match=r"Concat cannot combine patients missing a modality \(\{'clinical': 0, 'wsi': 10\}"
+        ValueError,
+        match=r"Concat cannot combine 10 patients \(.*lack each of the modalities: \{'clinical': 0, 'wsi': 10\}",
     ):
         intermediate().check(data)
 
@@ -199,20 +199,20 @@ def test_early_fusion_fits_and_runs_on_concatenated_rows_in_forward_order(cohort
 # ---------------------------------------------------------------- late fusion
 
 
-def late(combine, task="classification"):
+def late(fusion, task="classification"):
     head = (lambda d: ClassificationHead(d, 2)) if task == "classification" else (lambda d: CoxHead(d, "efron"))
     return LateFusion(
         branches={
             "clinical": Unimodal("clinical", [nn.Linear(2, 4)], head(4)),
             "wsi": Unimodal("wsi", [ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)], head(4)),
         },
-        combine=combine,
+        fusion=fusion,
     )
 
 
 def test_late_fusion_loss_is_sum_of_branch_losses_and_prediction_uses_mean_logits(cohort):
     data = make_data(cohort, required=["clinical", "wsi"], task="classification")
-    model = late(MeanLogits())
+    model = late(MaskedMean())
     model.check(data)
     batch = whole_batch(data)
     output = model(batch)
@@ -224,10 +224,10 @@ def test_late_fusion_loss_is_sum_of_branch_losses_and_prediction_uses_mean_logit
     assert model.columns(data.target.info()) == ["probability[low]", "probability[high]"]
 
 
-def test_late_fusion_cox_mean_logits_needs_complete_branches(cohort):
+def test_late_fusion_cox_masked_mean_needs_complete_branches(cohort):
     with pytest.raises(ValueError, match="arbitrary offset"):
-        late(MeanLogits(), task="survival").check(make_data(cohort, required=["clinical"]))
-    late(MeanLogits(), task="survival").check(make_data(cohort, required=["clinical", "wsi"]))
+        late(MaskedMean(), task="survival").check(make_data(cohort, required=["clinical"]))
+    late(MaskedMean(), task="survival").check(make_data(cohort, required=["clinical", "wsi"]))
 
 
 def test_late_fusion_with_missing_branch_rows(cohort):
@@ -251,15 +251,44 @@ def test_late_fusion_rejects_mixed_heads_and_resolves_stages():
                 "a": Unimodal("clinical", [nn.Linear(2, 1)], CoxHead(1, "efron")),
                 "b": Unimodal("clinical", [nn.Linear(2, 1)], ClassificationHead(1, 2)),
             },
-            MeanLogits(),
+            MaskedMean(),
         )
     hybrid = LateFusion(
         {
             "tables": Unimodal("clinical", [nn.Linear(2, 2)], ClassificationHead(2, 2)),
             "both": IntermediateFusion({"clinical": [nn.Linear(2, 2)], "wsi": []}, Concat(), ClassificationHead(18, 2)),
         },
-        MeanLogits(),
+        MaskedMean(),
     )
     with pytest.raises(ValueError, match="2 branches match modality 'clinical'"):
         hybrid.stages_for("clinical")
     assert isinstance(hybrid.stages_for("clinical", branch="both")[0], nn.Linear)
+
+
+def test_models_reject_fusion_methods_for_another_stage_at_construction():
+    with pytest.raises(TypeError, match="MajorityVote is for late fusion, not intermediate fusion"):
+        intermediate(fusion=MajorityVote(tie_break="error"))
+    with pytest.raises(TypeError, match="MajorityVote is for late fusion, not early fusion"):
+        EarlyFusion(["clinical", "lab"], MajorityVote(tie_break="error"), [nn.Linear(5, 4)], CoxHead(4, "efron"))
+    with pytest.raises(TypeError, match="Concat is for early or intermediate fusion, not late fusion"):
+        late(Concat())
+    with pytest.raises(TypeError, match="fusion must be a FusionMethod"):
+        intermediate(fusion=nn.Identity())
+
+
+def test_late_fusion_branch_rejects_patients_with_only_some_of_its_modalities(cohort):
+    data = make_data(cohort, required=["clinical"], task="classification")
+
+    def model(fusion, width):
+        both = IntermediateFusion(
+            {"clinical": [nn.Linear(2, 4)], "wsi": [ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)]},
+            fusion,
+            ClassificationHead(width, 2),
+        )
+        return LateFusion(
+            {"clinical": Unimodal("clinical", [nn.Linear(2, 2)], ClassificationHead(2, 2)), "both": both}, MaskedMean()
+        )
+
+    with pytest.raises(ValueError, match="Concat cannot combine 10 patients"):
+        model(Concat(), 8).check(data)
+    model(MaskedMean(), 4).check(data)

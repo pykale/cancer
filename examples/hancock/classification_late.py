@@ -19,7 +19,7 @@ from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
 from kalecancer.evaluate import AUROC, BalancedAccuracy
 from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures
-from kalecancer.model import ABMIL, ClassificationHead, LateFusion, MeanLogits, TabICLEncoder, Unimodal
+from kalecancer.model import ABMIL, ClassificationHead, LateFusion, MaskedMean, TabICLEncoder, Unimodal
 from kalecancer.pipeline import EarlyStopping, Pipeline
 
 DATA = Path(__file__).resolve().parents[2] / "data" / "hancock"
@@ -103,7 +103,7 @@ def build_model() -> LateFusion:
                 head=ClassificationHead(in_dim=64, n_classes=2),
             ),
         },
-        combine=MeanLogits(),
+        fusion=MaskedMean(),
     )
 
 
