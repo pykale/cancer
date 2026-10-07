@@ -19,7 +19,7 @@ import torch
 from torch import Tensor, nn
 
 from kalecancer.loaddata.dataset import MultimodalDataset
-from kalecancer.loaddata.modalities import Modality
+from kalecancer.loaddata.modalities import FixedShapeModality, Modality
 from kalecancer.loaddata.targets import BaseTarget
 from kalecancer.model.fusion import FusionContext, FusionMethod, Stage
 from kalecancer.model.incontext import InContextModule
@@ -76,7 +76,8 @@ def _describe(x: Any) -> str:
 
 
 class StageList(nn.ModuleList):
-    """Stages applied in order. A stage with ``needs_ids = True`` is called as ``stage(x, ids)``."""
+    """Stages applied in order. A stage with ``needs_ids = True`` is called as ``stage(x, ids)``. The input must be
+    finite unless the first stage sets ``allow_nan = True``."""
 
     def __init__(self, stages: Sequence[nn.Module], name: str):
         if isinstance(stages, nn.Module | str):
@@ -107,14 +108,40 @@ class StageList(nn.ModuleList):
             width = produced if produced is not None else width
         return width
 
+    def check_input(self, x: Any, ids: list[str]) -> None:
+        """Raise if a patient's input has NaN or infinite values, unless the first stage sets ``allow_nan = True``.
+
+        Args:
+            x: The stage list's input: an ``(n, ...)`` tensor, or a list of one tensor per patient (bags).
+            ids: The patients of ``x``, in row order.
+        """
+        if self and getattr(self[0], "allow_nan", False):
+            return
+        if isinstance(x, Tensor):
+            finite = torch.isfinite(x).reshape(len(x), -1).all(dim=1).tolist()
+        elif isinstance(x, list | tuple) and all(isinstance(item, Tensor) for item in x):
+            finite = [bool(torch.isfinite(item).all()) for item in x]
+        else:
+            return  # an input this cannot inspect; the first stage is responsible for it
+        if bad := [pid for pid, ok in zip(ids, finite, strict=True) if not ok]:
+            raise ValueError(
+                f"encoding[{self.name!r}] input has NaN or infinite values for {len(bad)} "
+                f"patient{'' if len(bad) == 1 else 's'} (e.g. {bad[:5]}); impute them in the modality's transform, "
+                "or start the stage list with a stage that sets allow_nan = True"
+            )
+
     def fit(self, train: MultimodalDataset, ids: list[str], load: Callable[[list[str]], Any]) -> None:
         """Fit the first stage on the rows ``load(ids)`` if it is an ``InContextModule``."""
         if self and isinstance(self[0], InContextModule):
             assert train.target is not None, "an InContextModule stage needs a dataset with a target"
-            self[0].fit(load(ids), train.target.tensors(ids), ids)
+            x = load(ids)
+            self.check_input(x, ids)
+            self[0].fit(x, train.target.tensors(ids), ids)
 
     def forward(self, x: Any, ids: list[str]) -> Any:
-        """Run the stages in order; an error gets a note naming the stage that raised it and its input."""
+        """Check the input, then run the stages in order; an error gets a note naming the stage that raised it and
+        its input."""
+        self.check_input(x, ids)
         for k, stage in enumerate(self):
             try:
                 x = stage(x, ids) if getattr(stage, "needs_ids", False) else stage(x)
@@ -126,7 +153,7 @@ class StageList(nn.ModuleList):
 
 def _loader(source: Modality) -> Callable[[list[str]], Any]:
     """A function that loads the given patients from ``source`` and collates them into one batch."""
-    return lambda ids: source.collate([source.load(pid) for pid in ids])
+    return lambda ids: source[ids]
 
 
 def _check_modalities(data: MultimodalDataset, names: Sequence[str]) -> None:
@@ -363,6 +390,11 @@ class EarlyFusion(_SingleHeadModel):
         """Raise if the dataset lacks a modality, its target does not suit the head, or the fusion method
         cannot be fitted on it."""
         _check_modalities(data, self.modalities)
+        bags = [name for name in self.modalities if not isinstance(data.modalities[name], FixedShapeModality)]
+        if bags:
+            raise TypeError(
+                f"EarlyFusion fuses raw inputs, so its modalities must be FixedShapeModality. {bags} are not"
+            )
         self._check_target(data)
         _check_fusion(self.fusion, "early", data, self._widths(), allow_undefined)
 

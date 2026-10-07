@@ -44,8 +44,8 @@ def _parameter_groups(model: nn.Module, overrides: Mapping[str, Mapping[str, flo
     return ([{"params": rest}] if rest else []) + groups
 
 
-def _run_stages(stages: StageList, batch: dict, modality: str) -> Tensor:
-    z = stages(batch["inputs"][modality], batch["ids"])
+def _run_stages(stages: StageList, x: Any, ids: list[str], modality: str) -> Tensor:
+    z = stages(x, ids)
     if not isinstance(z, Tensor) or z.ndim != 2:
         raise TypeError(f"encoding[{modality!r}] must end with (n, d) vectors")
     return z.float().cpu()

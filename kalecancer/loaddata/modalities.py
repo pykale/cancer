@@ -4,96 +4,139 @@ from __future__ import annotations
 
 import glob
 import re
-from collections.abc import Sequence
-from typing import Any, Literal, Protocol
+from abc import ABC, abstractmethod
+from collections.abc import Iterable, Iterator, Sequence
+from functools import cached_property
+from typing import Any, Literal, Self
 
 import h5py
 import numpy as np
 import pandas as pd
 import torch
+from scipy import sparse
 from sklearn.base import TransformerMixin
 from torch import Tensor
 
 from kalecancer.loaddata.identifiers import _as_ids
 
 
-class Modality(Protocol):
-    """What a modality provides. New kinds of data (slides, volumes, text) implement this."""
+class Modality(ABC):
+    """Per-patient data, keyed by patient id. Subclass ``FixedShapeModality`` or ``BagModality`` and implement
+    ``_load``."""
 
     ids: pd.Index
 
-    def load(self, id: str) -> Any: ...
+    def __getitem__(self, ids: Iterable[str] | str) -> Tensor | list[Tensor]:
+        """One patient's item for a single id, or a batch for several ids, in the order given."""
+        if isinstance(ids, str):
+            if ids not in self.ids:
+                raise KeyError(f"{type(self).__name__}: unknown id {ids!r}")
+            return self._load(ids)
 
-    def collate(self, items: list) -> Any: ...
+        requested = _as_ids(ids, type(self).__name__)
+        if len(requested) == 0:
+            raise ValueError(f"{type(self).__name__}: no ids requested")
+        if missing := [pid for pid in requested if pid not in self.ids]:
+            raise KeyError(f"{type(self).__name__}: {len(missing)} unknown ids, e.g. {missing[:5]}")
+        return self.collate([self._load(pid) for pid in requested])
+
+    def __len__(self) -> int:
+        return len(self.ids)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.ids)
+
+    def with_transform(self, fitted_transforms: Any, ids: Sequence[str]) -> Self:
+        """Given some fitted transforms, return the data of the specified ids with transforms applied."""
+        raise TypeError(
+            f"{self.__class__.__name__} has no implemented with_transform() method, so cannot accept any transformations"
+        )
+
+    def transform_input(self, ids: Sequence[str]) -> Any:
+        """The data of ``ids`` that a transform for this modality is fitted on."""
+        raise TypeError(f"{type(self).__name__} does not accept transforms")
+
+    @abstractmethod
+    def _load(self, id: str) -> Tensor:
+        """Return the data as a tensor for the given id.
+        Used by Modality.__getitem__()."""
+
+    @abstractmethod
+    def collate(self, items: list[Tensor]) -> Tensor | list[Tensor]:
+        """Given a list of items returned by _load(), combine one item per patient, in order, into a batch.
+        Used by Modality.__getitem__() when multiple IDs are passed.
+        Used by MultimodalDataset.collate() to combine the items of each modality into a batch."""
 
 
-class _Table:
-    """A DataFrame modality: one float32 vector per patient."""
-
-    def __init__(self, frame: pd.DataFrame, name: str):
-        self.frame = frame
-        self.name = name
-        self.ids = _as_ids(frame.index, f"modality {name!r}")
-        self._position = {pid: k for k, pid in enumerate(self.ids)}
-        self._values: np.ndarray | None = None
-
-    def _array(self) -> np.ndarray:
-        if self._values is None:
-            non_numeric = [c for c in self.frame.columns if not pd.api.types.is_numeric_dtype(self.frame[c])]
-            if non_numeric:
-                raise TypeError(
-                    f"modality {self.name!r}: columns {non_numeric[:5]} are not numeric; give this modality a transform"
-                )
-            self._values = self.frame.to_numpy(dtype=np.float32)
-        return self._values
-
-    def check(self, ids: Sequence[str]) -> None:
-        rows = self._array()[[self._position[pid] for pid in ids]]
-        bad = ~np.isfinite(rows).all(axis=1)
-        if bad.any():
-            examples = [pid for pid, b in zip(ids, bad, strict=True) if b][:5]
-            raise ValueError(
-                f"modality {self.name!r}: NaN or infinite values for {int(bad.sum())} patients (e.g. {examples}); "
-                "impute explicitly in a transform"
-            )
-
-    def load(self, id: str) -> Tensor:
-        row = self._array()[self._position[id]]
-        if not np.isfinite(row).all():
-            raise ValueError(
-                f"modality {self.name!r}: NaN or infinite values for {id!r}; impute explicitly in a transform"
-            )
-        return torch.tensor(row)
+class FixedShapeModality(Modality):
+    """Every patient's item has the same shape, e.g. one vector per patient."""
 
     def collate(self, items: list[Tensor]) -> Tensor:
-        return torch.stack(items) if items else torch.empty(0, self.frame.shape[1])
+        """Stack the items into one ``(n, *item_shape)`` tensor."""
+        return torch.stack(items)
 
-    def transform_input(self, ids: Sequence[str]) -> pd.DataFrame:
-        return self.frame.loc[list(ids)]
 
-    def with_transform(self, fitted: TransformerMixin, ids: Sequence[str]) -> _Table:
-        raw = self.frame.loc[list(ids)]
-        values = fitted.transform(raw)
-        if hasattr(values, "toarray"):
-            values = values.toarray()
-        try:
-            values = np.asarray(values, dtype=np.float32)
-        except (TypeError, ValueError) as error:
-            raise TypeError(f"modality {self.name!r}: the transform output is not numeric ({error})") from error
-        if values.ndim != 2 or len(values) != len(raw):
-            raise ValueError(
-                f"modality {self.name!r}: the transform must return one row per patient, got shape {values.shape}"
+class BagModality(Modality):
+    """Each patient's item is an ``(N_i, d)`` bag of instances, where N_i varies between patients."""
+
+    def collate(self, items: list[Tensor]) -> list[Tensor]:
+        """Keep the bags as a list, since their sizes differ."""
+        return items
+
+    @abstractmethod
+    def instances(self, id: str) -> pd.DataFrame:
+        """One row per instance of ``_load(id)``, in the same order, describing each one (e.g. file, x, y).
+        Never read by fit or predict.
+        Used by interpret module."""
+
+
+class Tabular(FixedShapeModality):
+    """A DataFrame modality: one float32 vector per patient."""
+
+    def __init__(self, frame: pd.DataFrame):
+        self._frame = frame.copy()
+        self.ids = _as_ids(self._frame.index, f"{self.__class__.__name__}")
+        self._position = {pid: k for k, pid in enumerate(self.ids)}
+
+    @property
+    def frame(self) -> pd.DataFrame:
+        """A copy of the table."""
+        return self._frame.copy()
+
+    @cached_property
+    def _array(self) -> np.ndarray:
+        """The table as a float32 array; raises if a column is not numeric."""
+        non_numeric = [c for c in self._frame.columns if not pd.api.types.is_numeric_dtype(self._frame[c])]
+        if non_numeric:
+            raise TypeError(
+                f"{self.__class__.__name__!r}: columns {non_numeric[:5]} are not numeric; give this modality a transform"
             )
+        return self._frame.to_numpy(dtype=np.float32)
+
+    def _load(self, id: str) -> Tensor:
+        """The patient's row as a float32 vector."""
+        return torch.tensor(self._array[self._position[id]], dtype=torch.float32)
+
+    def with_transform(self, fitted_transforms: TransformerMixin, ids: Sequence[str]) -> Tabular:
+        """A new ``Tabular`` holding the rows of ``ids`` after ``fitted_transforms``."""
+        raw = self.transform_input(ids)
+        values = fitted_transforms.transform(raw)
+        if sparse.issparse(values):
+            values = values.toarray()
+        values = np.asarray(values, dtype=np.float32)
         try:
-            columns = [str(c) for c in fitted.get_feature_names_out()]
+            columns = [str(c) for c in fitted_transforms.get_feature_names_out()]
         except (AttributeError, ValueError):
             columns = None
         if columns is not None and len(columns) != values.shape[1]:
             columns = None
-        return _Table(pd.DataFrame(values, index=raw.index, columns=columns), self.name)
+        return Tabular(pd.DataFrame(values, index=raw.index, columns=columns))
+
+    def transform_input(self, ids: Sequence[str]) -> pd.DataFrame:
+        return self._frame.loc[list(ids)]
 
 
-class PatchFeatures:
+class PatchFeatures(BagModality):
     """Pre-extracted patch features: one h5 file (or several) per patient, read lazily per patient.
 
     Args:
@@ -117,8 +160,8 @@ class PatchFeatures:
         self.features_key = features_key
         self.coords_key = coords_key
         self.multiple_files = multiple_files
-        _as_ids(pd.Index(files.index).unique(), "PatchFeatures")
-        self._paths = {pid: sorted(str(p) for p in paths) for pid, paths in files.groupby(level=0)}
+        _as_ids(pd.Index(files.index).unique(), f"{self.__class__.__name__}")
+        self._paths = {str(pid): sorted(str(p) for p in paths) for pid, paths in files.groupby(level=0)}
         several = sorted(pid for pid, paths in self._paths.items() if len(paths) > 1)
         if several and multiple_files == "error":
             raise ValueError(
@@ -153,22 +196,26 @@ class PatchFeatures:
 
     @staticmethod
     def _dataset(f: h5py.File, path: str, key: str) -> h5py.Dataset:
+        """The dataset ``key`` in ``f``, checked to be a non-empty 2-D array."""
         if key not in f:
             raise KeyError(f"{path}: no dataset {key!r} (found {sorted(f.keys())})")
         dataset = f[key]
+        if not isinstance(dataset, h5py.Dataset):
+            raise TypeError(f"{path}:{key} is a {type(dataset).__name__}, not a dataset")
         if dataset.ndim != 2 or dataset.shape[0] == 0:
             raise ValueError(f"{path}:{key} must be a non-empty 2-D array, got shape {dataset.shape}")
         return dataset
 
-    def load(self, id: str) -> Tensor:
+    def _load(self, id: str) -> Tensor:
+        """The patient's patch features as one ``(N, D)`` float32 tensor, joined across their files."""
         arrays = []
         for path in self._paths[id]:
             with h5py.File(path, "r") as f:
                 arrays.append(self._dataset(f, path, self.features_key)[:])
         return torch.from_numpy(np.concatenate(arrays)).float()
 
-    def coords(self, id: str) -> pd.DataFrame:
-        """Patch coordinates in the same file and row order as :meth:`load`."""
+    def instances(self, id: str) -> pd.DataFrame:
+        """Patch coordinates in the same file and row order as :meth:`_load`."""
         frames = []
         for path in self._paths[id]:
             with h5py.File(path, "r") as f:
@@ -178,17 +225,3 @@ class PatchFeatures:
                 raise ValueError(f"{path}: {len(xy)} coordinates for {n_features} feature rows")
             frames.append(pd.DataFrame({"file": path, "x": xy[:, 0], "y": xy[:, 1]}))
         return pd.concat(frames, ignore_index=True)
-
-    def collate(self, items: list[Tensor]) -> list[Tensor]:
-        return list(items)
-
-
-def _as_modality(name: str, value: Any) -> Any:
-    if not isinstance(name, str):
-        raise TypeError(f"modality names must be str, got {name!r}")
-    if isinstance(value, pd.DataFrame):
-        return _Table(value, name)
-    missing = [attr for attr in ("ids", "load", "collate") if not hasattr(value, attr)]
-    if missing:
-        raise TypeError(f"modality {name!r}: {type(value).__name__} is not a DataFrame and lacks {missing}")
-    return value

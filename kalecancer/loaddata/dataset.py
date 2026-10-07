@@ -9,11 +9,10 @@ from typing import Any
 
 import pandas as pd
 import torch
-from sklearn.base import TransformerMixin
 from sklearn.model_selection import train_test_split as _sklearn_train_test_split
 
 from kalecancer.loaddata.identifiers import _as_ids, _check_leading_zeros, _NotFoundError
-from kalecancer.loaddata.modalities import _as_modality
+from kalecancer.loaddata.modalities import Modality
 from kalecancer.loaddata.targets import BaseTarget
 
 
@@ -21,7 +20,7 @@ class MultimodalDataset(torch.utils.data.Dataset):
     """Modalities and a target joined by patient id.
 
     Args:
-        modalities: Name to modality. A DataFrame indexed by id is a table modality.
+        modalities: Name to modality.
         target: The target, or ``None`` for unlabelled data.
         required_modalities: Modalities every included patient must have. Patients also need the target
             (when given) and at least one modality. ``summary()`` reports who was excluded and why.
@@ -29,21 +28,25 @@ class MultimodalDataset(torch.utils.data.Dataset):
 
     def __init__(
         self,
-        modalities: Mapping[str, Any],
+        modalities: Mapping[str, Modality],
         target: BaseTarget | None,
         required_modalities: Sequence[str],
     ):
         if not modalities:
             raise ValueError("MultimodalDataset needs at least one modality")
+        wrong = [name for name, modality in modalities.items() if not isinstance(modality, Modality)]
+        if wrong:
+            raise TypeError(f"modalities {wrong} are not Modality instances. Wrap a DataFrame in Tabular(frame)")
         if isinstance(required_modalities, str):
             raise TypeError("required_modalities must be a list of modality names, not a single string")
-        self.modalities = {name: _as_modality(name, value) for name, value in modalities.items()}
+        self.modalities = modalities
         self.target = target
         self.required_modalities = list(required_modalities)
         unknown = [m for m in self.required_modalities if m not in self.modalities]
         if unknown:
             raise _NotFoundError(
-                f"required_modalities names unknown modalities {unknown}; available: {list(self.modalities)}"
+                f"required_modalities names unknown modalities {unknown}.\n"
+                f"Available modalities: {list(self.modalities)}"
             )
         sources = {f"modality {name!r}": modality.ids for name, modality in self.modalities.items()}
         if target is not None:
@@ -105,44 +108,39 @@ class MultimodalDataset(torch.utils.data.Dataset):
     def present_ids(self, modality: str) -> list[str]:
         return [pid for pid in self.ids if pid in self._modality_ids[modality]]
 
-    def with_transforms(self, fitted: Mapping[str, TransformerMixin]) -> MultimodalDataset:
+    def with_transforms(self, fitted: Mapping[str, Any]) -> MultimodalDataset:
         """The same dataset with fitted transforms applied to the named modalities."""
         new = copy.copy(self)
         new.modalities = dict(self.modalities)
         for name, transform in fitted.items():
             source = self.modalities[name]
-            if not hasattr(source, "with_transform"):
-                raise TypeError(f"modality {name!r} ({type(source).__name__}) does not accept transforms")
             new.modalities[name] = source.with_transform(transform, self.present_ids(name))
         return new
-
-    def check_inputs(self) -> None:
-        """Fail before batching if a table modality still has non-numeric or missing values."""
-        for name, source in self.modalities.items():
-            if hasattr(source, "check"):
-                source.check(self.present_ids(name))
 
     def __len__(self) -> int:
         return len(self.ids)
 
     def __getitem__(self, index: int) -> dict:
         pid = self.ids[index]
-        inputs = {name: source.load(pid) for name, source in self.modalities.items() if pid in self._modality_ids[name]}
+        inputs = {name: source[pid] for name, source in self.modalities.items() if pid in self._modality_ids[name]}
         return {"id": pid, "inputs": inputs}
 
     def collate(self, samples: list[dict]) -> dict:
-        """Batch: ids, per-modality presence masks, inputs of present patients only (batch order), target."""
+        """Batch for ``DataLoader(collate_fn=data.collate)``: ids, presence masks, the inputs of present patients in
+        batch order, and the target. A modality that no patient in the batch has gets no entry in ``inputs``."""
         ids = [sample["id"] for sample in samples]
+        inputs = {}
+        for name, source in self.modalities.items():
+            items = [sample["inputs"][name] for sample in samples if name in sample["inputs"]]
+            if items:
+                inputs[name] = source.collate(items)
         batch = {
             "ids": ids,
             "present": {
                 name: torch.tensor([name in sample["inputs"] for sample in samples], dtype=torch.bool)
                 for name in self.modalities
             },
-            "inputs": {
-                name: source.collate([sample["inputs"][name] for sample in samples if name in sample["inputs"]])
-                for name, source in self.modalities.items()
-            },
+            "inputs": inputs,
         }
         if self.target is not None:
             batch["target"] = self.target.tensors(ids)

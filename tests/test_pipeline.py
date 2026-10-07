@@ -12,7 +12,8 @@ from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 from torch import nn
 
 from kalecancer.evaluate import AUROC, BalancedAccuracy, HarrellC
-from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, TimeToEvent
+from kalecancer.interpret import attention
+from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
 from kalecancer.model import (
     ABMIL,
     ClassificationHead,
@@ -51,7 +52,10 @@ def dataset(cohort, required=("clinical", "wsi"), task="survival", event=None):
         target = Classification(cohort.labels, classes=["low", "high"])
     else:
         target = None
-    modalities = {"clinical": cohort.clinical, "wsi": PatchFeatures(cohort.wsi_files, multiple_files="concatenate")}
+    modalities = {
+        "clinical": Tabular(cohort.clinical),
+        "wsi": PatchFeatures(cohort.wsi_files, multiple_files="concatenate"),
+    }
     return MultimodalDataset(modalities, target=target, required_modalities=list(required))
 
 
@@ -258,6 +262,12 @@ def test_column_transformer_dropping_columns_raises(cohort):
         pipeline(transforms={"clinical": dropping}).fit(train)
 
 
+def test_a_transform_for_a_bag_modality_raises(cohort):
+    train, _ = split(dataset(cohort))
+    with pytest.raises(TypeError, match="PatchFeatures does not accept transforms"):
+        pipeline(transforms={"wsi": StandardScaler()}).fit(train)
+
+
 def test_batches_without_signal_are_skipped_and_reported(cohort):
     censored = pd.Series(False, index=cohort.event.index)
     train, _ = split(dataset(cohort, event=censored))
@@ -272,6 +282,57 @@ def test_missing_modality_at_prediction_is_checked(cohort):
     everyone = dataset(cohort, required=["clinical"])
     with pytest.raises(ValueError, match="Concat cannot combine"):
         pipe.predict(everyone.subset(everyone.ids[30:]))
+
+
+def remove_age(cohort, ids):
+    """Make ``age`` missing for ``ids``. ``clinical_transform`` scales age without imputing it, and sklearn's scalers
+    pass NaN through, so these patients reach the model with NaN inputs."""
+    cohort.clinical.loc[ids, "age"] = np.nan
+
+
+@pytest.mark.parametrize("task", ["survival", "classification"])
+def test_nan_inputs_raise_at_fit_naming_the_patients(cohort, task):
+    # without the check, Cox blamed divergence and classification trained to NaN predictions without an error
+    remove_age(cohort, ["002", "004", "006"])
+    train, _ = split(dataset(cohort, task=task))
+    model = intermediate() if task == "survival" else late_classifier()
+    with pytest.raises(ValueError, match=r"encoding\['clinical'\] input has NaN or infinite values") as error:
+        pipeline(model).fit(train)
+    assert any(pid in str(error.value) for pid in ["002", "004", "006"])
+
+
+def test_nan_inputs_at_prediction_raise_naming_the_patients(cohort):
+    remove_age(cohort, ["024", "025"])
+    train, test = split(dataset(cohort))
+    pipe = pipeline().fit(train)
+    message = r"encoding\['clinical'\] input has NaN or infinite values for 2 patients \(e\.g\. \['024', '025'\]\)"
+    with pytest.raises(ValueError, match=message):
+        pipe.predict(test)
+    with pytest.raises(ValueError, match=message):
+        pipe.encode(test, modality="clinical")
+
+
+class NanToZero(nn.Module):
+    """A first stage that handles missing values itself."""
+
+    allow_nan = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nan_to_num(x, nan=0.0)
+
+
+def test_a_first_stage_with_allow_nan_receives_nan_inputs(cohort):
+    remove_age(cohort, ["002", "024"])
+    train, test = split(dataset(cohort))
+    model = IntermediateFusion(
+        encoding={
+            "clinical": [NanToZero(), nn.Linear(3, 4)],
+            "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
+        },
+        fusion=Concat(),
+        head=CoxHead(in_dim=8, ties="efron"),
+    )
+    assert np.isfinite(pipeline(model).fit(train).predict(test).to_numpy()).all()
 
 
 # ---------------------------------------------------------------- late fusion, encode, attention
@@ -300,11 +361,34 @@ def test_encode_is_deterministic_and_attention_aligns_with_coordinates(cohort):
     pd.testing.assert_frame_equal(first, pipe.encode(test, modality="wsi"))
     assert list(first.index) == test.ids and first.shape[1] == 4
 
-    attention = pipe.attention(test, modality="wsi")
-    assert len(attention) == sum(len(cohort.bags[pid]) for pid in test.ids)
-    np.testing.assert_allclose(attention.groupby("patient_id")["attention"].sum(), 1.0, rtol=1e-5)
-    patient = attention[attention["patient_id"] == test.ids[0]]
+    weights = attention(pipe, test, "wsi")
+    assert len(weights) == sum(len(cohort.bags[pid]) for pid in test.ids)
+    np.testing.assert_allclose(weights.groupby("patient_id")["attention"].sum(), 1.0, rtol=1e-5)
+    patient = weights[weights["patient_id"] == test.ids[0]]
     np.testing.assert_array_equal(patient[["x", "y"]].to_numpy(), cohort.coords[test.ids[0]])
+
+    with pytest.raises(TypeError, match="Attention export needs a BagModality. 'clinical' is a Tabular"):
+        attention(pipe, test, "clinical")
+
+
+class DropFirstInstance(nn.Module):
+    def forward(self, bags: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [bag[1:] for bag in bags]
+
+
+def test_attention_rejects_a_stage_that_changes_the_instances(cohort):
+    model = IntermediateFusion(
+        encoding={
+            "clinical": [nn.Linear(3, 4)],
+            "wsi": [DropFirstInstance(), ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
+        },
+        fusion=Concat(),
+        head=CoxHead(in_dim=8, ties="efron"),
+    )
+    train, test = split(dataset(cohort))
+    pipe = pipeline(model).fit(train)
+    with pytest.raises(ValueError, match=r"encoding\['wsi'\]\[0\] DropFirstInstance changes the number of instances"):
+        attention(pipe, test, "wsi")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")

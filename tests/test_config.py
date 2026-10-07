@@ -11,7 +11,7 @@ from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 from torch import nn
 
 from kalecancer.evaluate import HarrellC, UnoC
-from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent
+from kalecancer.loaddata import MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
 from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion
 from kalecancer.pipeline import EarlyStopping, Pipeline, dump_config, load_pipeline
 from kalecancer.prepdata import ColumnGroup, TableTransform
@@ -75,7 +75,7 @@ def test_pipeline_from_yaml_trains_like_the_python_pipeline(cohort, tmp_path):
     loaded = load_pipeline(path)
 
     data = MultimodalDataset(
-        {"clinical": cohort.clinical, "wsi": PatchFeatures(cohort.wsi_files, multiple_files="concatenate")},
+        {"clinical": Tabular(cohort.clinical), "wsi": PatchFeatures(cohort.wsi_files, multiple_files="concatenate")},
         target=TimeToEvent(cohort.time, cohort.event),
         required_modalities=["clinical", "wsi"],
     )

@@ -18,7 +18,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
 from kalecancer.evaluate import AUROC, BalancedAccuracy
-from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures
+from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, Tabular
 from kalecancer.model import ABMIL, ClassificationHead, LateFusion, MaskedMean, TabICLEncoder, Unimodal
 from kalecancer.pipeline import EarlyStopping, Pipeline
 
@@ -57,7 +57,7 @@ def build_dataset() -> MultimodalDataset:
     table = clinical()
     keep = table["survival_status_with_cause"] != "deceased not tumor specific"
     return MultimodalDataset(
-        modalities={"clinical": table[BASELINE_COLUMNS], "wsi": primary_tumour_features()},
+        modalities={"clinical": Tabular(table[BASELINE_COLUMNS]), "wsi": primary_tumour_features()},
         target=Classification(labels=table.loc[keep, "survival_status"], classes=["living", "deceased"]),
         required_modalities=["clinical", "wsi"],
     )

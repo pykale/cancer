@@ -6,7 +6,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from kalecancer.loaddata import Classification, TimeToEvent
+from kalecancer.loaddata import Classification, MultimodalDataset, TimeToEvent
+from kalecancer.loaddata.modalities import Tabular
 from kalecancer.model import (
     ABMIL,
     MLP,
@@ -18,6 +19,7 @@ from kalecancer.model import (
     InContextModule,
     MajorityVote,
     MaskedMean,
+    StageList,
 )
 
 TARGET_IDS = pd.Index(["001", "002", "003"])
@@ -109,6 +111,56 @@ def test_in_context_guards():
         module(x[:, :2], IDS)
     with pytest.raises(ValueError, match=r"ids \['p0'\] are context ids but their rows differ"):
         module(x + (torch.arange(8) == 0).float()[:, None], IDS)
+
+
+# ---------------------------------------------------------------- stage lists
+
+
+class NanToZero(torch.nn.Module):
+    """A stage that handles missing values itself."""
+
+    allow_nan = True
+
+    def forward(self, x):
+        return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+class BagMean(torch.nn.Module):
+    def forward(self, bags):
+        return torch.stack([bag.mean(dim=0) for bag in bags])
+
+
+def test_stage_list_rejects_nan_and_inf_inputs_naming_the_patients():
+    x = torch.randn(4, 3)
+    x[1, 0], x[3, 2] = float("nan"), float("inf")
+    ids = ["001", "002", "003", "004"]
+    message = r"encoding\['clinical'\] input has NaN or infinite values for 2 patients \(e\.g\. \['002', '004'\]\)"
+    with pytest.raises(ValueError, match=message):
+        StageList([torch.nn.Linear(3, 2)], "clinical")(x, ids)
+    # with no stages the input goes straight to fusion or a head, which do not accept NaN either
+    with pytest.raises(ValueError, match=message):
+        StageList([], "clinical")(x, ids)
+    # only the first stage reads the raw input, so allow_nan on a later stage does not count
+    with pytest.raises(ValueError, match=message):
+        StageList([torch.nn.Linear(3, 3), NanToZero()], "clinical")(x, ids)
+    assert torch.isfinite(StageList([NanToZero(), torch.nn.Linear(3, 2)], "clinical")(x, ids)).all()
+
+
+def test_stage_list_rejects_a_bag_with_nan():
+    bags = [torch.randn(5, 3), torch.randn(7, 3)]
+    bags[1][2, 1] = float("nan")
+    with pytest.raises(ValueError, match=r"encoding\['wsi'\] .* for 1 patient \(e\.g\. \['002'\]\)"):
+        StageList([BagMean()], "wsi")(bags, ["001", "002"])
+
+
+def test_stage_list_checks_the_context_before_fitting_an_in_context_stage():
+    frame = pd.DataFrame({"a": [1.0, np.nan, 3.0], "b": [0.0, 1.0, 2.0]}, index=TARGET_IDS)
+    data = MultimodalDataset({"clinical": Tabular(frame)}, target=SURVIVAL, required_modalities=["clinical"])
+    stages = StageList([ContextSize()], "clinical")
+    with pytest.raises(ValueError, match=r"encoding\['clinical'\] .* for 1 patient \(e\.g\. \['002'\]\)"):
+        stages.fit(data, data.ids, lambda ids: data.modalities["clinical"][ids])
+    with pytest.raises(RuntimeError, match="fit must be called before forward"):
+        stages[0](torch.zeros(1, 2), ["new"])
 
 
 # ---------------------------------------------------------------- Cox head

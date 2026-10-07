@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from kalecancer.evaluate import HarrellC
-from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent
+from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent, Tabular
 from kalecancer.pipeline import load_pipeline
 
 DATA = Path(__file__).resolve().parents[2] / "data" / "hancock"
@@ -47,7 +47,7 @@ def official_split(data: MultimodalDataset, name: str) -> tuple[MultimodalDatase
 def build_dataset() -> MultimodalDataset:
     table = clinical()
     return MultimodalDataset(
-        modalities={"clinical": table[BASELINE_COLUMNS], "wsi": primary_tumour_features()},
+        modalities={"clinical": Tabular(table[BASELINE_COLUMNS]), "wsi": primary_tumour_features()},
         target=TimeToEvent(
             time=table["days_to_last_information"],
             event=table["survival_status"].map({"deceased": True, "living": False}),

@@ -22,7 +22,7 @@ import torch
 from sklearn.preprocessing import StandardScaler
 
 from kalecancer.evaluate import HarrellC
-from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent, train_test_split
+from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent, train_test_split, Tabular
 from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion
 from kalecancer.pipeline import Pipeline
 
@@ -65,7 +65,7 @@ clinical, outcome = make_cohort(folder)
 
 data = MultimodalDataset(
     modalities={
-        "clinical": clinical,
+        "clinical": Tabular(clinical),
         "slides": PatchFeatures.from_glob(f"{folder}/*.h5", id_pattern=r"(patient_\d{3})\.h5$"),
     },
     target=TimeToEvent(time=outcome["time"], event=outcome["event"]),

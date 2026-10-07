@@ -1,5 +1,5 @@
 """Pipeline: fit transforms and fold-local state on training patients, train one model end to end with Lightning,
-then predict, evaluate, encode and export attention."""
+then predict, evaluate, encode, and run a modality's stages for interpretation tools."""
 
 from __future__ import annotations
 
@@ -19,10 +19,9 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from kalecancer.evaluate.metrics import EvalContext, Metric
-from kalecancer.interpret.attention import attention as _attention
 from kalecancer.loaddata.dataset import MultimodalDataset
 from kalecancer.loaddata.targets import Classification
-from kalecancer.model.models import EarlyFusion, IntermediateFusion, LateFusion, Unimodal
+from kalecancer.model.models import EarlyFusion, IntermediateFusion, LateFusion, StageList, Unimodal
 from kalecancer.pipeline.training import (
     _concatenate,
     _EarlyStoppingWithRestore,
@@ -161,7 +160,6 @@ class Pipeline(BaseEstimator):
             train_ids, val_ids = self._split_validation(data)
             transforms = self._fit_transforms(data, train_ids)
             view = data.with_transforms(transforms)
-            view.check_inputs()
             model = copy.deepcopy(self.model)
             if self.random_state is not None:
                 _reinitialise(model)
@@ -280,8 +278,6 @@ class Pipeline(BaseEstimator):
         fitted = {}
         for name, transform in self.transforms.items():
             source = data.modalities[name]
-            if not hasattr(source, "transform_input"):
-                raise TypeError(f"modality {name!r} ({type(source).__name__}) does not accept transforms")
             rows = source.transform_input(train.present_ids(name))
             estimator = clone(transform).fit(rows)
             _check_no_dropped_columns(estimator, name)
@@ -328,14 +324,13 @@ class Pipeline(BaseEstimator):
             raise RuntimeError("this Pipeline is not fitted; call fit first")
 
     def transformed(self, data: MultimodalDataset) -> MultimodalDataset:
-        """The dataset as the fitted model sees it: fitted transforms applied and inputs checked."""
+        """The dataset as the fitted model sees it, with the fitted transforms applied. The model checks that its
+        inputs are finite as it reads them."""
         self._require_fitted()
         if not isinstance(data, MultimodalDataset):
             raise TypeError(f"expected a MultimodalDataset, got {type(data).__name__}")
         self.model_.check(data)
-        view = data.with_transforms(self.transforms_)
-        view.check_inputs()
-        return view
+        return data.with_transforms(self.transforms_)
 
     def _infer(self, data: MultimodalDataset, step: Callable[[nn.Module, dict], Any]) -> list:
         module = _InferenceModule(self.model_, step)
@@ -406,19 +401,33 @@ class Pipeline(BaseEstimator):
         single = MultimodalDataset({modality: view.modalities[modality]}, target=None, required_modalities=[modality])
         return single.subset(present), stages
 
+    def run_modality(
+        self,
+        data: MultimodalDataset,
+        modality: str,
+        fn: Callable[[StageList, Any, list[str]], Any],
+        branch: str | None = None,
+    ) -> list[tuple[list[str], Any]]:
+        """Call ``fn(stages, inputs, ids)`` on each batch of the patients in ``data`` who have ``modality``, with the
+        fitted transforms applied and the model in eval mode, and return ``(ids, result)`` per batch. ``stages`` is
+        the fitted stage list for ``modality``. Interpretation tools in ``kalecancer.interpret`` build on this."""
+        single, stages = self._single_modality(data, modality, branch)
+
+        def step(model: nn.Module, batch: dict) -> tuple[list[str], Any]:
+            return batch["ids"], fn(stages, batch["inputs"][modality], batch["ids"])
+
+        return self._infer(single, step)
+
     def encode(self, data: MultimodalDataset, modality: str, branch: str | None = None) -> pd.DataFrame:
         """The output of ``modality``'s stage list (the fusion input), indexed by patient id."""
-        single, stages = self._single_modality(data, modality, branch)
-        results = self._infer(single, lambda model, batch: (batch["ids"], _run_stages(stages, batch, modality)))
+        results = self.run_modality(
+            data, modality, lambda stages, x, ids: _run_stages(stages, x, ids, modality), branch
+        )
         ids = [pid for batch_ids, _ in results for pid in batch_ids]
         values = torch.cat([z for _, z in results]).numpy()
         return pd.DataFrame(
             values, index=pd.Index(ids, name="id"), columns=[f"{modality}_{k}" for k in range(values.shape[1])]
         )
-
-    def attention(self, data: MultimodalDataset, modality: str, branch: str | None = None) -> pd.DataFrame:
-        """Per-instance attention weights joined with the modality's coordinates; see ``kalecancer.interpret``."""
-        return _attention(self, data, modality, branch)
 
 
 def _reinitialise(model: nn.Module) -> None:

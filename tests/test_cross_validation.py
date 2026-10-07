@@ -6,7 +6,7 @@ from sklearn.model_selection import StratifiedKFold
 from torch import nn
 
 from kalecancer.evaluate import AUROC, BalancedAccuracy, HarrellC, cross_validate
-from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, TimeToEvent
+from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
 from kalecancer.model import ABMIL, ClassificationHead, Concat, CoxHead, IntermediateFusion
 from kalecancer.pipeline import Pipeline
 
@@ -19,7 +19,7 @@ def dataset(cohort, task="survival"):
         else Classification(cohort.labels, classes=["low", "high"])
     )
     return MultimodalDataset(
-        {"clinical": numeric, "wsi": PatchFeatures(cohort.wsi_files, multiple_files="concatenate")},
+        {"clinical": Tabular(numeric), "wsi": PatchFeatures(cohort.wsi_files, multiple_files="concatenate")},
         target=target,
         required_modalities=["clinical", "wsi"],
     )
@@ -97,6 +97,6 @@ def test_arguments_are_checked(cohort):
     data = dataset(cohort)
     with pytest.raises(ValueError, match="metrics is empty"):
         cross_validate(small_pipeline(), data, cv=StratifiedKFold(n_splits=3), metrics={})
-    unlabelled = MultimodalDataset({"clinical": cohort.clinical[["age"]]}, target=None, required_modalities=[])
+    unlabelled = MultimodalDataset({"clinical": Tabular(cohort.clinical[["age"]])}, target=None, required_modalities=[])
     with pytest.raises(ValueError, match="needs a dataset with a target"):
         cross_validate(small_pipeline(), unlabelled, cv=StratifiedKFold(n_splits=3), metrics={"c": HarrellC()})

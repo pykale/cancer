@@ -18,10 +18,10 @@ Python 3.11 or 3.12, managed with [uv](https://docs.astral.sh/uv/) against the c
 
 ```text
 kalecancer/
-├── loaddata/   MultimodalDataset, modalities (tables, PatchFeatures), targets, train_test_split
+├── loaddata/   MultimodalDataset, modalities (Tabular, PatchFeatures), targets, train_test_split
 ├── prepdata/   TableTransform: sklearn transforms for table modalities
 ├── model/      encoders, fusion methods, heads, and the models that wire them together
-├── pipeline/   Pipeline (fit, predict, evaluate, encode, attention), Lightning training, YAML configs
+├── pipeline/   Pipeline (fit, predict, evaluate, encode, run_modality), Lightning training, YAML configs
 ├── evaluate/   metrics on prediction frames, cross_validate
 └── interpret/  attention export
 ```
@@ -35,8 +35,14 @@ a list of stages for each modality, a fusion method, and a head. Extend it
 like this:
 
 - **A new combination of modalities** is a different dictionary, never a new class.
-- **A new kind of data** is one class that implements the `Modality` protocol (`ids`,
-  `load`, `collate`) in `loaddata/modalities.py`.
+- **A new kind of data** is one class in `loaddata/modalities.py` that sets `ids` and
+  implements `_load(id)`. It subclasses `FixedShapeModality` when every patient's item has
+  the same shape, so a batch is stacked into one tensor, or `BagModality` when each item is
+  an `(N_i, d)` bag whose size varies, so a batch is a list; a bag also implements
+  `instances`. A kind that is neither subclasses `Modality` and implements `collate` too.
+  A modality that accepts sklearn transforms implements `transform_input` and
+  `with_transform`, as `Tabular` does. Tables are passed as `Tabular(frame)`, never as a
+  bare DataFrame.
 - **A new block** is a plain `nn.Module` in `model/encoders.py`, used as a stage.
 - **A new fusion method** is one `FusionMethod` subclass in `model/fusion.py`. It declares the `stages` it supports,
   implements `defined`, `output_dim` and `forward`, and adds its own rules by overriding `check(context)`. Models
@@ -54,6 +60,9 @@ The code checks these at construction or during `fit`, so new components must fo
   A stage list must end with `(n, d)` vectors.
 - A stage that needs patient ids sets `needs_ids = True`. Only the first stage may be an
   `InContextModule`; it is fitted on the training rows before training starts.
+- The model rejects NaN or infinite values in a stage list's input and names the patients,
+  so missing values are imputed in the modality's transform. A first stage that handles
+  them itself sets `allow_nan = True`.
 - Every module with parameters needs a `reset_parameters()` method, or `keep_weights = True`
   as in `TabICLEncoder`. `random_state` re-initialises all other parameters.
 - Store every `__init__` argument under an attribute with the same name.
@@ -61,6 +70,12 @@ The code checks these at construction or during `fit`, so new components must fo
 - Stages run only on patients who have the modality, and their outputs are scattered back
   with NaN for the others. Fusion selects the defined rows. Never multiply by a mask:
   selecting rows is what keeps gradients finite.
+- `EarlyFusion` fuses raw inputs, so every modality it reads must be a `FixedShapeModality`.
+- A stage that samples a bag's instances at random does so only when `self.training` is
+  true. A fixed selection, such as dropping background patches, belongs in the modality, so
+  that its features and `instances` describe the same rows. Attention export needs a
+  `BagModality`, and raises an error if a stage before the attending one changes the number
+  of instances.
 - A fusion method's `defined(present)` decides which patients it combines, both in `check` and in the forward
   pass, and its `forward` only receives those rows. Its rules read the `FusionContext` the model passes to
   `check`, never the dataset.

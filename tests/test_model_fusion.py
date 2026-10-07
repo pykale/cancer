@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch import nn
 
-from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, TimeToEvent
+from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
 from kalecancer.model import (
     ABMIL,
     ClassificationHead,
@@ -52,9 +52,9 @@ def tables(cohort):
 
 def make_data(cohort, required, task="survival", with_lab=False):
     clinical, lab = tables(cohort)
-    modalities = {"clinical": clinical, "wsi": PatchFeatures(cohort.wsi_files, multiple_files="concatenate")}
+    modalities = {"clinical": Tabular(clinical), "wsi": PatchFeatures(cohort.wsi_files, multiple_files="concatenate")}
     if with_lab:
-        modalities["lab"] = lab
+        modalities["lab"] = Tabular(lab)
     target = (
         TimeToEvent(cohort.time, cohort.event)
         if task == "survival"
@@ -194,6 +194,12 @@ def test_early_fusion_fits_and_runs_on_concatenated_rows_in_forward_order(cohort
     torch.testing.assert_close(recorder.fit_x, expected.float())
     assert recorder.fit_ids == train.ids
     assert model(whole_batch(train)).prediction.shape == (20, 1)
+
+
+def test_early_fusion_rejects_bag_modalities_at_check(cohort):
+    model = EarlyFusion(["clinical", "wsi"], Concat(), [nn.Linear(18, 4)], CoxHead(4, "efron"))
+    with pytest.raises(TypeError, match=r"must be FixedShapeModality\. \['wsi'\] are not"):
+        model.check(make_data(cohort, required=["clinical", "wsi"]))
 
 
 # ---------------------------------------------------------------- late fusion

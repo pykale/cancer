@@ -20,7 +20,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
 from kalecancer.evaluate import HarrellC, UnoC
-from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent
+from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent, Tabular
 from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, TabICLEncoder
 from kalecancer.pipeline import EarlyStopping, Pipeline
 
@@ -62,7 +62,7 @@ def official_split(data: MultimodalDataset, name: str) -> tuple[MultimodalDatase
 def build_dataset() -> MultimodalDataset:
     table = clinical()
     return MultimodalDataset(
-        modalities={"clinical": table[BASELINE_COLUMNS], "wsi": primary_tumour_features()},
+        modalities={"clinical": Tabular(table[BASELINE_COLUMNS]), "wsi": primary_tumour_features()},
         target=TimeToEvent(
             time=table["days_to_last_information"],
             event=table["survival_status"].map({"deceased": True, "living": False}),

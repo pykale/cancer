@@ -19,7 +19,7 @@ behaves the same for every model and target.
 ```mermaid
 flowchart LR
     subgraph loaddata["loaddata"]
-        MOD["Modalities\ntable, PatchFeatures"]
+        MOD["Modalities\nTabular, PatchFeatures"]
         TGT["Targets\nTimeToEvent, Classification"]
         DS["MultimodalDataset\nkeyed by patient id"]
         MOD --> DS
@@ -38,7 +38,7 @@ flowchart LR
     end
 
     subgraph pipeline["pipeline"]
-        PIPE["Pipeline\nfit, predict, evaluate,\nencode, attention"]
+        PIPE["Pipeline\nfit, predict, evaluate,\nencode, run_modality"]
         CFG["load_pipeline,\ndump_config"]
     end
 
@@ -56,7 +56,7 @@ flowchart LR
 
 | Subpackage | Contents |
 | --- | --- |
-| `loaddata` | `MultimodalDataset`, `train_test_split`, the `Modality` protocol, `PatchFeatures`, `BaseTarget` and the `TimeToEvent` and `Classification` targets |
+| `loaddata` | `MultimodalDataset`, `train_test_split`, the `Modality` base class and its two kinds `FixedShapeModality` and `BagModality`, `Tabular`, `PatchFeatures`, `BaseTarget` and the `TimeToEvent` and `Classification` targets |
 | `prepdata` | `TableTransform` and `ColumnGroup`: sklearn transforms for table modalities |
 | `model` | Encoders (`MLP`, `ABMIL`, `TabICLEncoder`), `InContextModule`, fusion methods, heads, and the four models |
 | `pipeline` | `Pipeline`, `EarlyStopping`, Lightning training, `load_pipeline` and `dump_config` |
@@ -75,21 +75,38 @@ Users import from `kalecancer.<stage>`.
 
 ### Modalities
 
-A modality is anything with `ids`, `load(id)` and `collate(items)`. A DataFrame indexed by id is wrapped as a table
-modality automatically.
+A modality holds one kind of data for a set of patients, keyed by patient id. `modality[id]` loads one patient's item
+and `modality[ids]` loads a batch in the order given. Every modality subclasses one of two kinds, and the kind decides
+how a batch is formed:
 
-| Modality | Value per patient | Collated as |
+| Kind | Item per patient | Batch |
 | --- | --- | --- |
-| Table (DataFrame) | one float32 vector | stacked tensor `(n, d)` |
-| `PatchFeatures` | `(N_i, D)` matrix of pre-extracted patch features, read lazily from HDF5 | list of tensors, since `N_i` varies |
+| `FixedShapeModality` | the same shape for every patient | one stacked tensor `(n, *shape)` |
+| `BagModality` | an `(N_i, d)` bag of instances, where `N_i` varies | a list of tensors |
 
-A whole slide is therefore a bag of pre-extracted patch features, an ordinary modality whose collated value is a list
-rather than a stacked tensor. `PatchFeatures` also exposes `coords` for attention export. Feature extraction from raw
-slides is out of scope: it happens before the library.
+A new modality picks its kind and implements `_load(id)`. A bag also implements `instances(id)`, one row describing
+each instance, which attention export joins to the attention weights. A kind that is neither would subclass `Modality`
+directly and implement `collate` too.
+
+| Modality | Kind | Value per patient |
+| --- | --- | --- |
+| `Tabular(frame)` | fixed shape | one float32 vector: the patient's row of a DataFrame indexed by patient id |
+| `PatchFeatures` | bag | `(N_i, D)` pre-extracted patch features, read lazily from HDF5 |
+
+Tables are passed as `Tabular(frame)`; a bare DataFrame is rejected. `Tabular` is the modality that accepts sklearn
+transforms, through `transform_input` and `with_transform`; any other modality given a transform raises an error.
+
+`MultimodalDataset` follows the standard PyTorch pattern: `data[i]` loads one patient, and
+`DataLoader(data, collate_fn=data.collate)` batches them, with each modality's kind forming its part of the batch. A
+modality that no patient in a batch has gets no entry in that batch's inputs.
+
+A whole slide is therefore a bag of pre-extracted patch features: an ordinary modality whose batch is a list rather
+than a stacked tensor, and whose `instances` are its patch coordinates. Feature extraction from raw slides is out of
+scope: it happens before the library.
 
 Raw imaging (CT, MRI) would differ in kind: a 3D volume with voxel spacing and orientation to respect, where a
-slide is flat but gigapixel-scale. Either would be one new `Modality` class, plus stages to encode it. Neither exists
-yet.
+slide is flat but gigapixel-scale. A volume resampled to a fixed size would be one new `FixedShapeModality`, plus stages
+to encode it. Neither exists yet.
 
 ### Targets
 
@@ -140,6 +157,14 @@ fails before training. Stages available so far:
 - `TabICLEncoder`: a pretrained TabICL row encoder (optional `tabular` extra), pinned to an exact version because it
   relies on private internals;
 - any `nn.Module`, such as `torch.nn.Linear`.
+
+A stage list's input must be finite. The model checks it before the first stage, in training and in prediction, and
+names the patients with NaN or infinite values, so missing values are imputed in the modality's transform. A first
+stage that handles missing values itself sets `allow_nan = True`.
+
+Stages keep a bag's instances one to one with the rows the modality loaded, which is what lets attention export match
+weights to coordinates. A stage samples instances at random only in training mode; a fixed selection, such as dropping
+background patches, is made in the modality instead.
 
 `InContextModule` covers stages conditioned on labelled training rows, as TabICL is. It may only be the first stage and
 is fitted on the training rows before training starts. To keep labels from leaking, a training row is embedded against
@@ -211,7 +236,8 @@ state. Training runs on Lightning.
 
 It produces `model_`, `transforms_`, `train_ids_`, `val_ids_`, `target_`, `train_target_`, `history_` and
 `fit_report_`. The remaining methods are `predict` (a frame indexed by patient id, with a `branch` option for late
-fusion), `evaluate`, `encode` and `attention`.
+fusion), `evaluate`, `encode` and `run_modality`, which runs one modality's fitted stages over a dataset with a
+callback and is what interpretation tools build on.
 
 ### Leakage guards
 
@@ -251,7 +277,7 @@ because Cox log-hazards have an arbitrary offset that differs between folds.
 
 ## Interpretability
 
-What exists is **attention export**: `kalecancer.interpret.attention` (also `Pipeline.attention`) returns per-patch
+What exists is **attention export**: `kalecancer.interpret.attention(pipe, data, modality)` returns per-patch
 attention weights from the one stage exposing `attention()`, joined with the modality's patch coordinates, so weights
 can be mapped back onto slides.
 
