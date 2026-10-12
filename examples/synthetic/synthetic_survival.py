@@ -77,7 +77,7 @@ train, test = train_test_split(data, test_size=0.25, stratify=True, random_state
 # 2. Model: stages for each modality, a fusion method, and a prediction head.
 
 model = IntermediateFusion(
-    encoding={
+    encoders={
         "clinical": [torch.nn.Linear(2, 8)],
         "slides": [
             ABMIL(in_dim=PATCH_DIM, hidden_dim=16, attention_dim=8, dropout=0.0),

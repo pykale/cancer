@@ -19,7 +19,7 @@ from lightning.pytorch.callbacks import EarlyStopping as _LightningEarlyStopping
 from torch import Tensor, nn
 
 from kalecancer.evaluate.metrics import EvalContext, Metric
-from kalecancer.model.models import ModelOutput, StageList
+from kalecancer.model.models import ModelOutput
 
 if TYPE_CHECKING:
     from kalecancer.pipeline.pipeline import EarlyStopping
@@ -44,13 +44,6 @@ def _parameter_groups(model: nn.Module, overrides: Mapping[str, Mapping[str, flo
     return ([{"params": rest}] if rest else []) + groups
 
 
-def _run_stages(stages: StageList, x: Any, ids: list[str], modality: str) -> Tensor:
-    z = stages(x, ids)
-    if not isinstance(z, Tensor) or z.ndim != 2:
-        raise TypeError(f"encoding[{modality!r}] must end with (n, d) vectors")
-    return z.float().cpu()
-
-
 def _to_cpu(output: ModelOutput) -> ModelOutput:
     return ModelOutput(
         output=output.output.detach().float().cpu(),
@@ -67,6 +60,22 @@ def _concatenate(outputs: list[ModelOutput]) -> ModelOutput:
         defined=torch.cat([o.defined for o in outputs]),
         branches={name: _concatenate([o.branches[name] for o in outputs]) for name in outputs[0].branches},
     )
+
+
+def _record_non_finite(found: dict[str, set[str]], batch: dict) -> None:
+    """Add to ``found`` the patients in ``batch`` whose input to a modality has NaN or infinite values. Inputs that are
+    neither a tensor nor a list of tensors, such as graphs, are not inspected."""
+    for name, x in batch["inputs"].items():
+        if isinstance(x, Tensor):
+            finite = torch.isfinite(x).reshape(len(x), -1).all(dim=1).tolist()
+        elif isinstance(x, list | tuple) and all(isinstance(item, Tensor) for item in x):
+            finite = [bool(torch.isfinite(item).all()) for item in x]
+        else:
+            continue
+        # inputs hold only the patients who have the modality, in batch order
+        ids = [pid for pid, has in zip(batch["ids"], batch["present"][name].tolist(), strict=True) if has]
+        if bad := [pid for pid, ok in zip(ids, finite, strict=True) if not ok]:
+            found.setdefault(name, set()).update(bad)
 
 
 class _TrainingModule(L.LightningModule):
@@ -95,8 +104,11 @@ class _TrainingModule(L.LightningModule):
         self._skipped = 0
         self._validation: list[tuple] = []
         self._last_validation: dict = {}
+        # never reset between epochs: the warning reports each patient once, whatever the number of epochs
+        self.non_finite: dict[str, set[str]] = {}
 
     def training_step(self, batch: dict, batch_index: int) -> Tensor | None:
+        _record_non_finite(self.non_finite, batch)
         losses = self.model.loss(self.model(batch), batch["target"])
         self._has_loss = losses is not None
         if losses is None:
@@ -112,6 +124,7 @@ class _TrainingModule(L.LightningModule):
             self.optimizer_steps += 1
 
     def validation_step(self, batch: dict, batch_index: int) -> None:
+        _record_non_finite(self.non_finite, batch)
         target = {key: value.detach().cpu() for key, value in batch["target"].items()}
         self._validation.append((batch["ids"], _to_cpu(self.model(batch)), target))
 
@@ -152,8 +165,10 @@ class _InferenceModule(L.LightningModule):
         super().__init__()
         self.model = model
         self.step = step
+        self.non_finite: dict[str, set[str]] = {}
 
     def predict_step(self, batch: dict, batch_index: int) -> Any:
+        _record_non_finite(self.non_finite, batch)
         return self.step(self.model, batch)
 
 
@@ -186,7 +201,7 @@ class _EarlyStoppingWithRestore(_LightningEarlyStopping):
         self.best_value = float(self.best_score)
         if self.keep_state:
             state = trainer.lightning_module.model.state_dict()
-            # fitted stages may keep non-tensor extra state (e.g. TabICL's context ids)
+            # fitted encoders may keep non-tensor extra state (e.g. TabICL's context ids)
             self.best_state = {
                 key: value.detach().to("cpu", copy=True) if isinstance(value, Tensor) else copy.deepcopy(value)
                 for key, value in state.items()

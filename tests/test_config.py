@@ -1,6 +1,7 @@
 import json
 from functools import partial
 
+import lightning.pytorch as L
 import pandas as pd
 import pytest
 import torch
@@ -19,7 +20,7 @@ from kalecancer.prepdata import ColumnGroup, TableTransform
 
 def build_pipeline(metric=None):
     model = IntermediateFusion(
-        encoding={
+        encoders={
             "clinical": [nn.Linear(3, 4)],
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
         },
@@ -51,7 +52,7 @@ def build_pipeline(metric=None):
         accelerator="cpu",
         precision="32-true",
         random_state=0,
-        param_groups={"encoding.wsi": {"lr": 1e-3}},
+        param_groups={"encoders.wsi": {"lr": 1e-3}},
     )
 
 
@@ -80,7 +81,20 @@ def test_pipeline_from_yaml_trains_like_the_python_pipeline(cohort, tmp_path):
         required_modalities=["clinical", "wsi"],
     )
     train, test = data.subset(data.ids[:22]), data.subset(data.ids[22:])
-    pd.testing.assert_frame_equal(build_pipeline().fit(train).predict(test), loaded.fit(train).predict(test))
+    # load_pipeline builds the model under the config's random_state, so build the Python one under the same seed
+    L.seed_everything(0, verbose=False)
+    built = build_pipeline()
+    pd.testing.assert_frame_equal(built.fit(train).predict(test), loaded.fit(train).predict(test))
+
+
+def test_load_pipeline_builds_the_model_under_the_configs_random_state():
+    config = dump_config(build_pipeline())
+    torch.manual_seed(1)
+    first = load_pipeline(config).model.state_dict()
+    torch.manual_seed(2)
+    second = load_pipeline(config).model.state_dict()
+    for name in first:
+        torch.testing.assert_close(first[name], second[name], msg=name)
 
 
 def config_with(change):
@@ -97,7 +111,7 @@ def config_with(change):
         lambda c: c["transforms"]["clinical"]["init_args"]["groups"]["numeric"]["init_args"]["steps"][0].update(
             init_args={"with_meen": False}
         ),
-        lambda c: c["model"]["init_args"]["encoding"]["wsi"][0].update(class_path="kalecancer.ABMILL"),
+        lambda c: c["model"]["init_args"]["encoders"]["wsi"][0].update(class_path="kalecancer.ABMILL"),
         lambda c: c.pop("random_state"),
     ],
     ids=["unknown argument", "invalid literal", "nested sklearn typo", "unknown class", "missing argument"],
@@ -115,7 +129,7 @@ def test_components_must_store_their_arguments():
 
     pipe = build_pipeline()
     pipe.model = IntermediateFusion(
-        encoding={"clinical": [Scale(2.0), nn.Linear(3, 4)], "wsi": [ABMIL(16, 4, 4, 0.0)]},
+        encoders={"clinical": [Scale(2.0), nn.Linear(3, 4)], "wsi": [ABMIL(16, 4, 4, 0.0)]},
         fusion=Concat(),
         head=CoxHead(in_dim=8, ties="efron"),
     )

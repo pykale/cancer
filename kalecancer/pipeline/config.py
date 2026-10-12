@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import lightning.pytorch as L
 import numpy as np
 import torch
 import yaml
@@ -22,6 +23,7 @@ from jsonargparse import ArgumentParser
 from torch import nn
 
 from kalecancer.pipeline.pipeline import Pipeline
+from kalecancer.pipeline.training import _lightning_session
 
 _VERSION_KEY = "kalecancer_version"
 
@@ -33,7 +35,11 @@ _VARIADIC = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
 
 
 def load_pipeline(config: str | Path | Mapping[str, Any]) -> Pipeline:
-    """Build a Pipeline from a YAML path or a dict. Unknown arguments, wrong types and missing arguments raise."""
+    """Build a Pipeline from a YAML path or a dict. Unknown arguments, wrong types and missing arguments raise.
+
+    When the config sets ``random_state``, the model is built under that seed, as LightningCLI's ``seed_everything``
+    does, so the config alone fixes the initial weights.
+    """
     if isinstance(config, str | Path):
         config = yaml.safe_load(Path(config).read_text())
     if not isinstance(config, Mapping):
@@ -51,7 +57,13 @@ def load_pipeline(config: str | Path | Mapping[str, Any]) -> Pipeline:
         )
     parser = ArgumentParser(exit_on_error=False)
     parser.add_argument("--pipeline", type=Pipeline)
-    return parser.instantiate(parser.parse_object({"pipeline": config})).pipeline
+    parsed = parser.parse_object({"pipeline": config})
+    seed = (config.get("init_args") or {}).get("random_state")
+    # the Pipeline never re-initialises the model, so its initial weights are drawn here, when it is built
+    with _lightning_session():
+        if seed is not None:
+            L.seed_everything(seed, verbose=False)
+        return parser.instantiate(parsed).pipeline
 
 
 def dump_config(pipeline: Pipeline) -> dict[str, Any]:

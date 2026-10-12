@@ -11,22 +11,21 @@ from kalecancer.model import (
     Concat,
     CoxHead,
     EarlyFusion,
-    InContextModule,
+    EncoderList,
+    FittedEncoder,
     IntermediateFusion,
     LateFusion,
     MajorityVote,
     MaskedMean,
-    StageList,
     Unimodal,
 )
 
 
-class RecordingStage(InContextModule):
-    """Pass-through stage that records the ids it sees and the data it was fitted on."""
+class RecordingEncoder(FittedEncoder):
+    """Pass-through fitted encoder that records the ids it sees and the data it was fitted on."""
 
-    def __init__(self, width: int):
-        super().__init__(context_label="event", context_folds=2, random_state=0)
-        self.out_dim = width
+    def __init__(self):
+        super().__init__()
         self.seen_ids: list[list[str]] = []
         self.fit_ids: list[str] | None = None
         self.fit_x = None
@@ -69,7 +68,7 @@ def whole_batch(data):
 
 def intermediate(fusion=None, head_dim=8):
     return IntermediateFusion(
-        encoding={
+        encoders={
             "clinical": [nn.Linear(2, 4)],
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
         },
@@ -78,30 +77,28 @@ def intermediate(fusion=None, head_dim=8):
     )
 
 
-# ---------------------------------------------------------------- stage lists
+# ---------------------------------------------------------------- encoder lists
 
 
-def test_stage_list_checks_links_fit_position_and_type():
-    with pytest.raises(ValueError, match=r"\[1\] Linear expects width 7 but receives 6"):
-        StageList([ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(7, 3)], "wsi")
-    with pytest.raises(ValueError, match="only the first stage may be fitted"):
-        StageList([nn.Linear(2, 2), RecordingStage(2)], "clinical")
-    with pytest.raises(TypeError, match="list of stages"):
-        StageList(nn.Linear(2, 2), "clinical")
-    assert StageList([nn.Linear(2, 4), nn.ReLU(), nn.Dropout(0.1)], "clinical").output_width(2) == 4
+def test_encoder_list_checks_fit_position_and_type():
+    with pytest.raises(ValueError, match="only the first encoder may be fitted"):
+        EncoderList([nn.Linear(2, 2), RecordingEncoder()], "clinical")
+    with pytest.raises(TypeError, match="list of encoders"):
+        EncoderList(nn.Linear(2, 2), "clinical")
 
 
-def test_head_width_is_checked_at_construction():
-    with pytest.raises(ValueError, match="expects width 7 but receives 8"):
-        intermediate(head_dim=7)
+def test_widths_are_not_checked_at_construction():
+    # widths are checked by the dry run in Pipeline.fit, against the real embeddings
+    intermediate(head_dim=7)
+    EncoderList([ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(7, 3)], "wsi")
 
 
-def test_stage_errors_name_the_stage_and_its_input():
-    stages = StageList([nn.Linear(16, 4)], "wsi")
+def test_encoder_errors_name_the_encoder_and_its_input():
+    encoders = EncoderList([nn.Linear(16, 4)], "wsi")
     with pytest.raises(TypeError) as caught:
-        stages([torch.zeros(5, 16), torch.zeros(3, 16)], ["001", "002"])
+        encoders([torch.zeros(5, 16), torch.zeros(3, 16)], ["001", "002"])
     assert caught.value.__notes__ == [
-        "in encoding['wsi'][0] Linear, called on a list of 2 tensors shaped (5, 16), (3, 16)"
+        "in encoders['wsi'][0] Linear, called on a list of 2 tensors shaped (5, 16), (3, 16)"
     ]
 
 
@@ -119,11 +116,11 @@ def test_intermediate_concat_forward_loss_and_gradients(cohort):
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 
 
-def test_id_aware_stages_are_fitted_on_and_see_present_patients_only(cohort):
+def test_fitted_encoders_are_fitted_on_and_see_present_patients_only(cohort):
     data = make_data(cohort, required=["clinical"])
-    recorder = RecordingStage(16)
+    recorder = RecordingEncoder()
     model = IntermediateFusion(
-        encoding={
+        encoders={
             "clinical": [nn.Linear(2, 4)],
             "wsi": [recorder, ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)],
         },
@@ -133,7 +130,7 @@ def test_id_aware_stages_are_fitted_on_and_see_present_patients_only(cohort):
     with_slides = [f"{k:03d}" for k in range(1, 31)]
     model.fit(data)
     assert recorder.fit_ids == with_slides and len(recorder.fit_x) == 30
-    assert recorder.fit_target["event"].shape == (30,)
+    assert recorder.fit_target is data.target
     model(whole_batch(data))
     assert recorder.seen_ids == [with_slides]
 
@@ -159,10 +156,10 @@ def test_concat_with_a_missing_modality_raises_at_check(cohort):
         intermediate().check(data)
 
 
-def test_stage_lists_must_end_with_vectors(cohort):
+def test_encoder_lists_must_end_with_vectors(cohort):
     data = make_data(cohort, required=["clinical", "wsi"])
-    model = IntermediateFusion(encoding={"wsi": []}, fusion=Concat(), head=CoxHead(in_dim=16, ties="efron"))
-    with pytest.raises(TypeError, match=r"encoding\['wsi'\] must end with \(n, d\) vectors, got list"):
+    model = IntermediateFusion(encoders={"wsi": []}, fusion=Concat(), head=CoxHead(in_dim=16, ties="efron"))
+    with pytest.raises(TypeError, match=r"encoders\['wsi'\] must output an \(n, d\) tensor, got a list"):
         model(whole_batch(data))
 
 
@@ -184,7 +181,7 @@ def test_standalone_unimodal_requires_its_modality(cohort):
 
 def test_early_fusion_fits_and_runs_on_concatenated_rows_in_forward_order(cohort):
     data = make_data(cohort, required=["clinical", "lab"], with_lab=True)
-    recorder = RecordingStage(5)
+    recorder = RecordingEncoder()
     model = EarlyFusion(["clinical", "lab"], Concat(), [recorder, nn.Linear(5, 4)], CoxHead(4, "efron"))
     model.check(data)
     train = data.subset(data.ids[:20])
@@ -250,7 +247,7 @@ def test_late_fusion_with_missing_branch_rows(cohort):
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 
 
-def test_late_fusion_rejects_mixed_heads_and_resolves_stages():
+def test_late_fusion_rejects_mixed_heads_and_resolves_encoder_lists():
     with pytest.raises(TypeError, match="one kind"):
         LateFusion(
             {
@@ -267,8 +264,8 @@ def test_late_fusion_rejects_mixed_heads_and_resolves_stages():
         MaskedMean(),
     )
     with pytest.raises(ValueError, match="2 branches match modality 'clinical'"):
-        hybrid.stages_for("clinical")
-    assert isinstance(hybrid.stages_for("clinical", branch="both")[0], nn.Linear)
+        hybrid.encoders_for("clinical")
+    assert isinstance(hybrid.encoders_for("clinical", branch="both")[0], nn.Linear)
 
 
 def test_models_reject_fusion_methods_for_another_stage_at_construction():

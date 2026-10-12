@@ -101,13 +101,13 @@ uv run python examples/hancock/cross_validation.py
 uv run python examples/hancock/classification_late.py
 ```
 
-Each example is a standalone script, and the model is a dictionary of stages per modality, so changing how modalities combine is a change to the model rather than to a pipeline. See [multimodal fusion](https://github.com/pykale/cancer/blob/main/docs/multimodal_fusion.md) for the models and fusion methods available.
+Each example is a standalone script, and the model is a dictionary of encoders per modality, so changing how modalities combine is a change to the model rather than to a pipeline. See [multimodal fusion](https://github.com/pykale/cancer/blob/main/docs/multimodal_fusion.md) for the models and fusion methods available.
 
 Ask questions on [PyKale's GitHub Discussions tab](https://github.com/pykale/pykale/discussions) if you need help or create an [issue](https://github.com/pykale/cancer/issues) if you find something wrong.
 
 ### Step 2: Building and Contributing
 
-Build new modules and/or projects with KaleCancer referring to the [architecture guide](https://github.com/pykale/cancer/blob/main/docs/architecture.md), e.g., on how to modify an existing pipeline or build a new one. New code belongs in the pipeline stage that names what it does, and anything specific to one dataset belongs in `examples` rather than in the library.
+Build new modules and/or projects with KaleCancer referring to the [architecture guide](https://github.com/pykale/cancer/blob/main/docs/architecture.md), e.g., on how to modify an existing pipeline or build a new one. New code belongs in the subpackage that names what it does, and anything specific to one dataset belongs in `examples` rather than in the library.
 
 This is an open-source project welcoming your contributions. You can contribute in three ways:
 

@@ -1,8 +1,8 @@
 # ADR 0001: Modality refactor
 
-- **Status:** accepted
+- **Note:** §8 partly superseded by [ADR 0002](0002-encoder-interface.md)
 - **Date:** 2026-10-07
-- **Scope:** the decisions behind the changes made in this commit
+- **Scope:** Redifine the data loading to decrease coupling and increase extensibility
 
 ## TL;DR
 
@@ -164,6 +164,9 @@ a transform is fitted on.
 both, and a future modality can accept transforms the same way.
 
 ## 8. The model, not the modality, rejects NaN
+
+> **Superseded in part by ADR 0002 §6.** The model still rejects NaN, but the encoder list now checks its output (the
+> embedding) rather than its input, and `allow_nan` is gone. NaN or inf in the input is reported in a warning.
 
 **Context:** `Table` rejected NaN and infinite values, but whether NaN is acceptable depends on the encoder:
 TabPFN-style models accept it. Without any check, Cox blamed "divergence", classification trained without error and

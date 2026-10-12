@@ -20,8 +20,8 @@ Python 3.11 or 3.12, managed with [uv](https://docs.astral.sh/uv/) against the c
 kalecancer/
 ├── loaddata/   MultimodalDataset, modalities (Tabular, PatchFeatures), targets, train_test_split
 ├── prepdata/   TableTransform: sklearn transforms for table modalities
-├── model/      encoders, fusion methods, heads, and the models that wire them together
-├── pipeline/   Pipeline (fit, predict, evaluate, encode, run_modality), Lightning training, YAML configs
+├── model/      encode/ (encoders, EncoderList), fusion methods, heads, and the models that wire them together
+├── pipeline/   Pipeline (fit, predict, evaluate, encode, run_encoders), Lightning training, YAML configs
 ├── evaluate/   metrics on prediction frames, cross_validate
 └── interpret/  attention export
 ```
@@ -31,7 +31,7 @@ and training settings, and it works the same for every model and target. Do not 
 pipeline or trainer for a particular modality, fusion strategy or endpoint.
 
 A model is a `Unimodal`, `EarlyFusion`, `IntermediateFusion` or `LateFusion`, built from
-a list of stages for each modality, a fusion method, and a head. Extend it
+a list of encoders for each modality, a fusion method, and a head. Extend it
 like this:
 
 - **A new combination of modalities** is a different dictionary, never a new class.
@@ -43,9 +43,13 @@ like this:
   A modality that accepts sklearn transforms implements `transform_input` and
   `with_transform`, as `Tabular` does. Tables are passed as `Tabular(frame)`, never as a
   bare DataFrame.
-- **A new block** is a plain `nn.Module` in `model/encoders.py`, used as a stage.
+- **A new encoder** is a plain `nn.Module` in `model/encode/encoders.py`, or in its own file under `model/encode/`
+  when it needs an optional extra, as `tabicl.py` does. Its `forward(x)` takes the modality's batch or the previous
+  encoder's output, and it checks its own input. Stock torch modules such as `nn.Linear` are encoders too. An encoder
+  fitted on the training patients subclasses `FittedEncoder`, and one that reports attention subclasses
+  `AttentionEncoder`, both from `model/encode/base_encoders.py`.
 - **A new fusion method** is one `FusionMethod` subclass in `model/fusion.py`. It declares the `stages` it supports,
-  implements `defined`, `output_dim` and `forward`, and adds its own rules by overriding `check(context)`. Models
+  implements `defined` and `forward`, and adds its own rules by overriding `check(context)`. Models
   never test for a particular fusion method.
 - **A new endpoint** is a `BaseTarget` subclass in `loaddata/targets.py`, implementing
   `tensors`, `strata` and `counts`, plus a head in `model/heads.py`. The head declares the
@@ -56,25 +60,32 @@ like this:
 
 The code checks these at construction or during `fit`, so new components must follow them:
 
-- Stages declare their widths as `in_dim`/`out_dim` (or `in_features`/`out_features`).
-  A stage list must end with `(n, d)` vectors.
-- A stage that needs patient ids sets `needs_ids = True`. Only the first stage may be an
-  `InContextModule`; it is fitted on the training rows before training starts.
-- The model rejects NaN or infinite values in a stage list's input and names the patients,
-  so missing values are imputed in the modality's transform. A first stage that handles
-  them itself sets `allow_nan = True`.
-- Every module with parameters needs a `reset_parameters()` method, or `keep_weights = True`
-  as in `TabICLEncoder`. `random_state` re-initialises all other parameters.
+- An encoder checks its own input in `forward`; nothing reads declared widths. Before training, `fit` runs the model
+  once on up to two training patients per modality (the dry run), so a wrong width or input fails before the first
+  optimizer step. Errors get notes naming the encoder (`encoders['wsi'][1]`), the head, and the late fusion branch.
+- An encoder list must end in a finite, floating-point `(len(ids), d)` tensor: one embedding per patient.
+  `EncoderList` checks this in every forward pass and says whether NaN or inf came from the input or from the
+  encoders. It does not check its input, so an encoder that handles missing values needs no flag; otherwise impute
+  them in the modality's transform. When the encoders turn NaN or inf in the input into finite embeddings, `fit`,
+  `predict` and `run_encoders` each raise one `NonFiniteInputWarning` per modality, and `fit` records the counts in
+  `fit_report_["non_finite_inputs"]`.
+- Only the first encoder may be a `FittedEncoder`. It implements `fit(x, target, ids)` and `forward(x, ids)`, and is
+  fitted on the training patients who have the modality before training starts. It keeps fitted state in buffers, or
+  in `extra_state` for anything that is not a tensor, so the state loads under `weights_only=True`. It owns the rows
+  it is fitted on, including whether they may hold NaN.
+- A module is initialised when it is built, and `fit` never re-initialises it: it trains a copy of the weights the
+  model was built with. `Pipeline(random_state=...)` seeds only what `fit` does, so to vary the initial weights, seed
+  before building the model. `load_pipeline` builds the model under the config's `random_state`.
 - Store every `__init__` argument under an attribute with the same name.
   `sklearn.base.clone` and `dump_config` both depend on this.
-- Stages run only on patients who have the modality, and their outputs are scattered back
+- Encoders run only on patients who have the modality, and their embeddings are scattered back
   with NaN for the others. Fusion selects the defined rows. Never multiply by a mask:
   selecting rows is what keeps gradients finite.
 - `EarlyFusion` fuses raw inputs, so every modality it reads must be a `FixedShapeModality`.
-- A stage that samples a bag's instances at random does so only when `self.training` is
+- An encoder that samples a bag's instances at random does so only when `self.training` is
   true. A fixed selection, such as dropping background patches, belongs in the modality, so
   that its features and `instances` describe the same rows. Attention export needs a
-  `BagModality`, and raises an error if a stage before the attending one changes the number
+  `BagModality`, and raises an error if an encoder before the attending one changes the number
   of instances.
 - A fusion method's `defined(present)` decides which patients it combines, both in `check` and in the forward
   pass, and its `forward` only receives those rows. Its rules read the `FusionContext` the model passes to
@@ -108,9 +119,10 @@ The code checks these at construction or during `fit`, so new components must fo
 - scikit-survival is GPL-licensed. Use it only as a reference implementation in tests, and
   never import it from `kalecancer/`. Unless you think it would be hugely beneficial - then we could discuss its import.
 - `tabicl` is pinned to an exact version because `TabICLEncoder` relies on its private
-  internals. Bump it only if `tests/test_tabicl.py` passes.
+  internals. Bump it only if `tests/test_tabicl.py` passes with the pretrained checkpoint
+  cached, so the comparison with upstream runs rather than being skipped.
 - Export public classes from their subpackage's `__init__.py`. Users import from
-  `kalecancer.<stage>`, not from the package root.
+  `kalecancer.<subpackage>`, not from the package root.
 - Use Google-style docstrings, type hints and a line length of 120. ruff-format decides
   formatting; do not format by hand. Comments explain why, not what.
 
@@ -137,8 +149,10 @@ Tests live in a flat `tests/` directory with one file per area, such as
 `test_loaddata.py`, `test_model_fusion.py` and `test_pipeline.py`. They build synthetic
 HDF5 cohorts with `make_cohort` from `tests/conftest.py` and never access the network.
 
-- `test_tabicl.py` is skipped unless the TabICL checkpoint is already in the Hugging Face
-  cache. The `gpu` test is skipped when CUDA is not available.
+- `test_tabicl.py` runs `TabICLEncoder` on a tiny, randomly initialised TabICL checkpoint
+  that a fixture builds, so it needs only the `tabicl` extra. The one test that compares
+  with upstream `TabICLClassifier` is skipped unless the pretrained checkpoint is already in
+  the Hugging Face cache. The `gpu` test is skipped when CUDA is not available.
 - `test_synthetic_example.py` runs the synthetic example and requires a Harrell's C above
   0.7, so any change to that example must keep it learning.
 

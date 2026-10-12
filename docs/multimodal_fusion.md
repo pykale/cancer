@@ -7,9 +7,9 @@ approaches changes the model dictionary, not the encoders, heads or `Pipeline`.
 
 | Model | Combines | Structure |
 | --- | --- | --- |
-| `Unimodal` | nothing | stages, then head |
-| `EarlyFusion` | raw vectors | fuse, then one stage list, then head |
-| `IntermediateFusion` | encoded features | stages per modality, then fuse, then head |
+| `Unimodal` | nothing | encoders, then head |
+| `EarlyFusion` | raw vectors | fuse, then one encoder list, then head |
+| `IntermediateFusion` | embeddings | encoders per modality, then fuse, then head |
 | `LateFusion` | branch predictions | branch models trained jointly, then a fusion method |
 
 Early fusion needs modalities that are already vectors, such as tables.
@@ -41,7 +41,7 @@ from kalecancer.pipeline import Pipeline
 
 # Intermediate: encode each modality, concatenate, one Cox head.
 intermediate = IntermediateFusion(
-    encoding={
+    encoders={
         "clinical": [MLP(in_dim=12, hidden_dims=[64], out_dim=64, dropout=0.1)],
         "wsi": [ABMIL(in_dim=1024, hidden_dim=256, attention_dim=128, dropout=0.25), nn.Linear(256, 64)],
     },
@@ -65,14 +65,15 @@ The dataset supplies the modality names and the target. Runnable versions are in
 [examples/hancock/](../examples/hancock/): `survival_intermediate.py` (intermediate, Cox), `classification_late.py`
 (late, classification) and `configs/intermediate_cox.yaml` (the same model as YAML).
 
-Widths are checked at construction: a stage list must end in `(n, d)` vectors, adjacent `in_dim`/`out_dim` must
-match, and the head's `in_dim` must match the fusion output (`Concat` sums the widths, `MaskedMean` needs them equal).
+Widths are checked when `fit` starts, in a dry run on a few training patients before training: each encoder list
+must end in one embedding per patient, consecutive encoders must fit together, and the head must take the fused width
+(`Concat` sums the widths, `MaskedMean` needs them equal). An error names the encoder, head or branch that raised it.
 
 ## Missing modalities
 
 Every model follows one rule, so absence needs no placeholder values:
 
-1. Stages run only on patients who have the modality.
+1. Encoders run only on patients who have the modality.
 2. Outputs are scattered back into the batch with NaN for the others.
 3. Fusion selects the defined rows. It never multiplies by a mask, since `NaN * 0` is `NaN` and would corrupt
    gradients.
@@ -89,7 +90,6 @@ A new fusion method subclasses `FusionMethod`, declares the `stages` it supports
 `"late"`) and implements:
 
 - `defined(present)`: which patients it can combine, from an `(n_patients, n_inputs)` presence matrix;
-- `output_dim(widths)`: the width of its output, given the width of each input;
 - `forward(values, present)`: the combination, called only on the rows `defined` accepts.
 
 To add rules, it overrides `check(context)` and calls `super().check(context)` first. The `FusionContext` holds the

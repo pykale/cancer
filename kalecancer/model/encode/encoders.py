@@ -1,15 +1,11 @@
-"""Encoders: stages that turn a modality's inputs into one vector per patient."""
+"""Encoders that need no optional extra: modules that turn a modality's inputs into one embedding per patient."""
 
 from __future__ import annotations
-
-import warnings
 
 import torch
 from torch import Tensor, nn
 
-with warnings.catch_warnings():
-    # torchsurv applies torch.jit.script when imported, which recent torch deprecates; users cannot act on it
-    warnings.filterwarnings("ignore", message=r".*torch\.jit\.script.* is deprecated", category=FutureWarning)
+from kalecancer.model.encode.base_encoders import AttentionEncoder
 
 
 class MLP(nn.Module):
@@ -37,7 +33,7 @@ class MLP(nn.Module):
         return self.layers(x)
 
 
-class ABMIL(nn.Module):
+class ABMIL(AttentionEncoder):
     """Gated attention-based multiple-instance pooling (Ilse et al., 2018).
 
     Takes a list of bags, one ``(N_i, in_dim)`` tensor per patient, and returns ``(n, hidden_dim)``.

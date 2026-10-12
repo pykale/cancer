@@ -6,20 +6,19 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from kalecancer.loaddata import Classification, MultimodalDataset, TimeToEvent
-from kalecancer.loaddata.modalities import Tabular
+from kalecancer.loaddata import Classification, TimeToEvent
 from kalecancer.model import (
     ABMIL,
     MLP,
     ClassificationHead,
     Concat,
     CoxHead,
+    EncoderList,
+    FittedEncoder,
     FusionContext,
     FusionMethod,
-    InContextModule,
     MajorityVote,
     MaskedMean,
-    StageList,
 )
 
 TARGET_IDS = pd.Index(["001", "002", "003"])
@@ -64,62 +63,39 @@ def test_abmil_rejects_wrong_width_and_empty_bags():
         abmil([torch.randn(0, 8)])
 
 
-# ---------------------------------------------------------------- in-context modules
+# ---------------------------------------------------------------- fitted encoders
 
 
-class ContextSize(InContextModule):
-    """Embeds each query as the number of context rows it sees."""
+class Centre(FittedEncoder):
+    """Subtracts the training mean, kept in a buffer whose size depends on the data."""
 
-    out_dim = 1
+    mean: torch.Tensor
 
     def __init__(self):
-        super().__init__(context_label="event", context_folds=2, random_state=0)
+        super().__init__()
+        self.register_buffer("mean", torch.empty(0))
 
-    def embed(self, context, queries):
-        return context.sum().expand(len(queries), 1).float()
+    def fit(self, x, target, ids):
+        self.mean = x.mean(dim=0)
+
+    def forward(self, x, ids):
+        return x - self.mean
 
 
-EVENTS = {"event": torch.tensor([True, False] * 4)}
-IDS = [f"p{k}" for k in range(8)]
-
-
-def test_context_rows_see_the_context_without_their_fold_and_the_context_loads_into_a_fresh_module():
+def test_a_fitted_encoder_loads_into_a_fresh_one():
     x = torch.randn(8, 3)
-    module = ContextSize()
-    module.fit(x, EVENTS, IDS)
-    assert module(torch.cat([x, torch.randn(1, 3)]), IDS + ["new"]).flatten().tolist() == [4.0] * 8 + [8.0]
-    fresh = ContextSize()
-    fresh.load_state_dict(module.state_dict())
-    assert fresh(x, IDS).flatten().tolist() == [4.0] * 8
+    fitted = Centre()
+    fitted.fit(x, SURVIVAL, [f"p{k}" for k in range(8)])
+    fresh = Centre()
+    fresh.load_state_dict(fitted.state_dict())
+    torch.testing.assert_close(fresh(x, []), x - x.mean(dim=0))
 
 
-def test_in_context_guards():
-    x = torch.randn(8, 3)
-    module = ContextSize()
-    with pytest.raises(ValueError, match="context_label must be 'event' or 'label'"):
-        InContextModule(context_label="time", context_folds=2, random_state=0)
-    with pytest.raises(RuntimeError, match="ContextSize.fit must be called before forward"):
-        module(x, IDS)
-    with pytest.raises(ValueError, match="needs a target with 'event'"):
-        module.fit(x, {"label": torch.zeros(8)}, IDS)
-    with pytest.raises(ValueError, match="aligned with 7 ids"):
-        module.fit(x, EVENTS, IDS[:7])
-    with pytest.raises(ValueError, match=r"classes \[1\] have fewer rows than context_folds=2"):
-        module.fit(x, {"event": torch.tensor([True] + [False] * 7)}, IDS)
-    module.fit(x, EVENTS, IDS)
-    with pytest.raises(ValueError, match=r"expected x of shape \(8, 3\)"):
-        module(x[:, :2], IDS)
-    with pytest.raises(ValueError, match=r"ids \['p0'\] are context ids but their rows differ"):
-        module(x + (torch.arange(8) == 0).float()[:, None], IDS)
-
-
-# ---------------------------------------------------------------- stage lists
+# ---------------------------------------------------------------- encoder lists
 
 
 class NanToZero(torch.nn.Module):
-    """A stage that handles missing values itself."""
-
-    allow_nan = True
+    """An encoder that handles missing values itself."""
 
     def forward(self, x):
         return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
@@ -130,37 +106,72 @@ class BagMean(torch.nn.Module):
         return torch.stack([bag.mean(dim=0) for bag in bags])
 
 
-def test_stage_list_rejects_nan_and_inf_inputs_naming_the_patients():
+class Log(torch.nn.Module):
+    def forward(self, x):
+        return torch.log(x)
+
+
+IDS = ["001", "002", "003", "004"]
+
+
+def test_encoder_list_rejects_non_finite_embeddings_and_blames_the_input():
     x = torch.randn(4, 3)
     x[1, 0], x[3, 2] = float("nan"), float("inf")
-    ids = ["001", "002", "003", "004"]
-    message = r"encoding\['clinical'\] input has NaN or infinite values for 2 patients \(e\.g\. \['002', '004'\]\)"
-    with pytest.raises(ValueError, match=message):
-        StageList([torch.nn.Linear(3, 2)], "clinical")(x, ids)
-    # with no stages the input goes straight to fusion or a head, which do not accept NaN either
-    with pytest.raises(ValueError, match=message):
-        StageList([], "clinical")(x, ids)
-    # only the first stage reads the raw input, so allow_nan on a later stage does not count
-    with pytest.raises(ValueError, match=message):
-        StageList([torch.nn.Linear(3, 3), NanToZero()], "clinical")(x, ids)
-    assert torch.isfinite(StageList([NanToZero(), torch.nn.Linear(3, 2)], "clinical")(x, ids)).all()
+    output = r"encoders\['clinical'\] output NaN or infinite values for 2 patient\(s\) \(e\.g\. \['002', '004'\]\)"
+    cause = r"input already has NaN or infinite values for 2 patient\(s\) \(e\.g\. \['002', '004'\]\)"
+    with pytest.raises(ValueError, match=f"{output}.*{cause}"):
+        EncoderList([torch.nn.Linear(3, 2)], "clinical")(x, IDS)
+    # with no encoders the input is the embedding, and fusion and heads do not accept NaN either
+    with pytest.raises(ValueError, match=output):
+        EncoderList([], "clinical")(x, IDS)
 
 
-def test_stage_list_rejects_a_bag_with_nan():
+def test_an_encoder_that_handles_nan_needs_no_flag():
+    x = torch.randn(4, 3)
+    x[1, 0] = float("nan")
+    assert torch.isfinite(EncoderList([NanToZero(), torch.nn.Linear(3, 2)], "clinical")(x, IDS)).all()
+    # only the embedding is checked, so an encoder later in the list may handle NaN too
+    assert torch.isfinite(EncoderList([torch.nn.Linear(3, 3), NanToZero()], "clinical")(x, IDS)).all()
+
+
+def test_encoder_list_blames_the_encoders_when_the_input_is_finite():
+    with pytest.raises(ValueError, match="The input was finite, so the encoders produced these values"):
+        EncoderList([Log()], "clinical")(-torch.rand(4, 3) - 1, IDS)
+
+
+def test_encoder_list_names_the_patient_whose_bag_has_nan():
     bags = [torch.randn(5, 3), torch.randn(7, 3)]
     bags[1][2, 1] = float("nan")
-    with pytest.raises(ValueError, match=r"encoding\['wsi'\] .* for 1 patient \(e\.g\. \['002'\]\)"):
-        StageList([BagMean()], "wsi")(bags, ["001", "002"])
+    with pytest.raises(ValueError, match=r"encoders\['wsi'\] .* for 1 patient\(s\) \(e\.g\. \['002'\]\)"):
+        EncoderList([BagMean()], "wsi")(bags, ["001", "002"])
 
 
-def test_stage_list_checks_the_context_before_fitting_an_in_context_stage():
-    frame = pd.DataFrame({"a": [1.0, np.nan, 3.0], "b": [0.0, 1.0, 2.0]}, index=TARGET_IDS)
-    data = MultimodalDataset({"clinical": Tabular(frame)}, target=SURVIVAL, required_modalities=["clinical"])
-    stages = StageList([ContextSize()], "clinical")
-    with pytest.raises(ValueError, match=r"encoding\['clinical'\] .* for 1 patient \(e\.g\. \['002'\]\)"):
-        stages.fit(data, data.ids, lambda ids: data.modalities["clinical"][ids])
-    with pytest.raises(RuntimeError, match="fit must be called before forward"):
-        stages[0](torch.zeros(1, 2), ["new"])
+class Fail(torch.nn.Module):
+    def forward(self, x):
+        raise RuntimeError("should not run")
+
+
+def test_steps_yield_each_output_and_stopping_early_skips_the_rest():
+    encoders = EncoderList([torch.nn.Linear(3, 4), torch.nn.ReLU(), Fail()], "clinical")
+    x = torch.randn(4, 3)
+    seen = []
+    for k, encoder, out in encoders.steps(x, IDS):
+        seen.append((k, type(encoder).__name__, tuple(out.shape)))
+        if k == 1:
+            break
+    assert seen == [(0, "Linear", (4, 4)), (1, "ReLU", (4, 4))]
+    with pytest.raises(RuntimeError, match="should not run") as error:
+        encoders(x, IDS)
+    assert error.value.__notes__ == ["in encoders['clinical'][2] Fail, called on a tensor of shape (4, 4)"]
+
+
+def test_encoder_list_output_must_be_one_floating_point_row_per_patient():
+    with pytest.raises(ValueError, match=r"one row per patient: 4 patients, 3 rows"):
+        EncoderList([], "clinical")(torch.randn(3, 2), IDS)
+    with pytest.raises(ValueError, match=r"must output an \(n, d\) tensor, got shape \(4, 2, 2\)"):
+        EncoderList([], "clinical")(torch.randn(4, 2, 2), IDS)
+    with pytest.raises(TypeError, match="must output a floating-point tensor, got torch.int64"):
+        EncoderList([], "clinical")(torch.ones(4, 2, dtype=torch.long), IDS)
 
 
 # ---------------------------------------------------------------- Cox head
@@ -276,7 +287,6 @@ def late_context(covered, kinds, width=1):
 def test_concat_defines_only_patients_with_every_input():
     everyone = torch.ones(3, dtype=torch.bool)
     assert Concat()({"a": torch.randn(3, 2), "b": torch.randn(3, 4)}, {"a": everyone, "b": everyone}).shape == (3, 6)
-    assert Concat().output_dim({"a": 2, "b": 4}) == 6
     present = torch.tensor([[True, True], [True, False], [False, False]])
     assert Concat().defined(present).tolist() == [True, False, False]
     assert MaskedMean().defined(present).tolist() == [True, True, False]
@@ -312,9 +322,6 @@ def test_fusion_method_subclasses_must_implement_defined():
     class Incomplete(FusionMethod):
         stages = frozenset({"intermediate"})
 
-        def output_dim(self, widths):
-            return 0
-
         def forward(self, values, present):
             return values
 
@@ -341,8 +348,6 @@ def test_masked_mean_averages_present_rows_with_finite_gradients():
     torch.testing.assert_close(fused[0], (a[0] + b[0]) / 2)
     fused.sum().backward()
     assert torch.isfinite(project.weight.grad).all()
-    with pytest.raises(ValueError, match="one width"):
-        MaskedMean().output_dim({"a": 2, "b": 3})
     with pytest.raises(ValueError, match="one width"):
         MaskedMean().check(FusionContext.without_data("intermediate", {"a": 2, "b": 3}))
 

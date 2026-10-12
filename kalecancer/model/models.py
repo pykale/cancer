@@ -1,6 +1,6 @@
-"""Models: per-modality stage lists wired into unimodal, early, intermediate and late fusion.
+"""Models: per-modality wiring for unimodal, early, intermediate and late fusion.
 
-Execution rule shared by every model: stages run on the patients that have the modality, their outputs are
+Execution rule shared by every model: encoders run on the patients that have the modality, their outputs are
 scattered back into the batch with NaN for absent patients, fusion methods select defined rows (never multiply
 by a mask), and heads run on defined rows only. This keeps gradients finite when modalities are missing.
 
@@ -21,8 +21,8 @@ from torch import Tensor, nn
 from kalecancer.loaddata.dataset import MultimodalDataset
 from kalecancer.loaddata.modalities import FixedShapeModality, Modality
 from kalecancer.loaddata.targets import BaseTarget
+from kalecancer.model.encode.encoder_list import EncoderList
 from kalecancer.model.fusion import FusionContext, FusionMethod, Stage
-from kalecancer.model.incontext import InContextModule
 
 
 @dataclass
@@ -33,15 +33,6 @@ class ModelOutput:
     prediction: Tensor
     defined: Tensor
     branches: dict[str, ModelOutput] = field(default_factory=dict)
-
-
-def _declared(stage: nn.Module, names: tuple[str, str]) -> int | None:
-    """The first of ``names`` that ``stage`` declares as an int, or ``None`` when it declares none."""
-    for name in names:
-        value = getattr(stage, name, None)
-        if isinstance(value, int):
-            return value
-    return None
 
 
 def _scatter(rows: Tensor, mask: Tensor) -> Tensor:
@@ -57,103 +48,18 @@ def _selected_ids(ids: Sequence[str], mask: Tensor) -> list[str]:
     return [pid for pid, keep in zip(ids, mask.tolist(), strict=True) if keep]
 
 
-def _vectors(z: Any, name: str) -> Tensor:
-    """Return ``z`` if it is an ``(n, d)`` tensor; otherwise raise, naming the stage list."""
-    if not isinstance(z, Tensor) or z.ndim != 2:
-        shape = tuple(z.shape) if isinstance(z, Tensor) else type(z).__name__
-        raise TypeError(f"encoding[{name!r}] must end with (n, d) vectors, got {shape}")
-    return z
-
-
-def _describe(x: Any) -> str:
-    """Describe a stage's input for the note added to that stage's errors."""
-    if isinstance(x, Tensor):
-        return f"a tensor of shape {tuple(x.shape)}"
-    if isinstance(x, list) and all(isinstance(item, Tensor) for item in x):
-        shapes = ", ".join(str(tuple(item.shape)) for item in x[:3]) + (", ..." if len(x) > 3 else "")
-        return f"a list of {len(x)} tensor{'' if len(x) == 1 else 's'} shaped {shapes}"
-    return f"a {type(x).__name__}"
-
-
-class StageList(nn.ModuleList):
-    """Stages applied in order. A stage with ``needs_ids = True`` is called as ``stage(x, ids)``. The input must be
-    finite unless the first stage sets ``allow_nan = True``."""
-
-    def __init__(self, stages: Sequence[nn.Module], name: str):
-        if isinstance(stages, nn.Module | str):
-            raise TypeError(f"encoding[{name!r}] must be a list of stages, got {type(stages).__name__}")
-        stages = list(stages)
-        for k, stage in enumerate(stages):
-            if not isinstance(stage, nn.Module):
-                raise TypeError(f"encoding[{name!r}][{k}] must be an nn.Module, got {type(stage).__name__}")
-            if k > 0 and isinstance(stage, InContextModule):
-                raise ValueError(
-                    f"encoding[{name!r}][{k}] {type(stage).__name__} is an InContextModule; "
-                    "only the first stage may be fitted"
-                )
-        super().__init__(stages)
-        self.name = name
-        self.output_width(None)
-
-    def output_width(self, input_width: int | None) -> int | None:
-        """Walk declared widths (in_dim/out_dim or in_features/out_features); raise on a broken link."""
-        width = input_width
-        for k, stage in enumerate(self):
-            expected = _declared(stage, ("in_dim", "in_features"))
-            if expected is not None and width is not None and expected != width:
-                raise ValueError(
-                    f"encoding[{self.name!r}][{k}] {type(stage).__name__} expects width {expected} but receives {width}"
-                )
-            produced = _declared(stage, ("out_dim", "out_features"))
-            width = produced if produced is not None else width
-        return width
-
-    def check_input(self, x: Any, ids: list[str]) -> None:
-        """Raise if a patient's input has NaN or infinite values, unless the first stage sets ``allow_nan = True``.
-
-        Args:
-            x: The stage list's input: an ``(n, ...)`` tensor, or a list of one tensor per patient (bags).
-            ids: The patients of ``x``, in row order.
-        """
-        if self and getattr(self[0], "allow_nan", False):
-            return
-        if isinstance(x, Tensor):
-            finite = torch.isfinite(x).reshape(len(x), -1).all(dim=1).tolist()
-        elif isinstance(x, list | tuple) and all(isinstance(item, Tensor) for item in x):
-            finite = [bool(torch.isfinite(item).all()) for item in x]
-        else:
-            return  # an input this cannot inspect; the first stage is responsible for it
-        if bad := [pid for pid, ok in zip(ids, finite, strict=True) if not ok]:
-            raise ValueError(
-                f"encoding[{self.name!r}] input has NaN or infinite values for {len(bad)} "
-                f"patient{'' if len(bad) == 1 else 's'} (e.g. {bad[:5]}); impute them in the modality's transform, "
-                "or start the stage list with a stage that sets allow_nan = True"
-            )
-
-    def fit(self, train: MultimodalDataset, ids: list[str], load: Callable[[list[str]], Any]) -> None:
-        """Fit the first stage on the rows ``load(ids)`` if it is an ``InContextModule``."""
-        if self and isinstance(self[0], InContextModule):
-            assert train.target is not None, "an InContextModule stage needs a dataset with a target"
-            x = load(ids)
-            self.check_input(x, ids)
-            self[0].fit(x, train.target.tensors(ids), ids)
-
-    def forward(self, x: Any, ids: list[str]) -> Any:
-        """Check the input, then run the stages in order; an error gets a note naming the stage that raised it and
-        its input."""
-        self.check_input(x, ids)
-        for k, stage in enumerate(self):
-            try:
-                x = stage(x, ids) if getattr(stage, "needs_ids", False) else stage(x)
-            except Exception as error:
-                error.add_note(f"in encoding[{self.name!r}][{k}] {type(stage).__name__}, called on {_describe(x)}")
-                raise
-        return x
-
-
 def _loader(source: Modality) -> Callable[[list[str]], Any]:
     """A function that loads the given patients from ``source`` and collates them into one batch."""
     return lambda ids: source[ids]
+
+
+def _fit_encoders(
+    encoders: EncoderList, train: MultimodalDataset, ids: list[str], load: Callable[[list[str]], Any]
+) -> None:
+    """Fit ``encoders`` on the rows ``load(ids)``, loading them only if its first encoder is fitted."""
+    if encoders.needs_fit:
+        assert train.target is not None, "fitting an encoder needs a dataset with a target"
+        encoders.fit(load(ids), train.target, ids)
 
 
 def _check_modalities(data: MultimodalDataset, names: Sequence[str]) -> None:
@@ -191,6 +97,11 @@ def _check_fusion(
     fusion.check(FusionContext(stage, present, required, widths))
 
 
+def _width(x: Any) -> int | None:
+    """The width of an ``(n, d)`` batch, ``None`` for any other input."""
+    return x.shape[1] if isinstance(x, Tensor) and x.ndim == 2 else None
+
+
 class _SingleHeadModel(nn.Module):
     """Base for the models that end in one head: ``Unimodal``, ``EarlyFusion`` and ``IntermediateFusion``."""
 
@@ -218,11 +129,15 @@ class _SingleHeadModel(nn.Module):
         """Which patients in ``data`` this model predicts for."""
         raise NotImplementedError
 
-    def _check_head_width(self, width: int | None) -> None:
-        """Raise if the head declares an input width other than ``width``."""
-        expected = _declared(self.head, ("in_dim", "in_features"))
-        if width is not None and expected is not None and width != expected:
-            raise ValueError(f"head {type(self.head).__name__} expects width {expected} but receives {width}")
+    def dry_run(self, data: MultimodalDataset, batch: dict) -> None:
+        """Run the model once on ``batch``, a few of ``data``'s training patients, and check the fusion method against
+        the real widths of its inputs. ``Pipeline.fit`` calls this before training, in eval mode and without gradients,
+        so an encoder that cannot take its input fails before the first optimizer step."""
+        self._dry_run(data, batch, allow_undefined=False)
+
+    def _dry_run(self, data: MultimodalDataset, batch: dict, allow_undefined: bool) -> None:
+        """``dry_run``; ``allow_undefined`` is ``True`` for a ``LateFusion`` branch, as in ``_check``."""
+        self(batch)
 
     def _check_target(self, data: MultimodalDataset) -> None:
         """Raise if the head cannot predict the dataset's target."""
@@ -235,7 +150,11 @@ class _SingleHeadModel(nn.Module):
         if rows is None:
             output = torch.full((defined.shape[0], self.head.out_dim), float("nan"), device=defined.device)
         else:
-            output = _scatter(self.head(rows), defined)
+            try:
+                output = _scatter(self.head(rows), defined)
+            except Exception as error:
+                error.add_note(f"in head {type(self.head).__name__}, called on a tensor of shape {tuple(rows.shape)}")
+                raise
         return ModelOutput(output=output, prediction=self.head.predict(output), defined=defined)
 
     def loss(self, output: ModelOutput, target: Mapping[str, Tensor]) -> dict[str, Tensor] | None:
@@ -256,14 +175,13 @@ class _SingleHeadModel(nn.Module):
 
 
 class Unimodal(_SingleHeadModel):
-    """One modality's stages followed by a head."""
+    """One modality's list of encoders followed by a head."""
 
-    def __init__(self, modality: str, encoding: list[nn.Module], head: nn.Module):
+    def __init__(self, modality: str, encoders: list[nn.Module], head: nn.Module):
         super().__init__()
         self.modality = modality
-        self.encoding = StageList(encoding, modality)
+        self.encoders = EncoderList(encoders, modality)
         self.head = head
-        self._check_head_width(self.encoding.output_width(None))
 
     @property
     def modalities(self) -> list[str]:
@@ -284,107 +202,105 @@ class Unimodal(_SingleHeadModel):
         return data.present[self.modality]
 
     def fit(self, train: MultimodalDataset) -> None:
-        """Fit an ``InContextModule`` first stage on the training patients who have the modality."""
-        self.encoding.fit(train, train.present_ids(self.modality), _loader(train.modalities[self.modality]))
+        """Fit a ``FittedEncoder`` first on the training patients who have the modality."""
+        _fit_encoders(self.encoders, train, train.present_ids(self.modality), _loader(train.modalities[self.modality]))
 
     def forward(self, batch: dict) -> ModelOutput:
         """Encode the patients who have the modality and run the head on them."""
         present = batch["present"][self.modality]
-        rows = None
+        z = None
         if bool(present.any()):
-            z = self.encoding(batch["inputs"][self.modality], _selected_ids(batch["ids"], present))
-            rows = _vectors(z, self.modality)
-        return self._finish(rows, present)
+            z = self.encoders(batch["inputs"][self.modality], _selected_ids(batch["ids"], present))
+        return self._finish(z, present)
 
-    def stages_for(self, modality: str) -> StageList:
-        """The stage list, if ``modality`` is this model's modality."""
+    def encoders_for(self, modality: str) -> EncoderList:
+        """The encoder list, if ``modality`` is this model's modality."""
         if modality != self.modality:
             raise KeyError(f"this model uses {self.modality!r}, not {modality!r}")
-        return self.encoding
+        return self.encoders
 
 
 class IntermediateFusion(_SingleHeadModel):
-    """Each modality's stages, then a fusion method, then one head."""
+    """Each modality's encoders, then a fusion method, then one head."""
 
-    def __init__(self, encoding: dict[str, list[nn.Module]], fusion: FusionMethod, head: nn.Module):
+    def __init__(self, encoders: dict[str, list[nn.Module]], fusion: FusionMethod, head: nn.Module):
         super().__init__()
-        if not encoding:
-            raise ValueError("IntermediateFusion needs at least one modality in encoding")
+        if not encoders:
+            raise ValueError("IntermediateFusion needs at least one modality in encoders")
         _require_fusion_method(fusion, "fusion")
-        self.encoding = nn.ModuleDict({name: StageList(stages, name) for name, stages in encoding.items()})
+        self.encoders = nn.ModuleDict({name: EncoderList(listed, name) for name, listed in encoders.items()})
         self.fusion = fusion
         self.head = head
-        widths = self._widths()
-        fusion.check(FusionContext.without_data("intermediate", widths))
-        known = {name: width for name, width in widths.items() if width is not None}
-        if len(known) == len(widths):
-            self._check_head_width(fusion.output_dim(known))
+        # the embedding widths are unknown until the dry run, so only rules that need no width run here
+        fusion.check(FusionContext.without_data("intermediate", dict.fromkeys(self.encoders)))
 
     @property
     def modalities(self) -> list[str]:
-        """The modalities in ``encoding``, in order."""
-        return list(self.encoding)
-
-    def _widths(self) -> dict[str, int | None]:
-        """The output width of each modality's stage list, ``None`` where its stages do not declare one."""
-        return {name: stages.output_width(None) for name, stages in self.encoding.items()}
+        """The modalities in ``encoders``, in order."""
+        return list(self.encoders)
 
     def _check(self, data: MultimodalDataset, allow_undefined: bool) -> None:
         """Raise if the dataset lacks a modality, its target does not suit the head, or the fusion method
         cannot be fitted on it."""
         _check_modalities(data, self.modalities)
         self._check_target(data)
-        _check_fusion(self.fusion, "intermediate", data, self._widths(), allow_undefined)
+        _check_fusion(self.fusion, "intermediate", data, dict.fromkeys(self.modalities), allow_undefined)
+
+    def _dry_run(self, data: MultimodalDataset, batch: dict, allow_undefined: bool) -> None:
+        """Run each encoder list, check the fusion method against the embedding widths, then run the whole model."""
+        widths: dict[str, int | None] = dict.fromkeys(self.modalities)
+        for name, encoder_list in self.encoders.items():
+            present = batch["present"][name]
+            if bool(present.any()):
+                widths[name] = _width(encoder_list(batch["inputs"][name], _selected_ids(batch["ids"], present)))
+        _check_fusion(self.fusion, "intermediate", data, widths, allow_undefined)
+        self(batch)
 
     def _defined_for(self, data: MultimodalDataset) -> pd.Series:
         """The patients the fusion method can combine."""
         return self.fusion.defined_rows(data.present[self.modalities])
 
     def fit(self, train: MultimodalDataset) -> None:
-        """Fit each ``InContextModule`` first stage on the training patients who have its modality."""
-        for name, stages in self.encoding.items():
-            stages.fit(train, train.present_ids(name), _loader(train.modalities[name]))
+        """Fit each ``FittedEncoder`` on the training patients who have its modality."""
+        for name, encoder_list in self.encoders.items():
+            _fit_encoders(encoder_list, train, train.present_ids(name), _loader(train.modalities[name]))
 
     def forward(self, batch: dict) -> ModelOutput:
         """Encode each modality on the patients who have it, fuse the defined patients, and run the head."""
-        present = {name: batch["present"][name] for name in self.encoding}
+        present = {name: batch["present"][name] for name in self.encoders}
         defined = self.fusion.defined(_presence(present))
         if not bool(defined.any()):
             return self._finish(None, defined)
         z = {}
-        for name, stages in self.encoding.items():
+        for name, encoder_list in self.encoders.items():
             if bool(present[name].any()):
-                rows = _vectors(stages(batch["inputs"][name], _selected_ids(batch["ids"], present[name])), name)
+                rows = encoder_list(batch["inputs"][name], _selected_ids(batch["ids"], present[name]))
                 z[name] = _scatter(rows, present[name])
         index = defined.nonzero().squeeze(1)
         fused = self.fusion({name: v[index] for name, v in z.items()}, {name: m[index] for name, m in present.items()})
         return self._finish(fused, defined)
 
-    def stages_for(self, modality: str) -> StageList:
-        """The stage list for ``modality``."""
-        if modality not in self.encoding:
+    def encoders_for(self, modality: str) -> EncoderList:
+        """The encoder list for ``modality``."""
+        if modality not in self.encoders:
             raise KeyError(f"this model uses {self.modalities}, not {modality!r}")
-        return self.encoding[modality]
+        return self.encoders[modality]
 
 
 class EarlyFusion(_SingleHeadModel):
-    """Fuse raw vector modalities first, then one stage list, then one head."""
+    """Fuse raw vector modalities first, then one encoder list, then one head."""
 
-    def __init__(self, modalities: list[str], fusion: FusionMethod, encoding: list[nn.Module], head: nn.Module):
+    def __init__(self, modalities: list[str], fusion: FusionMethod, encoders: list[nn.Module], head: nn.Module):
         super().__init__()
         if isinstance(modalities, str) or len(modalities) < 2:
             raise ValueError("EarlyFusion needs a list of at least two modalities; use Unimodal for one")
         _require_fusion_method(fusion, "fusion")
         self.modalities = list(modalities)
         self.fusion = fusion
-        self.encoding = StageList(encoding, "fused")
+        self.encoders = EncoderList(encoders, "fused")
         self.head = head
-        fusion.check(FusionContext.without_data("early", self._widths()))
-        self._check_head_width(self.encoding.output_width(None))
-
-    def _widths(self) -> dict[str, int | None]:
-        """Unknown raw widths: they depend on the table transforms, which are fitted after the model is checked."""
-        return dict.fromkeys(self.modalities)
+        # the raw widths depend on the transforms, which are fitted later, so only rules that need no width run here
+        fusion.check(FusionContext.without_data("early", dict.fromkeys(self.modalities)))
 
     def _check(self, data: MultimodalDataset, allow_undefined: bool) -> None:
         """Raise if the dataset lacks a modality, its target does not suit the head, or the fusion method
@@ -396,14 +312,20 @@ class EarlyFusion(_SingleHeadModel):
                 f"EarlyFusion fuses raw inputs, so its modalities must be FixedShapeModality. {bags} are not"
             )
         self._check_target(data)
-        _check_fusion(self.fusion, "early", data, self._widths(), allow_undefined)
+        _check_fusion(self.fusion, "early", data, dict.fromkeys(self.modalities), allow_undefined)
+
+    def _dry_run(self, data: MultimodalDataset, batch: dict, allow_undefined: bool) -> None:
+        """Check the fusion method against the widths of the transformed inputs, then run the whole model."""
+        widths = {name: _width(batch["inputs"].get(name)) for name in self.modalities}
+        _check_fusion(self.fusion, "early", data, widths, allow_undefined)
+        self(batch)
 
     def _defined_for(self, data: MultimodalDataset) -> pd.Series:
         """The patients the fusion method can combine."""
         return self.fusion.defined_rows(data.present[self.modalities])
 
     def fit(self, train: MultimodalDataset) -> None:
-        """Fit an ``InContextModule`` first stage on the training patients who have every modality."""
+        """Fit an ``FittedEncoder`` on the training patients who have every modality."""
         # the context is built from complete rows, fused exactly as forward fuses them
         ids = [pid for pid in train.ids if all(train.present.at[pid, name] for name in self.modalities)]
 
@@ -412,10 +334,10 @@ class EarlyFusion(_SingleHeadModel):
             everyone = torch.ones(len(batch_ids), dtype=torch.bool)
             return self.fusion(inputs, {name: everyone for name in self.modalities})
 
-        self.encoding.fit(train, ids, load)
+        _fit_encoders(self.encoders, train, ids, load)
 
     def forward(self, batch: dict) -> ModelOutput:
-        """Fuse the raw inputs of the defined patients, run the stage list on the result, then the head."""
+        """Fuse the raw inputs of the defined patients, run the encoder list on the result, then the head."""
         present = {name: batch["present"][name] for name in self.modalities}
         defined = self.fusion.defined(_presence(present))
         if not bool(defined.any()):
@@ -427,14 +349,14 @@ class EarlyFusion(_SingleHeadModel):
             if bool(present[name].any())
         }
         fused = self.fusion(inputs, {name: present[name][index] for name in self.modalities})
-        rows = _vectors(self.encoding(fused, _selected_ids(batch["ids"], defined)), "fused")
+        rows = self.encoders(fused, _selected_ids(batch["ids"], defined))
         return self._finish(rows, defined)
 
-    def stages_for(self, modality: str) -> StageList:
-        """The one stage list, named ``"fused"``."""
+    def encoders_for(self, modality: str) -> EncoderList:
+        """The one encoder list, named ``"fused"``."""
         if modality != "fused":
-            raise KeyError("EarlyFusion has one stage list, named 'fused', which runs on the fused input")
-        return self.encoding
+            raise KeyError("EarlyFusion has one encoder list, named 'fused', which runs on the fused input")
+        return self.encoders
 
 
 class LateFusion(nn.Module):
@@ -490,13 +412,29 @@ class LateFusion(nn.Module):
         self.fusion.check(self._fusion_context(data))
 
     def fit(self, train: MultimodalDataset) -> None:
-        """Fit each branch's ``InContextModule`` first stages on the training patients."""
+        """Fit each branch's ``FittedEncoder`` first encoders on the training patients."""
         for branch in self.branches.values():
             branch.fit(train)
 
+    def dry_run(self, data: MultimodalDataset, batch: dict) -> None:
+        """Dry-run each branch, as ``_SingleHeadModel.dry_run`` does, then run the whole model once on ``batch``."""
+        for name, branch in self.branches.items():
+            try:
+                branch._dry_run(data, batch, allow_undefined=True)
+            except Exception as error:
+                error.add_note(f"in branch {name!r} ({type(branch).__name__})")
+                raise
+        self(batch)
+
     def forward(self, batch: dict) -> ModelOutput:
         """Run every branch, then fuse the branch outputs of the patients ``fusion`` defines."""
-        outputs = {name: branch(batch) for name, branch in self.branches.items()}
+        outputs = {}
+        for name, branch in self.branches.items():
+            try:
+                outputs[name] = branch(batch)
+            except Exception as error:
+                error.add_note(f"in branch {name!r} ({type(branch).__name__})")
+                raise
         present = {name: out.defined for name, out in outputs.items()}
         defined = self.fusion.defined(_presence(present))
         by_output = self.fusion.input_space == "output"
@@ -527,8 +465,8 @@ class LateFusion(nn.Module):
             return self._reference_head.columns(target)
         return self.fusion.columns(target)
 
-    def stages_for(self, modality: str, branch: str | None = None) -> StageList:
-        """The stage list for ``modality``; pass ``branch`` when more than one branch reads it."""
+    def encoders_for(self, modality: str, branch: str | None = None) -> EncoderList:
+        """The encoder list for ``modality``; pass ``branch`` when more than one branch reads it."""
         matches = [
             (name, b)
             for name, b in self.branches.items()
@@ -537,4 +475,4 @@ class LateFusion(nn.Module):
         if len(matches) != 1:
             candidates = [name for name, b in self.branches.items() if modality in b.modalities]
             raise ValueError(f"{len(matches)} branches match modality {modality!r}; pass branch= one of {candidates}")
-        return matches[0][1].stages_for(modality)
+        return matches[0][1].encoders_for(modality)

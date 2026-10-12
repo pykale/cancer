@@ -1,3 +1,4 @@
+import warnings
 from functools import partial
 
 import numpy as np
@@ -19,13 +20,13 @@ from kalecancer.model import (
     ClassificationHead,
     Concat,
     CoxHead,
-    InContextModule,
+    FittedEncoder,
     IntermediateFusion,
     LateFusion,
     MaskedMean,
     Unimodal,
 )
-from kalecancer.pipeline import EarlyStopping, Pipeline
+from kalecancer.pipeline import EarlyStopping, NonFiniteInputWarning, Pipeline
 from kalecancer.prepdata import ColumnGroup, TableTransform
 
 
@@ -65,7 +66,7 @@ def split(data, n_train=22):
 
 def intermediate(fusion=None, head_dim=8):
     return IntermediateFusion(
-        encoding={
+        encoders={
             "clinical": [nn.Linear(3, 4)],
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.25), nn.Linear(6, 4)],
         },
@@ -139,31 +140,57 @@ def test_evaluating_on_patients_used_in_fit_raises(cohort):
     assert 0.0 <= pipe.evaluate(train, metrics={"c": HarrellC()}, allow_seen=True)["c"] <= 1.0
 
 
-def test_random_state_fixes_the_initial_weights(cohort):
+def test_widths_are_checked_by_a_dry_run_before_training(cohort):
+    train, _ = split(dataset(cohort))
+    # the dry run runs two patients, so a batch of 2 rows shows the error came before training
+    with pytest.raises(RuntimeError, match=r"\(2x8 and 7x1\)") as error:
+        pipeline(intermediate(head_dim=7)).fit(train)
+    assert error.value.__notes__ == ["in head CoxHead, called on a tensor of shape (2, 8)"]
+    unequal = IntermediateFusion(
+        encoders={"clinical": [nn.Linear(3, 4)], "wsi": [ABMIL(16, 6, 4, 0.0)]},
+        fusion=MaskedMean(),
+        head=CoxHead(in_dim=4, ties="efron"),
+    )
+    with pytest.raises(ValueError, match=r"MaskedMean needs inputs of one width, got \{'clinical': 4, 'wsi': 6\}"):
+        pipeline(unequal).fit(train)
+
+
+def test_a_late_fusion_error_names_the_branch(cohort):
+    train, _ = split(dataset(cohort, task="classification"))
+    model = LateFusion(
+        {
+            "clinical": Unimodal("clinical", [nn.Linear(3, 2)], ClassificationHead(2, 2)),
+            "wsi": Unimodal("wsi", [ABMIL(16, 6, 4, 0.0)], ClassificationHead(5, 2)),
+        },
+        MaskedMean(),
+    )
+    with pytest.raises(RuntimeError, match=r"\(2x6 and 5x2\)") as error:
+        pipeline(model).fit(train)
+    assert error.value.__notes__ == [
+        "in head ClassificationHead, called on a tensor of shape (2, 6)",
+        "in branch 'wsi' (Unimodal)",
+    ]
+
+
+def test_fit_does_not_depend_on_the_global_seed(cohort):
     train, test = split(dataset(cohort))
+    model = intermediate()
     torch.manual_seed(1)
-    first = pipeline(intermediate()).fit(train).predict(test)
+    first = pipeline(model).fit(train).predict(test)
     torch.manual_seed(2)
-    second = pipeline(intermediate()).fit(train).predict(test)
+    second = pipeline(model).fit(train).predict(test)
     pd.testing.assert_frame_equal(first, second)
 
 
-def test_keep_weights_modules_are_not_reinitialised(cohort):
-    class Pretrained(nn.Linear):
-        keep_weights = True
-
-    projection = Pretrained(3, 4)
-    projection.requires_grad_(False)
-    model = IntermediateFusion(
-        encoding={"clinical": [projection], "wsi": [ABMIL(16, 4, 4, 0.0)]},
-        fusion=Concat(),
-        head=CoxHead(in_dim=8, ties="efron"),
-    )
-    pipe = pipeline(model).fit(split(dataset(cohort))[0])
-    torch.testing.assert_close(pipe.model_.encoding["clinical"][0].weight, projection.weight)
+def test_fit_starts_from_the_weights_the_model_was_built_with(cohort):
+    model = intermediate()
+    # with a learning rate of 0 training changes nothing, so model_ holds exactly the weights fit started from
+    pipe = pipeline(model, optimizer=partial(torch.optim.AdamW, lr=0.0)).fit(split(dataset(cohort))[0])
+    for (name, built), (_, fitted) in zip(model.state_dict().items(), pipe.model_.state_dict().items(), strict=True):
+        torch.testing.assert_close(fitted, built, msg=name)
 
 
-def test_parameters_without_reset_raise(cohort):
+def test_modules_without_reset_parameters_fit_with_a_random_state(cohort):
     class Scale(nn.Module):
         def __init__(self):
             super().__init__()
@@ -173,12 +200,11 @@ def test_parameters_without_reset_raise(cohort):
             return x * self.factor
 
     model = IntermediateFusion(
-        encoding={"clinical": [Scale(), nn.Linear(3, 4)], "wsi": [ABMIL(16, 4, 4, 0.0)]},
+        encoders={"clinical": [Scale(), nn.Linear(3, 4)], "wsi": [ABMIL(16, 4, 4, 0.0)]},
         fusion=Concat(),
         head=CoxHead(in_dim=8, ties="efron"),
     )
-    with pytest.raises(TypeError, match="no reset_parameters"):
-        pipeline(model).fit(split(dataset(cohort))[0])
+    pipeline(model, random_state=0).fit(split(dataset(cohort))[0])
 
 
 def test_clone_is_unfitted_and_independent(cohort):
@@ -248,7 +274,7 @@ def test_training_guards(cohort):
     with pytest.raises(ValueError, match="accumulate_grad_batches"):
         pipeline(trainer_kwargs={"accumulate_grad_batches": 2}).fit(train)
     with pytest.raises(ValueError, match="matches no trainable parameter"):
-        pipeline(param_groups={"encoding.clinicl": {"lr": 1e-3}}).fit(train)
+        pipeline(param_groups={"encoders.clinicl": {"lr": 1e-3}}).fit(train)
     with pytest.raises(ValueError, match="precision"):
         pipeline(precision="16-true").fit(train)
     with pytest.raises(ValueError, match="make no batch"):
@@ -296,7 +322,7 @@ def test_nan_inputs_raise_at_fit_naming_the_patients(cohort, task):
     remove_age(cohort, ["002", "004", "006"])
     train, _ = split(dataset(cohort, task=task))
     model = intermediate() if task == "survival" else late_classifier()
-    with pytest.raises(ValueError, match=r"encoding\['clinical'\] input has NaN or infinite values") as error:
+    with pytest.raises(ValueError, match=r"encoders\['clinical'\] output NaN or infinite values") as error:
         pipeline(model).fit(train)
     assert any(pid in str(error.value) for pid in ["002", "004", "006"])
 
@@ -305,7 +331,10 @@ def test_nan_inputs_at_prediction_raise_naming_the_patients(cohort):
     remove_age(cohort, ["024", "025"])
     train, test = split(dataset(cohort))
     pipe = pipeline().fit(train)
-    message = r"encoding\['clinical'\] input has NaN or infinite values for 2 patients \(e\.g\. \['024', '025'\]\)"
+    message = (
+        r"encoders\['clinical'\] output NaN or infinite values for 2 patient\(s\) \(e\.g\. \['024', '025'\]\)"
+        r".*input already has NaN"
+    )
     with pytest.raises(ValueError, match=message):
         pipe.predict(test)
     with pytest.raises(ValueError, match=message):
@@ -313,26 +342,55 @@ def test_nan_inputs_at_prediction_raise_naming_the_patients(cohort):
 
 
 class NanToZero(nn.Module):
-    """A first stage that handles missing values itself."""
-
-    allow_nan = True
+    """An encoder that handles missing values itself."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.nan_to_num(x, nan=0.0)
 
 
-def test_a_first_stage_with_allow_nan_receives_nan_inputs(cohort):
-    remove_age(cohort, ["002", "024"])
-    train, test = split(dataset(cohort))
-    model = IntermediateFusion(
-        encoding={
+def nan_handling_model():
+    return IntermediateFusion(
+        encoders={
             "clinical": [NanToZero(), nn.Linear(3, 4)],
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
         },
         fusion=Concat(),
         head=CoxHead(in_dim=8, ties="efron"),
     )
-    assert np.isfinite(pipeline(model).fit(train).predict(test).to_numpy()).all()
+
+
+def test_an_encoder_that_handles_nan_receives_nan_inputs_and_a_warning_reports_them(cohort):
+    remove_age(cohort, ["002", "024"])
+    train, test = split(dataset(cohort))
+    fitted = r"1 of 22 patients have NaN or infinite values in 'clinical' \(e\.g\. \['002'\]\)"
+    with pytest.warns(NonFiniteInputWarning, match=fitted):
+        pipe = pipeline(nan_handling_model()).fit(train)
+    assert pipe.fit_report_["non_finite_inputs"] == {"clinical": 1}
+    with pytest.warns(NonFiniteInputWarning, match=r"1 of 8 patients .* \['024'\]"):
+        prediction = pipe.predict(test)
+    assert np.isfinite(prediction.to_numpy()).all()
+    # encode and attention export share predict's inference step, so they warn too
+    with pytest.warns(NonFiniteInputWarning, match=r"\['024'\]"):
+        pipe.encode(test, modality="clinical")
+
+
+def fit_recording_non_finite_warnings(pipe, train, silence):
+    """Fit ``pipe``, and return it with the ``NonFiniteInputWarning``s that reached the user."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        if silence:
+            warnings.filterwarnings("ignore", category=NonFiniteInputWarning)
+        pipe.fit(train)
+    return pipe, [w for w in caught if issubclass(w.category, NonFiniteInputWarning)]
+
+
+def test_clean_inputs_raise_no_warning_and_the_warning_can_be_silenced(cohort):
+    pipe, caught = fit_recording_non_finite_warnings(pipeline(), split(dataset(cohort))[0], silence=False)
+    assert pipe.fit_report_["non_finite_inputs"] == {} and not caught
+    remove_age(cohort, ["002"])
+    train = split(dataset(cohort))[0]
+    _, caught = fit_recording_non_finite_warnings(pipeline(nan_handling_model()), train, silence=True)
+    assert not caught
 
 
 # ---------------------------------------------------------------- late fusion, encode, attention
@@ -376,9 +434,9 @@ class DropFirstInstance(nn.Module):
         return [bag[1:] for bag in bags]
 
 
-def test_attention_rejects_a_stage_that_changes_the_instances(cohort):
+def test_attention_rejects_an_encoder_that_changes_the_instances(cohort):
     model = IntermediateFusion(
-        encoding={
+        encoders={
             "clinical": [nn.Linear(3, 4)],
             "wsi": [DropFirstInstance(), ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
         },
@@ -387,7 +445,7 @@ def test_attention_rejects_a_stage_that_changes_the_instances(cohort):
     )
     train, test = split(dataset(cohort))
     pipe = pipeline(model).fit(train)
-    with pytest.raises(ValueError, match=r"encoding\['wsi'\]\[0\] DropFirstInstance changes the number of instances"):
+    with pytest.raises(ValueError, match=r"encoders\['wsi'\]\[0\] DropFirstInstance changes the number of instances"):
         attention(pipe, test, "wsi")
 
 
@@ -406,22 +464,30 @@ def test_gpu_training_with_early_stopping_matches_its_own_bookkeeping(cohort):
     assert np.isfinite(pipe.predict(test).to_numpy()).all()
 
 
-class ContextStage(InContextModule):
-    """An in-context stage that passes rows through, so only its fitted context matters."""
-
-    out_dim = 3
+class ContextIds(FittedEncoder):
+    """Passes rows through, and keeps the ids it was fitted on as non-tensor fitted state."""
 
     def __init__(self):
-        super().__init__(context_label="event", context_folds=2, random_state=0)
+        super().__init__()
+        self.context_ids: list[str] = []
 
-    def embed(self, context, queries):
-        return queries
+    def fit(self, x, target, ids):
+        self.context_ids = list(ids)
+
+    def forward(self, x, ids):
+        return x
+
+    def get_extra_state(self) -> dict:
+        return {"context_ids": self.context_ids}
+
+    def set_extra_state(self, state: dict) -> None:
+        self.context_ids = state["context_ids"]
 
 
 def test_restoring_the_best_epoch_keeps_non_tensor_fitted_state(cohort):
     train, _ = split(dataset(cohort, required=["clinical"]), n_train=36)
     model = IntermediateFusion(
-        encoding={"clinical": [ContextStage(), nn.Linear(3, 4)], "wsi": [ABMIL(16, 4, 4, 0.0)]},
+        encoders={"clinical": [ContextIds(), nn.Linear(3, 4)], "wsi": [ABMIL(16, 4, 4, 0.0)]},
         fusion=MaskedMean(),
         head=CoxHead(in_dim=4, ties="efron"),
     )
@@ -431,4 +497,4 @@ def test_restoring_the_best_epoch_keeps_non_tensor_fitted_state(cohort):
         validation=StratifiedShuffleSplit(n_splits=1, test_size=0.3, random_state=0),
         early_stopping=EarlyStopping(metric="loss", patience=2, restore_best=True),
     ).fit(train)
-    assert pipe.model_.encoding["clinical"][0].context_ids == pipe.train_ids_
+    assert pipe.model_.encoders["clinical"][0].context_ids == pipe.train_ids_

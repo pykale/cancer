@@ -98,7 +98,7 @@ def _masked_mean(stacked: Tensor, mask: Tensor) -> Tensor:
 class FusionMethod(nn.Module, ABC):
     """Combines named ``(n, d)`` inputs, which a patient may lack, into one ``(n, d')`` tensor.
 
-    Subclasses set ``stages`` and implement ``defined``, ``output_dim`` and ``forward``. To add rules, override
+    Subclasses set ``stages`` and implement ``defined`` and ``forward``. To add rules, override
     ``check`` and call ``super().check(context)`` first.
 
     In late fusion, ``input_space`` is what the method receives from each branch. With ``"output"`` it receives the raw
@@ -123,10 +123,6 @@ class FusionMethod(nn.Module, ABC):
     def defined_rows(self, present: pd.DataFrame) -> pd.Series:
         """``defined`` for a presence table with one row per patient, as a bool Series indexed like it."""
         return pd.Series(self.defined(torch.tensor(present.to_numpy(dtype=bool))).numpy(), index=present.index)
-
-    @abstractmethod
-    def output_dim(self, widths: Mapping[str, int]) -> int:
-        """Width of the combined tensor, given the width of each input."""
 
     def check(self, context: FusionContext) -> None:
         """Raise if this method cannot be fitted in ``context``.
@@ -178,10 +174,6 @@ class Concat(FusionMethod):
         """The patients who have every input."""
         return present.all(dim=1)
 
-    def output_dim(self, widths: Mapping[str, int]) -> int:
-        """The sum of the input widths."""
-        return sum(widths.values())
-
     def forward(self, values: Mapping[str, Tensor], present: Mapping[str, Tensor]) -> Tensor:
         """Concatenate the inputs along the feature dimension, in input order."""
         return torch.cat([values[name] for name in values], dim=-1)
@@ -198,11 +190,6 @@ class MaskedMean(FusionMethod):
     def defined(self, present: Tensor) -> Tensor:
         """The patients who have at least one input."""
         return present.any(dim=1)
-
-    def output_dim(self, widths: Mapping[str, int]) -> int:
-        """The width the inputs share."""
-        _check_one_width(self, widths)
-        return next(iter(widths.values()))
 
     def check(self, context: FusionContext) -> None:
         """Also needs inputs of one width and, in late fusion, heads of one kind; Cox heads need every branch
@@ -249,11 +236,6 @@ class MajorityVote(FusionMethod):
     def defined(self, present: Tensor) -> Tensor:
         """The patients who have at least one input."""
         return present.any(dim=1)
-
-    def output_dim(self, widths: Mapping[str, int]) -> int:
-        """The width the inputs share."""
-        _check_one_width(self, widths)
-        return next(iter(widths.values()))
 
     def check(self, context: FusionContext) -> None:
         """Also needs classification heads with one output width."""

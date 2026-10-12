@@ -4,14 +4,13 @@ init_args:
   model:
     class_path: kalecancer.model.IntermediateFusion
     init_args:
-      encoding:
+      encoders:
         clinical:
           - class_path: kalecancer.model.TabICLEncoder
             init_args:
               checkpoint: tabicl-classifier-v2-20260212.ckpt
               output: row
               trainable: []
-              context_label: event
               context_folds: 5
               random_state: 0
           - {class_path: torch.nn.Linear, init_args: {in_features: 512, out_features: 64}}

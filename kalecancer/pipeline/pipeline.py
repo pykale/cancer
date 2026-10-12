@@ -1,5 +1,5 @@
 """Pipeline: fit transforms and fold-local state on training patients, train one model end to end with Lightning,
-then predict, evaluate, encode, and run a modality's stages for interpretation tools."""
+then predict, evaluate, encode, and run a modality's encoders for interpretation tools."""
 
 from __future__ import annotations
 
@@ -21,13 +21,13 @@ from torch.utils.data import DataLoader
 from kalecancer.evaluate.metrics import EvalContext, Metric
 from kalecancer.loaddata.dataset import MultimodalDataset
 from kalecancer.loaddata.targets import Classification
-from kalecancer.model.models import EarlyFusion, IntermediateFusion, LateFusion, StageList, Unimodal
+from kalecancer.model.encode.encoder_list import EncoderList
+from kalecancer.model.models import EarlyFusion, IntermediateFusion, LateFusion, Unimodal
 from kalecancer.pipeline.training import (
     _concatenate,
     _EarlyStoppingWithRestore,
     _InferenceModule,
     _lightning_session,
-    _run_stages,
     _to_cpu,
     _TrainingModule,
 )
@@ -60,6 +60,28 @@ _MODELS = (Unimodal, IntermediateFusion, EarlyFusion, LateFusion)
 
 
 _TRAINED = "_kalecancer_trained"
+
+
+class NonFiniteInputWarning(UserWarning):
+    """Some patients' inputs had NaN or infinite values, and the encoders turned them into finite embeddings.
+
+    This is expected when an encoder handles missing values itself; silence it with
+    ``warnings.filterwarnings("ignore", category=NonFiniteInputWarning)``. Otherwise an encoder swallowed the values,
+    and they should be imputed in the modality's transform.
+    """
+
+
+def _warn_non_finite(found: Mapping[str, set[str]], data: MultimodalDataset, stacklevel: int) -> None:
+    """Warn once for each modality whose input had NaN or infinite values for some of ``data``'s patients."""
+    for name, ids in found.items():
+        bad = sorted(ids)
+        warnings.warn(
+            f"{len(bad)} of {len(data.present_ids(name))} patients have NaN or infinite values in {name!r} "
+            f"(e.g. {bad[:5]}); the encoders turned them into finite embeddings. If they are not meant to handle "
+            "missing values, impute them in the modality's transform",
+            NonFiniteInputWarning,
+            stacklevel=stacklevel + 1,
+        )
 
 
 class EarlyStopping:
@@ -108,10 +130,11 @@ class Pipeline(BaseEstimator):
         early_stopping: Stop on a validation score; needs ``validation``.
         accelerator: Lightning accelerator (``"cpu"``, ``"gpu"``, ``"auto"``).
         precision: ``"32-true"``, ``"16-mixed"`` or ``"bf16-mixed"``.
-        random_state: Seeds shuffling and re-initialises every parameter not marked ``keep_weights``. ``None``
-            keeps the weights the model was built with and does not seed.
+        random_state: Seeds what ``fit`` does: the validation split, shuffling, dropout and sampling during training,
+            and the parameters of lazy modules when the dry run creates them. ``fit`` always starts from the weights
+            the model was built with, so to vary them, seed before building the model. ``None`` does not seed.
         param_groups: Optimizer options for parameters under a name prefix,
-            e.g. ``{"encoding.clinical": {"lr": 1e-5}}``.
+            e.g. ``{"encoders.clinical": {"lr": 1e-5}}``.
         num_workers: DataLoader workers.
         trainer_kwargs: Further ``lightning.pytorch.Trainer`` arguments (not the ones this class manages).
     """
@@ -161,11 +184,11 @@ class Pipeline(BaseEstimator):
             transforms = self._fit_transforms(data, train_ids)
             view = data.with_transforms(transforms)
             model = copy.deepcopy(self.model)
-            if self.random_state is not None:
-                _reinitialise(model)
-            model.fit(view.subset(train_ids))
+            train_view = view.subset(train_ids)
+            model.fit(train_view)
+            _dry_run(model, train_view)
 
-            loader = self._loader(view.subset(train_ids), shuffle=True)
+            loader = self._loader(train_view, shuffle=True)
             if len(loader) == 0:
                 raise ValueError(
                     f"{len(train_ids)} training patients make no batch of batch_size={self.batch_size} "
@@ -217,6 +240,7 @@ class Pipeline(BaseEstimator):
             "best_score": stopper.best_value if stopper else None,
             "optimizer_steps": module.optimizer_steps,
             "skipped_batches": skipped,
+            "non_finite_inputs": {name: len(ids) for name, ids in module.non_finite.items()},
         }
         if skipped:
             warnings.warn(
@@ -225,6 +249,7 @@ class Pipeline(BaseEstimator):
                 UserWarning,
                 stacklevel=2,
             )
+        _warn_non_finite(module.non_finite, data, stacklevel=2)
         return self
 
     def _check_arguments(self, data: MultimodalDataset) -> None:
@@ -337,6 +362,8 @@ class Pipeline(BaseEstimator):
         with _lightning_session(), tempfile.TemporaryDirectory() as root:
             results = self._trainer([], root, max_epochs=1).predict(module, self._loader(data, shuffle=False))
         self.model_.eval().cpu()
+        # _infer serves predict and run_encoders, so encode and attention export warn too
+        _warn_non_finite(module.non_finite, data, stacklevel=3)
         return results
 
     def predict(self, data: MultimodalDataset, branch: str | None = None) -> pd.DataFrame:
@@ -394,35 +421,37 @@ class Pipeline(BaseEstimator):
         if modality not in data.modalities:
             raise ValueError(f"the dataset has no modality {modality!r}")
         view = self.transformed(data)
-        stages = self.model_.stages_for(modality, branch) if branch is not None else self.model_.stages_for(modality)
+        encoders = (
+            self.model_.encoders_for(modality, branch) if branch is not None else self.model_.encoders_for(modality)
+        )
         present = view.present_ids(modality)
         if not present:
             raise ValueError(f"no patient in this dataset has {modality!r}")
         single = MultimodalDataset({modality: view.modalities[modality]}, target=None, required_modalities=[modality])
-        return single.subset(present), stages
+        return single.subset(present), encoders
 
-    def run_modality(
+    def run_encoders(
         self,
         data: MultimodalDataset,
         modality: str,
-        fn: Callable[[StageList, Any, list[str]], Any],
+        fn: Callable[[EncoderList, Any, list[str]], Any],
         branch: str | None = None,
     ) -> list[tuple[list[str], Any]]:
-        """Call ``fn(stages, inputs, ids)`` on each batch of the patients in ``data`` who have ``modality``, with the
-        fitted transforms applied and the model in eval mode, and return ``(ids, result)`` per batch. ``stages`` is
-        the fitted stage list for ``modality``. Interpretation tools in ``kalecancer.interpret`` build on this."""
-        single, stages = self._single_modality(data, modality, branch)
+        """Call ``fn(encoders, inputs, ids)`` on each batch of the patients in ``data`` who have ``modality``, with
+        the fitted transforms applied and the model in eval mode, and return ``(ids, result)`` per batch.
+        ``encoders`` is the fitted encoder list for ``modality``. Interpretation tools in ``kalecancer.interpret``
+        build on this."""
+        single, encoders = self._single_modality(data, modality, branch)
 
         def step(model: nn.Module, batch: dict) -> tuple[list[str], Any]:
-            return batch["ids"], fn(stages, batch["inputs"][modality], batch["ids"])
+            return batch["ids"], fn(encoders, batch["inputs"][modality], batch["ids"])
 
         return self._infer(single, step)
 
     def encode(self, data: MultimodalDataset, modality: str, branch: str | None = None) -> pd.DataFrame:
-        """The output of ``modality``'s stage list (the fusion input), indexed by patient id."""
-        results = self.run_modality(
-            data, modality, lambda stages, x, ids: _run_stages(stages, x, ids, modality), branch
-        )
+        """The embeddings of ``modality``: the output of its encoder list, indexed by patient id."""
+        # forward checks the embedding, so encode needs no check of its own
+        results = self.run_encoders(data, modality, lambda encoders, x, ids: encoders(x, ids).float().cpu(), branch)
         ids = [pid for batch_ids, _ in results for pid in batch_ids]
         values = torch.cat([z for _, z in results]).numpy()
         return pd.DataFrame(
@@ -430,20 +459,26 @@ class Pipeline(BaseEstimator):
         )
 
 
-def _reinitialise(model: nn.Module) -> None:
-    """Re-draw parameters under the current seed, except inside modules marked ``keep_weights``."""
+def _dry_run_ids(train: MultimodalDataset, modalities: list[str]) -> list[str]:
+    """Up to two training patients who have all of ``modalities``, and up to two who have each one, in id order."""
+    present = train.present[modalities]
+    chosen: list[str] = []
+    for mask in [present.all(axis=1), *(present[name] for name in modalities)]:
+        have = sum(bool(mask[pid]) for pid in chosen)
+        chosen += [pid for pid in sorted(mask.index[mask]) if pid not in chosen][: max(0, 2 - have)]
+    return sorted(chosen)
 
-    def visit(module: nn.Module, path: str) -> None:
-        if getattr(module, "keep_weights", False):
-            return
-        if any(True for _ in module.parameters(recurse=False)):
-            if not callable(getattr(module, "reset_parameters", None)):
-                raise TypeError(
-                    f"{path or 'model'} ({type(module).__name__}) has parameters but no reset_parameters(), so "
-                    "random_state cannot initialise it; add reset_parameters or set keep_weights = True"
-                )
-            module.reset_parameters()
-        for name, child in module.named_children():
-            visit(child, f"{path}.{name}" if path else name)
 
-    visit(model, "")
+def _dry_run(model: nn.Module, train: MultimodalDataset) -> None:
+    """Run ``model`` once on a few training patients before training, in eval mode and without gradients, so an
+    encoder that cannot take its input fails before the first optimizer step and the fusion method is checked against
+    the real widths. Validation patients are never used."""
+    sample = train.subset(_dry_run_ids(train, model.modalities))
+    batch = sample.collate([sample[k] for k in range(len(sample))])
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            model.dry_run(train, batch)
+    finally:
+        model.train(was_training)

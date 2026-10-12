@@ -86,13 +86,12 @@ def clinical_transform() -> ColumnTransformer:
 
 def build_pipeline() -> Pipeline:
     model = IntermediateFusion(
-        encoding={
+        encoders={
             "clinical": [
                 TabICLEncoder(
                     checkpoint="tabicl-classifier-v2-20260212.ckpt",
                     output="row",
                     trainable=[],
-                    context_label="event",
                     context_folds=5,
                     random_state=0,
                 ),

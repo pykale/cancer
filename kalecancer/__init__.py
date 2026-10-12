@@ -1,6 +1,6 @@
 """kalecancer: multimodal deep learning for cancer research.
 
-Import from the stage subpackages:
+Import from the subpackages:
 
 - ``kalecancer.loaddata``
 - ``kalecancer.prepdata``

@@ -27,7 +27,7 @@ def dataset(cohort, task="survival"):
 
 def small_pipeline(task="survival"):
     model = IntermediateFusion(
-        encoding={
+        encoders={
             "clinical": [nn.Linear(1, 2)],
             "wsi": [ABMIL(in_dim=16, hidden_dim=2, attention_dim=2, dropout=0.0)],
         },

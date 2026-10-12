@@ -81,12 +81,11 @@ def build_model() -> LateFusion:
         branches={
             "clinical": Unimodal(
                 modality="clinical",
-                encoding=[
+                encoders=[
                     TabICLEncoder(
                         checkpoint="tabicl-classifier-v2-20260212.ckpt",
                         output="row",
                         trainable=[],
-                        context_label="label",
                         context_folds=5,
                         random_state=0,
                     ),
@@ -96,7 +95,7 @@ def build_model() -> LateFusion:
             ),
             "wsi": Unimodal(
                 modality="wsi",
-                encoding=[
+                encoders=[
                     ABMIL(in_dim=1024, hidden_dim=256, attention_dim=128, dropout=0.25),
                     torch.nn.Linear(256, 64),
                 ],
