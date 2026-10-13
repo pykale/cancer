@@ -102,6 +102,29 @@ def test_evaluate_records_why_censoring_weighted_metrics_were_unavailable() -> N
     assert "censoring_weighted_metrics_error" in metrics
 
 
+def test_evaluate_skips_risk_groups_by_default() -> None:
+    """Matches prior behaviour for existing callers: stratification is opt-in."""
+    metrics = evaluate_predictions(make_predictions())
+
+    assert "risk_groups" not in metrics
+
+
+def test_evaluate_adds_risk_groups_when_requested() -> None:
+    metrics = evaluate_predictions(make_predictions(n=40, seed=3), n_risk_groups=2)
+
+    assert set(metrics["risk_groups"]) == {"group", "km_curves", "log_rank_p_value"}
+    assert set(metrics["risk_groups"]["km_curves"]) == {0, 1}
+
+
+def test_evaluate_returns_survival_probs_and_calibration_alongside_brier() -> None:
+    metrics = evaluate_predictions(
+        make_predictions(n=120, seed=1), make_predictions("train", n=200, seed=2), [365.0, 1095.0]
+    )
+
+    assert metrics["survival_probs"].shape == (120, len(metrics["survival_probs_times"]))
+    assert "calibration_slope" in metrics
+
+
 def test_summarise_folds_reports_mean_and_spread() -> None:
     folds = [
         {"test": {"c_index": 0.6, "num_patients": 100.0}},

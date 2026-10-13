@@ -18,8 +18,10 @@ from torch.utils.data import DataLoader
 
 from kalecancer.evaluate.survival_metrics import (
     breslow_baseline_hazard,
+    calibration_slope,
     concordance_index,
     integrated_brier,
+    kaplan_meier_groups,
     predict_survival_function,
     time_dependent_auc,
     usable_eval_times,
@@ -88,6 +90,8 @@ def evaluate_predictions(
     predictions: SplitPredictions,
     train_predictions: SplitPredictions | None = None,
     eval_times: list[float] | None = None,
+    *,
+    n_risk_groups: int | None = None,
 ) -> dict:
     """Compute survival metrics for a split.
 
@@ -99,9 +103,19 @@ def evaluate_predictions(
         predictions: Predictions for the split being scored.
         train_predictions: Predictions on the training split.
         eval_times: Horizons for the time-dependent metrics, in the unit of ``duration``.
+        n_risk_groups: If given, stratify ``predictions`` into this many risk-quantile
+            groups via :func:`~kalecancer.evaluate.survival_metrics.kaplan_meier_groups`
+            and report the KM group output. ``None`` (the default) skips this, matching
+            prior behaviour for existing callers.
 
     Returns:
         Metric names mapped to values; time-dependent entries are keyed by horizon.
+        When ``train_predictions`` and ``eval_times`` are both given, also includes
+        ``"survival_probs"`` (predicted survival probabilities, shape
+        ``(N, len(horizons))``) and ``"survival_probs_times"`` (the horizons they were
+        evaluated at) -- the per-patient curves computed for the Brier score, kept
+        rather than discarded. When ``n_risk_groups`` is given, also includes
+        ``"risk_groups"`` (the :func:`kaplan_meier_groups` output).
     """
     risk = predictions.risk.numpy().astype(float)
     times = predictions.duration.numpy().astype(float)
@@ -115,6 +129,13 @@ def evaluate_predictions(
         # orderable pair. Reporting why beats aborting a finished training run.
         logger.warning("concordance index unavailable: %s", error)
         metrics["c_index_error"] = str(error)
+
+    if n_risk_groups is not None:
+        try:
+            metrics["risk_groups"] = kaplan_meier_groups(risk, times, events, n_groups=n_risk_groups)
+        except ValueError as error:
+            logger.warning("risk-group stratification unavailable: %s", error)
+            metrics["risk_groups_error"] = str(error)
 
     if train_predictions is None or not eval_times:
         return metrics
@@ -148,6 +169,9 @@ def evaluate_predictions(
         metrics["integrated_brier_score"] = float(
             integrated_brier(train_times, train_events, times, events, survival_probs, horizons)
         )
+        metrics["survival_probs"] = survival_probs
+        metrics["survival_probs_times"] = horizons
+        metrics["calibration_slope"] = calibration_slope(times, events, survival_probs, horizons)
     except ValueError as error:
         logger.warning("censoring-weighted metrics unavailable: %s", error)
         metrics["censoring_weighted_metrics_error"] = str(error)

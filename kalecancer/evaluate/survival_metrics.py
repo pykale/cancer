@@ -1,4 +1,4 @@
-"""Time-dependent AUC, integrated Brier score, and KM stratification.
+"""Time-dependent AUC, integrated Brier score, KM stratification, and calibration.
 
 These metrics live in ``kalecancer/evaluate/`` rather than
 ``kalecancer/survival/`` on purpose: unlike Harrell's C-index, they need
@@ -425,3 +425,100 @@ def predict_survival_function(
 
     hazard_ratio = np.exp(log_hazard)
     return np.exp(-np.outer(hazard_ratio, baseline_at_eval))
+
+
+# --------------------------------------------------------------------------- #
+# Calibration
+# --------------------------------------------------------------------------- #
+
+
+def _km_survival_at(times: np.ndarray, events: np.ndarray, horizon: float) -> float:
+    """Kaplan-Meier survival estimate at one horizon, for one bin of subjects.
+
+    A bin with no observed event has nothing to estimate a drop from, so survival
+    stays at 1.0 throughout -- not undefined.
+    """
+    if not np.any(events):
+        return 1.0
+    km_time, km_survival = kaplan_meier_estimator(events, times)
+    idx = np.searchsorted(km_time, horizon, side="right") - 1
+    if idx < 0:
+        return 1.0
+    return float(km_survival[idx])
+
+
+def calibration_slope(
+    times: np.ndarray,
+    events: np.ndarray,
+    survival_probs: np.ndarray,
+    eval_times: np.ndarray,
+    n_bins: int = 5,
+) -> dict[str, float]:
+    """Binned observed-vs-expected calibration slope, at each evaluation horizon.
+
+    At each horizon, subjects are grouped into ``n_bins`` equal-sized bins by their
+    predicted survival probability. Within a bin, "expected" is the mean predicted
+    probability and "observed" is the Kaplan-Meier survival estimate for that bin's
+    subjects at the same horizon; the slope is the least-squares fit of observed on
+    expected across bins. A slope of 1.0 is perfect calibration; below 1.0 means
+    predictions are too extreme (overconfident), above 1.0 means too conservative.
+
+    Args:
+        times: Observed (event or censoring) time, shape ``(N,)``.
+        events: Event indicators, shape ``(N,)``.
+        survival_probs: Predicted survival probabilities, shape ``(N, T)`` -- the
+            matrix returned by :func:`predict_survival_function`.
+        eval_times: Horizons the survival probabilities were evaluated at, shape
+            ``(T,)``.
+        n_bins: Number of equal-sized bins to group subjects into at each horizon.
+
+    Returns:
+        Dict mapping each horizon (formatted ``f"{time:.0f}"``) to its calibration
+        slope. A horizon whose predicted probabilities are too concentrated to fill
+        ``n_bins`` non-empty, non-degenerate bins is omitted rather than reported
+        from a meaningless fit.
+
+    Raises:
+        ValueError: If ``survival_probs``'s shape is inconsistent with ``times`` or
+            ``eval_times``.
+    """
+    times = np.asarray(times, dtype=np.float64)
+    events = np.asarray(events, dtype=bool)
+    survival_probs = np.asarray(survival_probs, dtype=np.float64)
+    eval_times = np.asarray(eval_times, dtype=np.float64)
+
+    if survival_probs.ndim != 2:
+        raise ValueError(f"survival_probs must have shape (N, T), got {survival_probs.shape}")
+    if survival_probs.shape[0] != times.shape[0]:
+        raise ValueError(
+            f"survival_probs and times must share the first dimension, got "
+            f"{survival_probs.shape[0]} and {times.shape[0]}"
+        )
+    if survival_probs.shape[1] != eval_times.shape[0]:
+        raise ValueError(
+            f"survival_probs' second dimension must match eval_times, got "
+            f"{survival_probs.shape[1]} and {eval_times.shape[0]}"
+        )
+
+    slopes: dict[str, float] = {}
+    for col, horizon in enumerate(eval_times):
+        predicted = survival_probs[:, col]
+        bin_edges = np.quantile(predicted, np.linspace(0.0, 1.0, n_bins + 1))
+        bin_id = np.clip(np.digitize(predicted, bin_edges[1:-1], right=True), 0, n_bins - 1)
+
+        # Near-constant predicted probabilities, or a cohort smaller than n_bins, leave
+        # a bin empty or every bin's mean identical; either way the slope is undefined,
+        # so the horizon is skipped rather than fit from degenerate bins.
+        occupied = np.bincount(bin_id, minlength=n_bins)
+        if np.any(occupied == 0):
+            continue
+
+        expected = np.array([predicted[bin_id == b].mean() for b in range(n_bins)])
+        if np.ptp(expected) == 0:
+            continue
+        observed = np.array([_km_survival_at(times[bin_id == b], events[bin_id == b], horizon) for b in range(n_bins)])
+
+        slope = float(np.polyfit(expected, observed, deg=1)[0])
+        slopes[f"{horizon:.0f}"] = slope
+
+    return slopes

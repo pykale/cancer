@@ -8,6 +8,7 @@ import pytest
 from examples.synthetic_data import make_synthetic_survival
 from kalecancer.evaluate.survival_metrics import (
     breslow_baseline_hazard,
+    calibration_slope,
     integrated_brier,
     kaplan_meier_groups,
     predict_survival_function,
@@ -121,3 +122,41 @@ def test_risk_groups_that_cannot_be_filled_are_reported() -> None:
 def test_a_single_risk_group_is_refused() -> None:
     with pytest.raises(ValueError, match="at least 2"):
         kaplan_meier_groups(np.arange(20.0), np.linspace(10.0, 200.0, 20), np.ones(20, dtype=bool), n_groups=1)
+
+
+def test_calibration_slope_true_risk_is_well_calibrated() -> None:
+    (
+        _,
+        train_times,
+        train_events,
+        test_times,
+        test_events,
+        true_risk_train,
+        true_risk_test,
+    ) = _train_test_split()
+    eval_times = _eval_times_within_follow_up(test_times, test_events)
+
+    event_times, cumulative_baseline_hazard = breslow_baseline_hazard(true_risk_train, train_times, train_events)
+    survival_probs = predict_survival_function(true_risk_test, event_times, cumulative_baseline_hazard, eval_times)
+
+    slopes = calibration_slope(test_times, test_events, survival_probs, eval_times, n_bins=5)
+
+    assert slopes
+    assert all(0.5 < slope < 1.5 for slope in slopes.values())
+
+
+def test_calibration_slope_skips_horizons_with_degenerate_bins() -> None:
+    n = 20
+    times = np.linspace(10.0, 200.0, n)
+    events = np.ones(n, dtype=bool)
+    eval_times = np.array([50.0])
+    constant_survival_probs = np.full((n, 1), 0.5)
+
+    slopes = calibration_slope(times, events, constant_survival_probs, eval_times, n_bins=5)
+
+    assert slopes == {}
+
+
+def test_calibration_slope_rejects_mismatched_shapes() -> None:
+    with pytest.raises(ValueError, match="share the first dimension"):
+        calibration_slope(np.zeros(5), np.ones(5, dtype=bool), np.zeros((4, 2)), np.array([1.0, 2.0]))
