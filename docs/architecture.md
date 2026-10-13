@@ -71,7 +71,7 @@ Users import from `kalecancer.<subpackage>`.
 
 ### Patients are the identifier
 
-`MultimodalDataset` joins modalities and a target by **patient id**. Ids are strings, unique within each source, and checked across sources for ids that differ only by leading zeros. Splitting is always by patient, never by slide or patch: `subset` and `train_test_split` take patient ids.
+`MultimodalDataset` joins modalities and a target by **patient id**. Ids are strings, unique within each source, and checked across sources for ids that differ only by leading zeros. Splitting is always by patient, never by slide or patch: `subset` and `train_test_split` take patient ids. Read ids from JSON with `dtype={"patient_id": str}`, or `"001"` becomes `1`.
 
 ### Modalities
 
@@ -86,7 +86,7 @@ how a batch is formed:
 
 A new modality picks its kind and implements `_load(id)`. A bag also implements `instances(id)`, one row describing
 each instance, which attention export joins to the attention weights. A kind that is neither would subclass `Modality`
-directly and implement `collate` too.
+directly and implement `collate` too. To add one, see [extending/modalities.md](extending/modalities.md).
 
 | Modality | Kind | Value per patient |
 | --- | --- | --- |
@@ -114,6 +114,8 @@ encoders for it. Neither exists yet.
 | --- | --- | --- |
 | `TimeToEvent(time, event)` | `time` finite and > 0; `event` is a `bool`, `True` observed, `False` censored | `CoxHead` |
 | `Classification(labels, classes)` | labels drawn from an explicit, ordered class list | `ClassificationHead` |
+
+To add an endpoint, see [extending/endpoints.md](extending/endpoints.md).
 
 A missing `event` raises an error: an unknown outcome is not a censored one. Each target reports strata (events or
 labels), which drive stratified splitting.
@@ -157,6 +159,8 @@ held in an `EncoderList`, which runs them in order. Encoders available so far:
 - `TabICLEncoder`: a pretrained TabICL row encoder (optional `tabular` extra), pinned to an exact version because it
   relies on private internals;
 - any `nn.Module`, such as `torch.nn.Linear`.
+
+To add one, see [extending/encoders.md](extending/encoders.md).
 
 An encoder checks its own input; nothing reads declared widths. Instead, `fit` runs the model once on up to two
 training patients per modality before training starts (the dry run), so a wrong width or input fails before the first
@@ -246,7 +250,10 @@ state. Training runs on Lightning.
 5. runs the dry run on a few training patients;
 6. trains with Lightning, optionally early-stopping on a validation metric and restoring the best weights.
 
-It produces `model_`, `transforms_`, `train_ids_`, `val_ids_`, `target_`, `train_target_`, `history_` and
+`random_state` seeds steps 2 to 6, but not the initial weights, which were drawn when the model was built. To vary
+them, call `torch.manual_seed` before building the model. `load_pipeline` does this with the config's `random_state`.
+
+`fit` produces `model_`, `transforms_`, `train_ids_`, `val_ids_`, `target_`, `train_target_`, `history_` and
 `fit_report_`. The remaining methods are `predict` (a frame indexed by patient id, with a `branch` option for late
 fusion), `evaluate`, `encode`, which returns a modality's embeddings, and `run_encoders`, which runs one modality's
 fitted encoders over a dataset with a callback and is what interpretation tools build on.

@@ -86,16 +86,4 @@ embeddings.
 
 ## Extending
 
-A new fusion method subclasses `FusionMethod`, declares the `stages` it supports (`"early"`, `"intermediate"`,
-`"late"`) and implements:
-
-- `defined(present)`: which patients it can combine, from an `(n_patients, n_inputs)` presence matrix;
-- `forward(values, present)`: the combination, called only on the rows `defined` accepts.
-
-To add rules, it overrides `check(context)` and calls `super().check(context)` first. The `FusionContext` holds the
-stage, which patients have which inputs and which must be combined, the input widths and, in late fusion, the target
-type each branch head predicts. The model builds it, so a fusion method never sees the dataset, and no model needs
-changing for a new method.
-
-In late fusion the inputs are the branches. `input_space` chooses whether the method receives the branch head outputs
-(`"output"`, the default) or their predictions (`"prediction"`, in which case it also implements `columns`).
+To add a fusion method, see [extending/fusion.md](extending/fusion.md).
