@@ -87,5 +87,5 @@ head takes: `Concat` sums the input widths, while `Max` and `MaskedMean` keep th
 - [ ] The method is exported from `kalecancer/model/__init__.py`.
 - [ ] Tests in `tests/test_model_fusion.py` cover `defined`, the result on rows with missing inputs (finite values
   and gradients), and each rule in `check`.
-- [ ] The fusion method table in `docs/multimodal_fusion.md` lists it.
+- [ ] The fusion method table in `docs/architecture.md` lists it.
 - [ ] The [Conventions](../../CONTRIBUTING.md#conventions) are followed.

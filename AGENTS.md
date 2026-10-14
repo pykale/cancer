@@ -35,8 +35,7 @@ modalities is a different dictionary, never a new class.
 
 These documents hold the rules the code relies on. Read the relevant one before you start, not after a test fails:
 
-- **Any change to `kalecancer/`:** read the Conventions in [CONTRIBUTING.md](CONTRIBUTING.md). Above all, nothing in
-  `kalecancer/` may name a dataset, a column, a file pattern or a published split.
+- **Any change to `kalecancer/`:** read the Conventions in [CONTRIBUTING.md](CONTRIBUTING.md).
 - **Adding or changing a modality, encoder, fusion method, target or head:** also read the guide for that component
   in [docs/extending/](docs/extending/), listed in CONTRIBUTING.md. The guides hold the contracts that `fit` and the
   dry run enforce.

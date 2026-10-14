@@ -1,12 +1,5 @@
 # kalecancer architecture
 
-## Scope
-
-The library supplies mechanisms only. Nothing in `kalecancer/` names a dataset, an endpoint column, a file pattern or
-a published split.
-
----
-
 ## Design in one paragraph
 
 There is **one estimator**, `Pipeline`. It takes a model, transforms for each modality and training settings, and it
@@ -62,8 +55,6 @@ flowchart LR
 | `pipeline` | `Pipeline`, `EarlyStopping`, Lightning training, `load_pipeline` and `dump_config` |
 | `evaluate` | `HarrellC`, `UnoC`, `TimeDependentAUC`, `AUROC`, `BalancedAccuracy`, `cross_validate` |
 | `interpret` | `attention` |
-
-Users import from `kalecancer.<subpackage>`.
 
 ---
 
@@ -148,6 +139,41 @@ A model is built from a list of encoders per modality, a fusion method, and a he
 Inputs from different modalities are incommensurable in shape, so raw inputs are never fused except when they are
 already vectors (early fusion). Intermediate fusion first encodes each modality to a vector.
 
+Choosing a fusion strategy changes the model, not the encoders, heads or `Pipeline`:
+
+```python
+from torch import nn
+
+from kalecancer.model import (
+    ABMIL, MLP, ClassificationHead, Concat, CoxHead, IntermediateFusion, LateFusion, MaskedMean, Unimodal,
+)
+from kalecancer.pipeline import Pipeline
+
+# Intermediate: encode each modality, concatenate, one Cox head.
+intermediate = IntermediateFusion(
+    encoders={
+        "clinical": [MLP(in_dim=12, hidden_dims=[64], out_dim=64, dropout=0.1)],
+        "wsi": [ABMIL(in_dim=1024, hidden_dim=256, attention_dim=128, dropout=0.25), nn.Linear(256, 64)],
+    },
+    fusion=Concat(),
+    head=CoxHead(in_dim=128, ties="efron"),
+)
+
+# Late: a classifier per modality, logits averaged.
+late = LateFusion(
+    branches={
+        "clinical": Unimodal("clinical", [MLP(12, [64], 64, 0.1)], ClassificationHead(64, n_classes=2)),
+        "wsi": Unimodal("wsi", [ABMIL(1024, 256, 128, 0.25), nn.Linear(256, 64)], ClassificationHead(64, n_classes=2)),
+    },
+    fusion=MaskedMean(),
+)
+
+pipeline = Pipeline(model=intermediate, ...)
+```
+
+Runnable versions are in [examples/hancock/](../examples/hancock/): `survival_intermediate.py` (intermediate, Cox),
+`classification_late.py` (late, classification) and `configs/intermediate_cox.yaml` (the same model as YAML).
+
 ### Encoders
 
 An encoder is any `nn.Module` whose `forward(x)` takes the modality's batch (an `(n, ...)` tensor for a fixed-shape
@@ -156,8 +182,7 @@ held in an `EncoderList`, which runs them in order. Encoders available so far:
 
 - `MLP`: linear, ReLU and dropout blocks;
 - `ABMIL`: gated attention-based multiple-instance pooling over a bag of patch features, which reports its attention;
-- `TabICLEncoder`: a pretrained TabICL row encoder (optional `tabular` extra), pinned to an exact version because it
-  relies on private internals;
+- `TabICLEncoder`: a pretrained TabICL row encoder (optional `tabular` extra);
 - any `nn.Module`, such as `torch.nn.Linear`.
 
 To add one, see [extending/encoders.md](extending/encoders.md).
@@ -250,9 +275,6 @@ state. Training runs on Lightning.
 5. runs the dry run on a few training patients;
 6. trains with Lightning, optionally early-stopping on a validation metric and restoring the best weights.
 
-`random_state` seeds steps 2 to 6, but not the initial weights, which were drawn when the model was built. To vary
-them, call `torch.manual_seed` before building the model. `load_pipeline` does this with the config's `random_state`.
-
 `fit` produces `model_`, `transforms_`, `train_ids_`, `val_ids_`, `target_`, `train_target_`, `history_` and
 `fit_report_`. The remaining methods are `predict` (a frame indexed by patient id, with a `branch` option for late
 fusion), `evaluate`, `encode`, which returns a modality's embeddings, and `run_encoders`, which runs one modality's
@@ -271,10 +293,9 @@ The pipeline is built so a leak fails loudly rather than quietly inflating a sco
 
 ### Configuration
 
-Components are configured through constructor arguments, not a global config. A pipeline can be written as YAML in
-jsonargparse's `class_path`/`init_args` format, read with `load_pipeline` and written with `dump_config`. This
-depends on each component storing every `__init__` argument under an attribute of the same name, which is also what
-`sklearn.base.clone` needs. Dumped configs record the `kalecancer` version, and loading warns on a mismatch.
+A pipeline can be written as YAML in jsonargparse's `class_path`/`init_args` format, read with `load_pipeline` and
+written with `dump_config`. This depends on each component storing every `__init__` argument under an attribute of the
+same name, which is also what `sklearn.base.clone` needs. Dumped configs record the `kalecancer` version, and loading warns on a mismatch.
 
 ---
 
@@ -317,5 +338,3 @@ tables, spatial attribution for imaging, and modality-level ablation remain futu
 | Encoders run on present patients, fusion selects rows | Masking or zero-filling spreads NaN through gradients; selecting rows keeps them finite. |
 | Validate each rule as soon as its information exists | Structural rules run at construction; missing-modality patterns and target/head mismatches at the start of `fit`; widths in a dry run before training. All surface before the first optimizer step, not mid-training. |
 | Orchestration lives in `examples/` | Choosing splits, naming an endpoint and writing a report are experiment concerns; the library supplies pieces to compose. |
-| Reuse existing libraries | Lightning for training, scikit-learn for transforms, splitting and classification metrics, TorchSurv for Cox loss and survival metrics, jsonargparse for configs. |
-| scikit-survival is test-only | It is GPL-licensed, so it is a reference implementation in tests and is never imported by the library. |

@@ -7,8 +7,7 @@ uv run python examples/<dir>/<script>.py
 ```
 
 Each example is a standalone script. Start with the synthetic one, then read a HANCOCK script to see the same
-`Pipeline` on real data. For how the pieces fit together, see [architecture.md](architecture.md) and
-[multimodal_fusion.md](multimodal_fusion.md).
+`Pipeline` on real data. For how the pieces fit together, see [architecture.md](architecture.md).
 
 ## Synthetic
 

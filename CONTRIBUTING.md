@@ -5,6 +5,10 @@ Thanks for helping. KaleCancer follows PyKale's
 [Code of Conduct](https://github.com/pykale/pykale/blob/main/.github/CODE_OF_CONDUCT.md). This page covers what is
 specific to this repository.
 
+## Examples
+
+Before contributing it is good to understand the libraries use case. See the [quickstart](docs/quickstart.md) for examples to help familiarize yourself with the library.
+
 ## Set up
 
 Use Python 3.11 or 3.12 with [uv](https://docs.astral.sh/uv/), which installs the exact versions in `uv.lock`:
@@ -81,10 +85,3 @@ made.
   give it a `random_state` argument, as `TabICLEncoder` does.
 - **Style:** Google-style docstrings, type hints, and a line length of 120. ruff-format decides formatting, so don't
   format by hand. Comments explain why, not what.
-
-## Examples
-
-Examples are standalone scripts. Run them from the repository root with `uv run python examples/<dir>/<script>.py`.
-
-- `examples/synthetic/` generates its cohort, runs on a CPU and downloads nothing.
-- `examples/hancock/` reads a local copy of the HANCOCK data from `data/hancock/`. Use one of the published splits `in`, `out` or `Oropharynx`.
