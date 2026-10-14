@@ -339,7 +339,7 @@ def feature_shapley(
     *,
     feature_names: Sequence[str] | None = None,
     metric: MetricFn | None = None,
-    n_samples: int = 200,
+    n_samples: int = 50,
     seed: int = 0,
     device: str | torch.device | None = None,
 ) -> dict[str, float]:
@@ -380,7 +380,11 @@ def feature_shapley(
         n_samples: Number of random orderings to sample. Costs ``n_samples * (d + 1)``
             forward passes over the whole cohort, where ``d`` is the number of
             features (every other modality is still embedded only once; see the
-            module docstring).
+            module docstring). The default, 50, is usually enough to stabilise the
+            *ranking* of features -- which one is largest, which are near zero --
+            even though the *values* themselves keep tightening with more samples.
+            Watch the logged standard error (``INFO``) to judge whether 50 is
+            enough for what you need, or whether to raise this.
         seed: Seeds both the feature ordering and the background resampling;
             deterministic for a fixed seed.
         device: If given, the model is moved there before scoring.
@@ -416,8 +420,15 @@ def feature_shapley(
                 n = tabular_x.shape[0]
                 rng = np.random.default_rng(seed)
 
+                # Logged at roughly every 10% of n_samples: a real run is thousands
+                # of forward passes, and silence until the first feature's summary
+                # line gives no sign anything is happening.
+                log_every = max(1, n_samples // 10)
+
                 contributions: dict[str, list[float]] = {name: [] for name in names}
-                for _ in range(n_samples):
+                for sample in range(n_samples):
+                    if (sample + 1) % log_every == 0 or sample + 1 == n_samples:
+                        logger.info("feature_shapley: %d/%d permutation samples done", sample + 1, n_samples)
                     order = rng.permutation(n_features)
 
                     # This sample's background: every column independently resampled
