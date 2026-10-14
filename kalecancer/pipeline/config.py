@@ -123,8 +123,11 @@ def _check_required_arguments(node: Any, path: str) -> None:
 
 
 def _qualified(target: Any) -> str:
-    """The shortest ``package.subpackage`` path that exports ``target``, the way scikit-learn and torch present their
-    classes (``kalecancer.model.IntermediateFusion``, ``torch.nn.Linear``), so configs survive moves between files."""
+    """The shortest ``package.subpackage`` path that exports ``target``.
+
+    This is how scikit-learn and torch present their classes (``kalecancer.model.IntermediateFusion``,
+    ``torch.nn.Linear``), so configs survive moves between files.
+    """
     parts = target.__module__.split(".")
     if target.__qualname__ == target.__name__:
         for depth in range(2, len(parts)):

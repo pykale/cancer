@@ -38,10 +38,10 @@ def cross_validate(
 ) -> CVResult:
     """Fit a clone of ``estimator`` on each training fold of ``cv`` and score it on the held-out patients.
 
-    ``cv`` is any sklearn splitter; it receives the patient ids and the target's strata (events or labels) as ``y``.
-    Every fold refits everything learned from data: validation carve, transforms, fit hooks and weights.
-    Metrics are reported per fold; they are not pooled over out-of-fold predictions, whose scales differ between
-    folds (Cox log-hazards have an arbitrary offset).
+    ``estimator`` is a ``Pipeline``. ``cv`` is any sklearn splitter; it receives the patient ids and the target's
+    strata (events or labels) as ``y``. Every fold refits everything learned from data: validation carve,
+    transforms, fitted encoders and weights. Metrics are reported per fold; they are not pooled over out-of-fold
+    predictions, whose scales differ between folds (Cox log-hazards have an arbitrary offset).
     """
     if data.target is None:
         raise ValueError("cross_validate needs a dataset with a target")

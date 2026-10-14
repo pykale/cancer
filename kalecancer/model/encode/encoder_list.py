@@ -1,3 +1,5 @@
+"""EncoderList: runs a modality's encoders in order and checks the embedding they output."""
+
 from collections.abc import Iterator, Sequence
 from typing import Any
 
@@ -9,6 +11,16 @@ from kalecancer.model.encode.base_encoders import FittedEncoder
 
 
 class EncoderList(nn.ModuleList):
+    """A modality's encoders, run in order.
+
+    Models build one from each list of encoders they are given. It checks that the last encoder outputs one finite
+    ``(n, d)`` embedding per patient, and adds a note naming the encoder to any error an encoder raises.
+
+    Args:
+        encoders: Any ``nn.Module``s, in order. Only the first may be a ``FittedEncoder``.
+        name: The modality name, or ``"fused"`` in ``EarlyFusion``. Error messages use it, e.g. ``encoders['wsi'][0]``.
+    """
+
     def __init__(self, encoders: Sequence[nn.Module], name: str):
         if not isinstance(encoders, Sequence):
             raise TypeError(
@@ -28,8 +40,10 @@ class EncoderList(nn.ModuleList):
 
     @property
     def needs_fit(self) -> bool:
-        """Whether the first encoder is a ``FittedEncoder``. Models load the training rows for ``fit`` only then,
-        since loading every training bag is costly."""
+        """Whether the first encoder is a ``FittedEncoder``.
+
+        Models load the training rows for ``fit`` only then, since loading every training bag is costly.
+        """
         return bool(self) and isinstance(self[0], FittedEncoder)
 
     def fit(self, x: Any, target: BaseTarget, ids: list[str]) -> None:
@@ -38,7 +52,7 @@ class EncoderList(nn.ModuleList):
         Args:
             x: The loaded, transformed input of the training patients ``ids``, as a batch of them would be.
             target: The training dataset's target.
-            ids: The training patients who have the modality, in the order of ``x``.
+            ids: The training patients in ``x``, in the same order.
         """
         if self.needs_fit:
             self[0].fit(x, target, ids)
@@ -60,8 +74,10 @@ class EncoderList(nn.ModuleList):
             x = out
 
     def forward(self, x: Any, ids: list[str]) -> Tensor:
-        """Run the encoders in order, then check the embedding: a floating-point ``(len(ids), d)`` tensor, finite for
-        every patient."""
+        """Run the encoders in order, then check the embedding.
+
+        The embedding must be a floating-point ``(len(ids), d)`` tensor, finite for every patient.
+        """
         inputs = x
         for _, _, out in self.steps(inputs, ids):
             x = out

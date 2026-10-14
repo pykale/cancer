@@ -17,8 +17,10 @@ if TYPE_CHECKING:
 
 
 def attention(pipeline: Pipeline, data: MultimodalDataset, modality: str, branch: str | None = None) -> pd.DataFrame:
-    """Per-instance attention weights of the modality's ``AttentionEncoder``, joined with the modality's
-    ``instances``. The encoders before it must keep each bag's instances one to one with the loaded rows."""
+    """Per-instance attention weights of the modality's ``AttentionEncoder``, joined with its ``instances``.
+
+    The encoders before it must keep each bag's instances one to one with the loaded rows.
+    """
     if modality not in data.modalities:
         raise ValueError(f"the dataset has no modality {modality!r}")
     source = data.modalities[modality]

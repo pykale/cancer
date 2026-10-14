@@ -39,13 +39,22 @@ class EvalContext:
 
 
 class Metric(ABC):
-    """Scores ``prediction`` against ``target`` row by row, matched by id. ``__init__`` arguments are stored under
-    their own names, which config dumps rely on."""
+    """Scores ``prediction`` against ``target`` row by row, matched by id.
+
+    ``__init__`` arguments are stored under their own names, which config dumps rely on.
+    """
 
     higher_is_better: bool
 
     @abstractmethod
-    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float: ...
+    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
+        """Score ``prediction`` against ``target``, matching rows by patient id.
+
+        Args:
+            prediction: Predictions indexed by patient id, as ``Pipeline.predict`` returns them.
+            target: The target's ``frame`` for the same patients.
+            context: The training target and class order, for metrics that need them.
+        """
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({', '.join(f'{k}={v!r}' for k, v in vars(self).items())})"
@@ -131,19 +140,25 @@ def _ipcw_training(metric: Metric, name: str, value: float, context: EvalContext
 
 
 class HarrellC(Metric):
-    """Harrell's concordance of ``log_hazard``: among comparable pairs (the earlier time is an event), the share in
-    which the earlier patient has the higher log-hazard. Tied log-hazards count one half."""
+    """Harrell's concordance of ``log_hazard``.
+
+    Among comparable pairs (the earlier time is an event), the share in which the earlier patient has the higher
+    log-hazard. Tied log-hazards count one half.
+    """
 
     higher_is_better = True
 
     def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
+        """Harrell's C of the ``log_hazard`` column against the target's ``time`` and ``event``."""
         risk, event, time = _survival_inputs(prediction, target)
         return float(ConcordanceIndex()(risk, event, time))
 
 
 class UnoC(Metric):
-    """Uno's concordance of ``log_hazard`` truncated at ``tau``: Harrell's pairs whose earlier time is before ``tau``,
-    weighted by 1 / G(earlier time)², with G the Kaplan–Meier censoring survival of ``context.train_target``.
+    """Uno's concordance of ``log_hazard``, truncated at ``tau``.
+
+    Harrell's pairs whose earlier time is before ``tau``, weighted by 1 / G(earlier time)², with G the Kaplan–Meier
+    censoring survival of ``context.train_target``.
 
     Raises unless ``tau`` is below the last training time with G(tau) > 0.
     """
@@ -154,6 +169,7 @@ class UnoC(Metric):
         self.tau = tau
 
     def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
+        """Uno's C of the ``log_hazard`` column, truncated at ``tau``."""
         risk, event, time = _survival_inputs(prediction, target)
         train_event, train_time = _ipcw_training(self, "tau", self.tau, context)
         weight = get_ipcw(train_event, train_time, new_time=time)
@@ -163,9 +179,10 @@ class UnoC(Metric):
 
 
 class TimeDependentAUC(Metric):
-    """Cumulative/dynamic AUC of ``log_hazard`` at ``time``: cases had the event by ``time`` and are weighted by
-    1 / G(event time), with G the Kaplan–Meier censoring survival of ``context.train_target``; controls are still
-    event-free after ``time``.
+    """Cumulative/dynamic AUC of ``log_hazard`` at ``time``.
+
+    Cases had the event by ``time`` and are weighted by 1 / G(event time), with G the Kaplan–Meier censoring
+    survival of ``context.train_target``; controls are still event-free after ``time``.
 
     Raises unless ``time`` is below the last training time with G(time) > 0, and within the target's follow-up:
     min target time <= ``time`` < max target time.
@@ -177,6 +194,7 @@ class TimeDependentAUC(Metric):
         self.time = time
 
     def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
+        """The cumulative/dynamic AUC of the ``log_hazard`` column at ``time``."""
         risk, event, time = _survival_inputs(prediction, target)
         train_event, train_time = _ipcw_training(self, "time", self.time, context)
         first, last = float(time.min()), float(time.max())
@@ -218,8 +236,10 @@ def _classification_inputs(
 
 
 class AUROC(Metric):
-    """Area under the ROC curve of ``positive_class`` against all other classes, scored by that class's prediction
-    column (the usual binary AUROC when there are two classes)."""
+    """Area under the ROC curve of ``positive_class`` against all other classes.
+
+    It is scored by that class's prediction column. With two classes this is the usual binary AUROC.
+    """
 
     higher_is_better = True
 
@@ -227,6 +247,7 @@ class AUROC(Metric):
         self.positive_class = positive_class
 
     def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
+        """The AUROC of ``positive_class`` against all other classes."""
         scores, labels = _classification_inputs(prediction, target, context)
 
         # assert is temporary fix to keep mypy quiet
@@ -251,6 +272,7 @@ class BalancedAccuracy(Metric):
     higher_is_better = True
 
     def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
+        """The balanced accuracy of each patient's highest-scoring class."""
         scores, labels = _classification_inputs(prediction, target, context)
         predicted = np.array(context.classes, dtype=object)[scores.argmax(axis=1)]
         return float(balanced_accuracy_score(labels, predicted))

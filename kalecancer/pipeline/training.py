@@ -1,5 +1,8 @@
-"""Lightning machinery behind Pipeline: training and inference modules, early stopping that restores the best
-epoch, and a session that keeps Lightning quiet and undoes its global state."""
+"""Lightning machinery behind Pipeline.
+
+Training and inference modules, early stopping that restores the best epoch, and a session that keeps Lightning
+quiet and undoes its global state.
+"""
 
 from __future__ import annotations
 
@@ -63,8 +66,10 @@ def _concatenate(outputs: list[ModelOutput]) -> ModelOutput:
 
 
 def _record_non_finite(found: dict[str, set[str]], batch: dict) -> None:
-    """Add to ``found`` the patients in ``batch`` whose input to a modality has NaN or infinite values. Inputs that are
-    neither a tensor nor a list of tensors, such as graphs, are not inspected."""
+    """Add to ``found`` the patients in ``batch`` whose input to a modality has NaN or infinite values.
+
+    Inputs that are neither a tensor nor a list of tensors, such as graphs, are not inspected.
+    """
     for name, x in batch["inputs"].items():
         if isinstance(x, Tensor):
             finite = torch.isfinite(x).reshape(len(x), -1).all(dim=1).tolist()
@@ -173,8 +178,11 @@ class _InferenceModule(L.LightningModule):
 
 
 class _EarlyStoppingWithRestore(_LightningEarlyStopping):
-    """Lightning's early stopping, which also snapshots the weights whenever its own rule records an improvement,
-    so stopping and restoring agree on which epoch was best."""
+    """Lightning's early stopping, which also keeps the weights of the best epoch.
+
+    It snapshots the weights whenever its own rule records an improvement, so stopping and restoring agree on which
+    epoch was best.
+    """
 
     def __init__(self, settings: EarlyStopping):
         super().__init__(

@@ -95,6 +95,11 @@ class MultimodalDataset(torch.utils.data.Dataset):
         return new
 
     def summary(self) -> pd.DataFrame:
+        """Patient counts, as a DataFrame with one ``count`` column.
+
+        It lists how many patients each modality and the target have, how many are included (in total and with each
+        modality), how many were excluded for each reason, and the target's counts for the included patients.
+        """
         counts = {f"available: {name}": len(ids) for name, ids in self._modality_ids.items()}
         if self._target_ids is not None:
             counts["available: target"] = len(self._target_ids)
@@ -106,6 +111,7 @@ class MultimodalDataset(torch.utils.data.Dataset):
         return pd.DataFrame({"count": counts})
 
     def present_ids(self, modality: str) -> list[str]:
+        """The included patients who have ``modality``, in id order."""
         return [pid for pid in self.ids if pid in self._modality_ids[modality]]
 
     def with_transforms(self, fitted: Mapping[str, Any]) -> MultimodalDataset:
@@ -126,8 +132,11 @@ class MultimodalDataset(torch.utils.data.Dataset):
         return {"id": pid, "inputs": inputs}
 
     def collate(self, samples: list[dict]) -> dict:
-        """Batch for ``DataLoader(collate_fn=data.collate)``: ids, presence masks, the inputs of present patients in
-        batch order, and the target. A modality that no patient in the batch has gets no entry in ``inputs``."""
+        """Collate samples into a batch, for ``DataLoader(collate_fn=data.collate)``.
+
+        The batch holds the ids, presence masks, the inputs of present patients in batch order, and the target. A
+        modality that no patient in the batch has gets no entry in ``inputs``.
+        """
         ids = [sample["id"] for sample in samples]
         inputs = {}
         for name, source in self.modalities.items():

@@ -21,8 +21,10 @@ from kalecancer.loaddata.identifiers import _as_ids
 
 
 class Modality(ABC):
-    """Per-patient data, keyed by patient id. Subclass ``FixedShapeModality`` or ``BagModality`` and implement
-    ``_load``."""
+    """Per-patient data, keyed by patient id.
+
+    Subclass ``FixedShapeModality`` or ``BagModality`` and implement ``_load``.
+    """
 
     ids: pd.Index
 
@@ -47,7 +49,10 @@ class Modality(ABC):
         return iter(self.ids)
 
     def with_transform(self, fitted_transforms: Any, ids: Sequence[str]) -> Self:
-        """Given some fitted transforms, return the data of the specified ids with transforms applied."""
+        """A new modality holding the data of ``ids`` after ``fitted_transforms``.
+
+        Modalities that accept transforms override this. By default it raises ``TypeError``.
+        """
         raise TypeError(
             f"{self.__class__.__name__} has no implemented with_transform() method, so cannot accept any transformations"
         )
@@ -59,13 +64,17 @@ class Modality(ABC):
     @abstractmethod
     def _load(self, id: str) -> Tensor:
         """Return the data as a tensor for the given id.
-        Used by Modality.__getitem__()."""
+
+        Used by ``Modality.__getitem__``.
+        """
 
     @abstractmethod
     def collate(self, items: list[Tensor]) -> Tensor | list[Tensor]:
-        """Given a list of items returned by _load(), combine one item per patient, in order, into a batch.
-        Used by Modality.__getitem__() when multiple IDs are passed.
-        Used by MultimodalDataset.collate() to combine the items of each modality into a batch."""
+        """Combine items returned by ``_load``, one per patient and in order, into a batch.
+
+        Used by ``Modality.__getitem__`` when several ids are passed, and by ``MultimodalDataset.collate`` to batch
+        each modality's items.
+        """
 
 
 class FixedShapeModality(Modality):
@@ -86,12 +95,18 @@ class BagModality(Modality):
     @abstractmethod
     def instances(self, id: str) -> pd.DataFrame:
         """One row per instance of ``_load(id)``, in the same order, describing each one (e.g. file, x, y).
-        Never read by fit or predict.
-        Used by interpret module."""
+
+        Used by the interpret module, never by fit or predict.
+        """
 
 
 class Tabular(FixedShapeModality):
-    """A DataFrame modality: one float32 vector per patient."""
+    """A DataFrame modality: one float32 vector per patient.
+
+    Args:
+        frame: One row per patient, indexed by patient id as a string. Its columns must be numeric, unless the
+            pipeline gives this modality a transform that makes them numeric.
+    """
 
     def __init__(self, frame: pd.DataFrame):
         self._frame = frame.copy()
@@ -133,6 +148,7 @@ class Tabular(FixedShapeModality):
         return Tabular(pd.DataFrame(values, index=raw.index, columns=columns))
 
     def transform_input(self, ids: Sequence[str]) -> pd.DataFrame:
+        """The rows of ``ids``, before any transform."""
         return self._frame.loc[list(ids)]
 
 

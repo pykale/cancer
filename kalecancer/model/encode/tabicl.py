@@ -1,4 +1,4 @@
-"""Fitted encoders: encoders fitted on the training patients before training, such as TabICL's in-context encoder."""
+"""TabICLEncoder, in its own file because it needs the optional ``tabicl`` extra."""
 
 from __future__ import annotations
 
@@ -22,14 +22,21 @@ class TabICLEncoder(FittedEncoder):
 
     The context is the training rows, labelled with the target's strata.
     A training patient is embedded against the context without its own stratified fold, and any other
-    patient against the whole context. This is too avoid data leakage, as removing just the patient
-    from the context would allow the model to predict the patients outcome based purely on the other
-    patients outcomes. For example, if there are 30 positive outcomes total, but when embedding a given
+    patient against the whole context. This is to avoid data leakage, as removing just the patient
+    from the context would allow the model to predict the patient's outcome based purely on the other
+    patients' outcomes. For example, if there are 30 positive outcomes total, but when embedding a given
     patient there are 29 positive outcomes in the context remaining, the model can infer that the
     patient has a positive outcome (purely as it knows the total number of outcomes).
 
+    The output has ``embed_dim * row_num_cls`` columns for either ``output``, as set by the checkpoint: 512 for
+    ``tabicl-classifier-v2-20260212.ckpt``.
+
+    ``fit`` raises if the rows have NaN or infinite values, if a column is constant, if there are more labels than
+    the checkpoint handles, or if a label has fewer rows than ``context_folds``.
+
     Args:
-        checkpoint: A TabICL classifier checkpoint file in the ``jingang/TabICL`` Hugging Face repository.
+        checkpoint: A TabICL classifier checkpoint file in the ``jingang/TabICL`` Hugging Face repository. It is
+            downloaded when the encoder is built, unless it is already cached.
         output: ``"row"`` for the row embeddings, ``"icl"`` for the in-context transformer's output.
         trainable: The TabICL stages to train; the others stay frozen.
         context_folds: The number of stratified folds the context is split into.
@@ -101,6 +108,7 @@ class TabICLEncoder(FittedEncoder):
         self._set_context_ids([])
 
     def fit(self, x: Tensor, target: BaseTarget, ids: list[str]) -> None:
+        """Store ``x`` as the context, labelled with ``target.strata(ids)``, and split it into stratified folds."""
         x = x.detach()
         if x.ndim != 2 or len(x) == 0 or len(x) != len(ids):
             raise ValueError(f"expected a non-empty (n, F) context aligned with {len(ids)} ids, got {tuple(x.shape)}")
@@ -124,7 +132,7 @@ class TabICLEncoder(FittedEncoder):
                 "so some fold-excluded contexts would lack them"
             )
 
-        # see the class dcostring for explainer on why a splitter is required
+        # see the class docstring for why the context is split into folds
         folds = np.empty(len(labels), dtype=np.int64)
         splitter = StratifiedKFold(self.context_folds, shuffle=True, random_state=self.random_state)
         for fold, (_, members) in enumerate(splitter.split(labels, labels)):
@@ -144,6 +152,7 @@ class TabICLEncoder(FittedEncoder):
         self._set_context_ids(ids)
 
     def forward(self, x: Tensor, ids: list[str]) -> Tensor:
+        """Embed each patient against the context, leaving out its own fold if it is in the context."""
         if not self.context_ids:
             raise RuntimeError(f"{type(self).__name__}.fit must be called before forward")
         if x.ndim != 2 or x.shape[1] != self.context_x.shape[1] or len(x) != len(ids):
@@ -200,7 +209,9 @@ class TabICLEncoder(FittedEncoder):
         self._position = {pid: k for k, pid in enumerate(self.context_ids)}
 
     def get_extra_state(self) -> dict:
+        """The context ids, saved in the state dict alongside the buffers."""
         return {"context_ids": self.context_ids}
 
     def set_extra_state(self, state: dict) -> None:
+        """Restore the context ids from a state dict."""
         self._set_context_ids(state["context_ids"])

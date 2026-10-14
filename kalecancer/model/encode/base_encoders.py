@@ -1,3 +1,5 @@
+"""Base classes for encoders that are fitted on the training patients, or that report attention."""
+
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -12,16 +14,19 @@ class AttentionEncoder(nn.Module, ABC):
 
     @abstractmethod
     def attention(self, bags: list[Tensor]) -> list[Tensor]:
-        """One tensor per bag whose last dimension is aligned with the bag's instances, e.g. ``(N_i,)`` or
-        ``(heads, N_i)``."""
+        """One tensor per bag whose last dimension is aligned with the bag's instances.
+
+        For example ``(N_i,)`` or ``(heads, N_i)``.
+        """
 
 
 class FittedEncoder(nn.Module, ABC):
     """An encoder fitted on the training patients before training starts.
 
     Only the first encoder in a list may be fitted: the inputs of later encoders change as the encoders before them
-    train. The encoder list fits it on the training patients who have the modality, and passes the patients' ids to
-    every ``forward``. Fitted state kept in buffers may have any size; an unfitted encoder loads a fitted one's state.
+    train. The encoder list fits it on the training patients who have the modality (in ``EarlyFusion``, every fused
+    modality), and passes the patients' ids to every ``forward``. Fitted state kept in buffers may have any size; an
+    unfitted encoder loads a fitted one's state.
     """
 
     @abstractmethod
@@ -31,7 +36,7 @@ class FittedEncoder(nn.Module, ABC):
         Args:
             x: The loaded, transformed input of ``ids``, as a batch of them would be.
             target: The training dataset's target.
-            ids: The training patients who have the modality, in the order of ``x``.
+            ids: The training patients in ``x``, in the same order.
         """
 
     @abstractmethod

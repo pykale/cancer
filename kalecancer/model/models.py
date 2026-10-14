@@ -27,7 +27,10 @@ from kalecancer.model.fusion import FusionContext, FusionMethod, Stage
 
 @dataclass
 class ModelOutput:
-    """Raw head output (what the loss sees), prediction, and which patients have a prediction."""
+    """Raw head output (what the loss sees), prediction, and which patients have a prediction.
+
+    In a ``LateFusion`` model, ``branches`` holds each branch's own output. It is empty for other models.
+    """
 
     output: Tensor
     prediction: Tensor
@@ -109,7 +112,7 @@ class _SingleHeadModel(nn.Module):
 
     @property
     def decomposable_loss(self) -> bool:
-        """Whether the head's loss is a sum over patients, so accumulating gradients reproduces a larger batch."""
+        """Whether the head's loss is a mean over patients, so accumulating gradients reproduces a larger batch."""
         return bool(getattr(self.head, "decomposable_loss", False))
 
     def check(self, data: MultimodalDataset) -> None:
@@ -130,9 +133,12 @@ class _SingleHeadModel(nn.Module):
         raise NotImplementedError
 
     def dry_run(self, data: MultimodalDataset, batch: dict) -> None:
-        """Run the model once on ``batch``, a few of ``data``'s training patients, and check the fusion method against
-        the real widths of its inputs. ``Pipeline.fit`` calls this before training, in eval mode and without gradients,
-        so an encoder that cannot take its input fails before the first optimizer step."""
+        """Run the model once on ``batch``, a few of ``data``'s training patients.
+
+        It also checks the fusion method against the real widths of its inputs. ``Pipeline.fit`` calls this before
+        training, in eval mode and without gradients, so an encoder that cannot take its input fails before the first
+        optimizer step.
+        """
         self._dry_run(data, batch, allow_undefined=False)
 
     def _dry_run(self, data: MultimodalDataset, batch: dict, allow_undefined: bool) -> None:
@@ -145,8 +151,10 @@ class _SingleHeadModel(nn.Module):
             self.head.check_target(data.target)
 
     def _finish(self, rows: Tensor | None, defined: Tensor) -> ModelOutput:
-        """Run the head on the rows of the defined patients (``None`` when there are none) and scatter its output
-        back over the batch, with NaN for the other patients."""
+        """Run the head on the rows of the defined patients and scatter its output back over the batch.
+
+        ``rows`` is ``None`` when no patient is defined. The other patients get NaN.
+        """
         if rows is None:
             output = torch.full((defined.shape[0], self.head.out_dim), float("nan"), device=defined.device)
         else:
@@ -175,7 +183,16 @@ class _SingleHeadModel(nn.Module):
 
 
 class Unimodal(_SingleHeadModel):
-    """One modality's list of encoders followed by a head."""
+    """One modality's list of encoders followed by a head.
+
+    On its own it needs every patient to have the modality. As a ``LateFusion`` branch, it predicts only for the
+    patients who do.
+
+    Args:
+        modality: The name of the modality in the dataset.
+        encoders: Encoders run in order on the modality. The last one must output an ``(n, d)`` embedding.
+        head: The head, e.g. ``CoxHead``. Its ``in_dim`` is the width of the embedding.
+    """
 
     def __init__(self, modality: str, encoders: list[nn.Module], head: nn.Module):
         super().__init__()
@@ -189,8 +206,10 @@ class Unimodal(_SingleHeadModel):
         return [self.modality]
 
     def _check(self, data: MultimodalDataset, allow_undefined: bool) -> None:
-        """Raise if the dataset lacks the modality, its target does not suit the head, or, when this model is
-        used on its own, some patients lack the modality."""
+        """Raise if the dataset lacks the modality or its target does not suit the head.
+
+        Used on its own, it also raises if some patients lack the modality.
+        """
         _check_modalities(data, self.modalities)
         self._check_target(data)
         missing = int((~data.present[self.modality]).sum())
@@ -202,7 +221,7 @@ class Unimodal(_SingleHeadModel):
         return data.present[self.modality]
 
     def fit(self, train: MultimodalDataset) -> None:
-        """Fit a ``FittedEncoder`` first on the training patients who have the modality."""
+        """Fit the first encoder, if it is a ``FittedEncoder``, on the training patients who have the modality."""
         _fit_encoders(self.encoders, train, train.present_ids(self.modality), _loader(train.modalities[self.modality]))
 
     def forward(self, batch: dict) -> ModelOutput:
@@ -221,7 +240,15 @@ class Unimodal(_SingleHeadModel):
 
 
 class IntermediateFusion(_SingleHeadModel):
-    """Each modality's encoders, then a fusion method, then one head."""
+    """Each modality's encoders, then a fusion method, then one head.
+
+    Args:
+        encoders: A list of encoders for each modality, by modality name. Each list must end in an ``(n, d)``
+            embedding.
+        fusion: How the embeddings are combined, e.g. ``Concat`` or ``MaskedMean``.
+        head: The head, e.g. ``CoxHead``. Its ``in_dim`` is the width of the fused embedding: the sum of the
+            embedding widths for ``Concat``, or their shared width for ``MaskedMean``.
+    """
 
     def __init__(self, encoders: dict[str, list[nn.Module]], fusion: FusionMethod, head: nn.Module):
         super().__init__()
@@ -240,8 +267,11 @@ class IntermediateFusion(_SingleHeadModel):
         return list(self.encoders)
 
     def _check(self, data: MultimodalDataset, allow_undefined: bool) -> None:
-        """Raise if the dataset lacks a modality, its target does not suit the head, or the fusion method
-        cannot be fitted on it."""
+        """Raise if the dataset does not suit this model.
+
+        It raises if the dataset lacks a modality, its target does not suit the head, or the fusion method cannot be
+        fitted on it.
+        """
         _check_modalities(data, self.modalities)
         self._check_target(data)
         _check_fusion(self.fusion, "intermediate", data, dict.fromkeys(self.modalities), allow_undefined)
@@ -288,7 +318,15 @@ class IntermediateFusion(_SingleHeadModel):
 
 
 class EarlyFusion(_SingleHeadModel):
-    """Fuse raw vector modalities first, then one encoder list, then one head."""
+    """Fuse raw vector modalities first, then one encoder list, then one head.
+
+    Args:
+        modalities: At least two modality names, all ``FixedShapeModality`` (e.g. ``Tabular``), in the order they
+            are fused.
+        fusion: How the raw inputs are combined, e.g. ``Concat``.
+        encoders: Encoders run in order on the fused input. The last one must output an ``(n, d)`` embedding.
+        head: The head, e.g. ``CoxHead``. Its ``in_dim`` is the width of the embedding.
+    """
 
     def __init__(self, modalities: list[str], fusion: FusionMethod, encoders: list[nn.Module], head: nn.Module):
         super().__init__()
@@ -303,8 +341,11 @@ class EarlyFusion(_SingleHeadModel):
         fusion.check(FusionContext.without_data("early", dict.fromkeys(self.modalities)))
 
     def _check(self, data: MultimodalDataset, allow_undefined: bool) -> None:
-        """Raise if the dataset lacks a modality, its target does not suit the head, or the fusion method
-        cannot be fitted on it."""
+        """Raise if the dataset does not suit this model.
+
+        It raises if the dataset lacks a modality, a modality is not a ``FixedShapeModality``, its target does not
+        suit the head, or the fusion method cannot be fitted on it.
+        """
         _check_modalities(data, self.modalities)
         bags = [name for name in self.modalities if not isinstance(data.modalities[name], FixedShapeModality)]
         if bags:
@@ -325,7 +366,10 @@ class EarlyFusion(_SingleHeadModel):
         return self.fusion.defined_rows(data.present[self.modalities])
 
     def fit(self, train: MultimodalDataset) -> None:
-        """Fit an ``FittedEncoder`` on the training patients who have every modality."""
+        """Fit the first encoder, if it is a ``FittedEncoder``.
+
+        It is fitted on the fused input of the training patients who have every modality.
+        """
         # the context is built from complete rows, fused exactly as forward fuses them
         ids = [pid for pid in train.ids if all(train.present.at[pid, name] for name in self.modalities)]
 
@@ -360,8 +404,16 @@ class EarlyFusion(_SingleHeadModel):
 
 
 class LateFusion(nn.Module):
-    """Branch models trained jointly (loss = unweighted sum of branch losses); ``fusion`` builds the prediction from
-    the branch outputs."""
+    """Branch models trained together, whose outputs ``fusion`` combines into one prediction.
+
+    The loss is the unweighted sum of the branch losses. Each branch predicts only for the patients who have its
+    modalities.
+
+    Args:
+        branches: At least two models, by name. Each is a ``Unimodal``, ``EarlyFusion`` or ``IntermediateFusion``
+            with its own head.
+        fusion: How the branch outputs are combined, e.g. ``MaskedMean`` or ``MajorityVote``.
+    """
 
     def __init__(self, branches: dict[str, nn.Module], fusion: FusionMethod):
         super().__init__()
@@ -385,7 +437,7 @@ class LateFusion(nn.Module):
 
     @property
     def decomposable_loss(self) -> bool:
-        """Whether every branch loss is a sum over patients, so accumulating gradients reproduces a larger batch."""
+        """Whether every branch loss is a mean over patients, so accumulating gradients reproduces a larger batch."""
         return all(branch.decomposable_loss for branch in self.branches.values())
 
     @property
@@ -394,8 +446,10 @@ class LateFusion(nn.Module):
         return next(iter(self.branches.values())).head
 
     def _fusion_context(self, data: MultimodalDataset | None) -> FusionContext:
-        """The context for ``fusion``: each branch head's width and kind and, given ``data``, which patients each
-        branch predicts for."""
+        """The context for ``fusion``.
+
+        It holds each branch head's width and kind and, given ``data``, which patients each branch predicts for.
+        """
         heads = {name: branch.head for name, branch in self.branches.items()}
         widths = {name: getattr(head, "out_dim", None) for name, head in heads.items()}
         kinds = {name: getattr(head, "target_type", None) for name, head in heads.items()}
@@ -412,7 +466,7 @@ class LateFusion(nn.Module):
         self.fusion.check(self._fusion_context(data))
 
     def fit(self, train: MultimodalDataset) -> None:
-        """Fit each branch's ``FittedEncoder`` first encoders on the training patients."""
+        """Call ``fit`` on each branch, which fits its first encoder if it is a ``FittedEncoder``."""
         for branch in self.branches.values():
             branch.fit(train)
 

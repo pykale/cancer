@@ -1,5 +1,8 @@
-"""Pipeline: fit transforms and fold-local state on training patients, train one model end to end with Lightning,
-then predict, evaluate, encode, and run a modality's encoders for interpretation tools."""
+"""Pipeline: train one model end to end with Lightning, then predict, evaluate and encode with it.
+
+Transforms and fold-local state are fitted on the training patients only. ``run_encoders`` runs a modality's
+encoders for interpretation tools.
+"""
 
 from __future__ import annotations
 
@@ -107,6 +110,7 @@ class EarlyStopping:
 
     @property
     def mode(self) -> str:
+        """``"max"`` if a higher score is better, otherwise ``"min"``."""
         if self.metric == "loss":
             return "min"
         return "max" if self.metric.higher_is_better else "min"
@@ -137,6 +141,22 @@ class Pipeline(BaseEstimator):
             e.g. ``{"encoders.clinical": {"lr": 1e-5}}``.
         num_workers: DataLoader workers.
         trainer_kwargs: Further ``lightning.pytorch.Trainer`` arguments (not the ones this class manages).
+
+    Attributes:
+        model_: The trained copy of ``model``, on the CPU in eval mode.
+        transforms_: The fitted transforms, by modality.
+        train_ids_: The patients the model was trained on.
+        val_ids_: The validation patients. Empty without ``validation``.
+        target_: The target of the dataset given to ``fit``.
+        train_target_: The target frame of the training patients. Metrics such as ``UnoC`` estimate censoring
+            from it.
+        history_: One row per epoch, indexed by ``epoch``, with ``train_loss``, ``val_loss`` (with validation),
+            ``val_metric`` (when early stopping on a metric), ``optimizer_steps`` (a running total) and
+            ``skipped_batches``.
+        fit_report_: A summary of the fit: ``n_train``, ``n_val``, the target's counts (e.g. ``events``),
+            ``epochs_run``, ``best_epoch`` and ``best_score`` (``None`` without early stopping), the total
+            ``optimizer_steps`` and ``skipped_batches``, and ``non_finite_inputs`` (for each modality, how many
+            patients had NaN or infinite values in their input).
     """
 
     def __init__(
@@ -175,6 +195,22 @@ class Pipeline(BaseEstimator):
     # ---------------------------------------------------------------------------------------------------- fit
 
     def fit(self, data: MultimodalDataset) -> Pipeline:
+        """Train a copy of ``model`` on ``data``.
+
+        In order, it splits off the validation patients (when ``validation`` is set), fits the transforms and any
+        ``FittedEncoder`` on the training patients, runs the model once on a few of them so that errors show up
+        before training starts (the dry run), and trains with Lightning. The results are stored in the attributes
+        that end in ``_``.
+
+        It warns with a ``UserWarning`` if some training batches were skipped because their loss had no signal, and
+        with a ``NonFiniteInputWarning`` if some inputs had NaN or infinite values.
+
+        Args:
+            data: The patients to train on. It must have a target.
+
+        Returns:
+            The pipeline itself.
+        """
         self._check_arguments(data)
         assert data.target is not None, "_check_arguments requires a target"
         with _lightning_session():
@@ -276,7 +312,7 @@ class Pipeline(BaseEstimator):
         complete = bool(data.present[self.model.modalities].to_numpy().all()) if self.model.modalities else True
         if trainer_kwargs.get("accumulate_grad_batches", 1) != 1 and not (self.model.decomposable_loss and complete):
             raise ValueError(
-                "accumulate_grad_batches does not reproduce a larger batch for this model: the loss is not a sum over "
+                "accumulate_grad_batches does not reproduce a larger batch for this model: the loss is not a mean over "
                 "patients (a Cox risk set, or branch losses averaged over patients with a modality). "
                 "Increase batch_size instead; memory-bound encoders should process their inputs in chunks"
             )
@@ -349,8 +385,10 @@ class Pipeline(BaseEstimator):
             raise RuntimeError("this Pipeline is not fitted; call fit first")
 
     def transformed(self, data: MultimodalDataset) -> MultimodalDataset:
-        """The dataset as the fitted model sees it, with the fitted transforms applied. The model checks that its
-        inputs are finite as it reads them."""
+        """The dataset as the fitted model sees it, with the fitted transforms applied.
+
+        Raises if the fitted model cannot be used with ``data``, for example when a modality it reads is missing.
+        """
         self._require_fitted()
         if not isinstance(data, MultimodalDataset):
             raise TypeError(f"expected a MultimodalDataset, got {type(data).__name__}")
@@ -367,8 +405,10 @@ class Pipeline(BaseEstimator):
         return results
 
     def predict(self, data: MultimodalDataset, branch: str | None = None) -> pd.DataFrame:
-        """Predictions indexed by patient id; NaN for patients without a prediction. ``branch`` selects one
-        branch of a ``LateFusion`` model."""
+        """Predictions indexed by patient id, with NaN for patients without a prediction.
+
+        ``branch`` selects one branch of a ``LateFusion`` model.
+        """
         view = self.transformed(data)
         if branch is not None and (not isinstance(self.model_, LateFusion) or branch not in self.model_.branches):
             names = list(self.model_.branches) if isinstance(self.model_, LateFusion) else []
@@ -437,10 +477,12 @@ class Pipeline(BaseEstimator):
         fn: Callable[[EncoderList, Any, list[str]], Any],
         branch: str | None = None,
     ) -> list[tuple[list[str], Any]]:
-        """Call ``fn(encoders, inputs, ids)`` on each batch of the patients in ``data`` who have ``modality``, with
-        the fitted transforms applied and the model in eval mode, and return ``(ids, result)`` per batch.
-        ``encoders`` is the fitted encoder list for ``modality``. Interpretation tools in ``kalecancer.interpret``
-        build on this."""
+        """Call ``fn(encoders, inputs, ids)`` on each batch of the patients in ``data`` who have ``modality``.
+
+        The fitted transforms are applied and the model is in eval mode. ``encoders`` is the fitted encoder list for
+        ``modality``. Returns ``(ids, result)`` for each batch. Interpretation tools in ``kalecancer.interpret``
+        build on this. ``EarlyFusion`` models are not supported yet, because their encoders run on the fused input.
+        """
         single, encoders = self._single_modality(data, modality, branch)
 
         def step(model: nn.Module, batch: dict) -> tuple[list[str], Any]:
@@ -449,7 +491,10 @@ class Pipeline(BaseEstimator):
         return self._infer(single, step)
 
     def encode(self, data: MultimodalDataset, modality: str, branch: str | None = None) -> pd.DataFrame:
-        """The embeddings of ``modality``: the output of its encoder list, indexed by patient id."""
+        """The embeddings of ``modality``: the output of its encoder list, indexed by patient id.
+
+        ``EarlyFusion`` models are not supported yet, because their encoders run on the fused input.
+        """
         # forward checks the embedding, so encode needs no check of its own
         results = self.run_encoders(data, modality, lambda encoders, x, ids: encoders(x, ids).float().cpu(), branch)
         ids = [pid for batch_ids, _ in results for pid in batch_ids]
@@ -470,9 +515,11 @@ def _dry_run_ids(train: MultimodalDataset, modalities: list[str]) -> list[str]:
 
 
 def _dry_run(model: nn.Module, train: MultimodalDataset) -> None:
-    """Run ``model`` once on a few training patients before training, in eval mode and without gradients, so an
-    encoder that cannot take its input fails before the first optimizer step and the fusion method is checked against
-    the real widths. Validation patients are never used."""
+    """Run ``model`` once on a few training patients before training, in eval mode and without gradients.
+
+    An encoder that cannot take its input then fails before the first optimizer step, and the fusion method is
+    checked against the real widths. Validation patients are never used.
+    """
     sample = train.subset(_dry_run_ids(train, model.modalities))
     batch = sample.collate([sample[k] for k in range(len(sample))])
     was_training = model.training

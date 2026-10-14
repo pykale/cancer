@@ -26,7 +26,12 @@ def _has_comparable_event(time: Tensor, event: Tensor) -> bool:
 
 
 class CoxHead(nn.Module):
-    """Linear log-hazard trained with the Cox partial likelihood over the patients in each batch."""
+    """Linear log-hazard trained with the Cox partial likelihood over the patients in each batch.
+
+    Args:
+        in_dim: Width of the embedding the head takes.
+        ties: How the loss handles tied event times, ``"efron"`` or ``"breslow"``.
+    """
 
     target_type: Final[type[TimeToEvent]] = TimeToEvent
     decomposable_loss = False
@@ -42,15 +47,19 @@ class CoxHead(nn.Module):
         self.linear = nn.Linear(in_dim, 1, bias=False)
 
     def forward(self, z: Tensor) -> Tensor:
+        """The log-hazard of each patient, as an ``(n, 1)`` tensor."""
         return self.linear(z)
 
     def predict(self, output: Tensor) -> Tensor:
+        """The log-hazard itself: higher means higher risk."""
         return output
 
     def columns(self, target: TimeToEvent) -> list[str]:
+        """One column, ``log_hazard``."""
         return ["log_hazard"]
 
     def check_target(self, target: BaseTarget) -> None:
+        """Raise if ``target`` is not a ``TimeToEvent``."""
         if not isinstance(target, self.target_type):
             raise TypeError(f"CoxHead needs a time-to-event target, got {type(target)}")
 
@@ -75,7 +84,12 @@ class CoxHead(nn.Module):
 
 
 class ClassificationHead(nn.Module):
-    """Linear class logits trained with cross-entropy."""
+    """Linear class logits trained with cross-entropy.
+
+    Args:
+        in_dim: Width of the embedding the head takes.
+        n_classes: Number of classes. It must match the number of classes in the target.
+    """
 
     target_type: Final[type[Classification]] = Classification
     decomposable_loss = True
@@ -90,15 +104,19 @@ class ClassificationHead(nn.Module):
         self.linear = nn.Linear(in_dim, n_classes)
 
     def forward(self, z: Tensor) -> Tensor:
+        """The class logits, as an ``(n, n_classes)`` tensor."""
         return self.linear(z)
 
     def predict(self, output: Tensor) -> Tensor:
+        """Class probabilities: the softmax of the logits."""
         return torch.softmax(output.float(), dim=-1)
 
     def columns(self, target: Classification) -> list[str]:
+        """One ``probability[<class>]`` column per class, in the target's class order."""
         return [f"probability[{c}]" for c in target.classes]
 
     def check_target(self, target: BaseTarget) -> None:
+        """Raise if ``target`` is not a ``Classification`` with ``n_classes`` classes."""
         if not isinstance(target, self.target_type):
             raise TypeError(f"ClassificationHead needs a classification target, got {type(target)}")
 
@@ -108,5 +126,6 @@ class ClassificationHead(nn.Module):
             )
 
     def loss(self, output: Tensor, target: Mapping[str, Tensor]) -> Tensor | None:
+        """Mean cross-entropy over the batch. Every batch has signal, so it never returns ``None``."""
         with torch.autocast(device_type=output.device.type, enabled=False):
             return F.cross_entropy(output.float(), target["label"])

@@ -9,7 +9,14 @@ from kalecancer.model.encode.base_encoders import AttentionEncoder
 
 
 class MLP(nn.Module):
-    """Linear → ReLU → Dropout for each hidden width, then a final Linear."""
+    """Linear → ReLU → Dropout for each hidden width, then a final Linear.
+
+    Args:
+        in_dim: Width of the input.
+        hidden_dims: Width of each hidden layer. There must be at least one.
+        out_dim: Width of the output.
+        dropout: Dropout probability after each hidden layer.
+    """
 
     def __init__(self, in_dim: int, hidden_dims: list[int], out_dim: int, dropout: float):
         super().__init__()
@@ -30,6 +37,7 @@ class MLP(nn.Module):
         self.layers = nn.Sequential(*layers)
 
     def forward(self, x: Tensor) -> Tensor:
+        """Map an ``(n, in_dim)`` batch to ``(n, out_dim)``."""
         return self.layers(x)
 
 
@@ -37,6 +45,12 @@ class ABMIL(AttentionEncoder):
     """Gated attention-based multiple-instance pooling (Ilse et al., 2018).
 
     Takes a list of bags, one ``(N_i, in_dim)`` tensor per patient, and returns ``(n, hidden_dim)``.
+
+    Args:
+        in_dim: Width of each instance's features.
+        hidden_dim: Width each instance is embedded to, which is also the output width.
+        attention_dim: Width of the layers that compute the attention scores.
+        dropout: Dropout probability after the instance embedding.
     """
 
     def __init__(self, in_dim: int, hidden_dim: int, attention_dim: int, dropout: float):
@@ -61,6 +75,7 @@ class ABMIL(AttentionEncoder):
         return weights.to(instances.dtype) @ instances, weights
 
     def forward(self, bags: list[Tensor]) -> Tensor:
+        """Pool each bag into the attention-weighted mean of its embedded instances."""
         if len(bags) == 0:
             raise ValueError("ABMIL received no bags")
         return torch.stack([self._pool(bag)[0] for bag in bags])

@@ -12,7 +12,13 @@ from sklearn.pipeline import make_pipeline
 
 
 class ColumnGroup:
-    """Columns that share a sequence of sklearn steps."""
+    """Columns that share a sequence of sklearn steps.
+
+    Args:
+        columns: The columns in the group.
+        steps: sklearn transformers applied to the columns in order, e.g. ``[SimpleImputer(), StandardScaler()]``.
+            An empty list passes the columns through unchanged.
+    """
 
     def __init__(self, columns: list[str], steps: list[TransformerMixin]):
         self.columns = columns
@@ -24,6 +30,10 @@ class TableTransform(TransformerMixin, BaseEstimator):
 
     jsonargparse cannot validate the untyped ``transformers`` tuples of ``ColumnTransformer``, so a typo
     inside a nested step would pass silently in a YAML config. Here every step is typed.
+
+    Args:
+        groups: The column groups, by name.
+        drop: Columns to leave out.
     """
 
     def __init__(self, groups: dict[str, ColumnGroup], drop: list[str]):
@@ -31,6 +41,7 @@ class TableTransform(TransformerMixin, BaseEstimator):
         self.drop = drop
 
     def fit(self, X: pd.DataFrame, y: Any = None) -> TableTransform:
+        """Check that every column is in exactly one group or in ``drop``, then fit each group's steps."""
         listed = [c for group in self.groups.values() for c in group.columns]
         duplicated = sorted({c for c in listed if listed.count(c) > 1})
         unlisted = [c for c in X.columns if c not in set(listed) | set(self.drop)]
@@ -53,9 +64,11 @@ class TableTransform(TransformerMixin, BaseEstimator):
         return self
 
     def transform(self, X: pd.DataFrame) -> np.ndarray:
+        """Apply each group's fitted steps. Columns in ``drop`` are left out."""
         return self.transformer_.transform(X)
 
     def get_feature_names_out(self, input_features: Any = None) -> np.ndarray:
+        """The names of the output columns. ``input_features`` is ignored."""
         return self.transformer_.get_feature_names_out()
 
 

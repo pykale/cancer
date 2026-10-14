@@ -15,10 +15,17 @@ from kalecancer.loaddata.identifiers import _as_ids
 
 
 class BaseTarget(ABC):
+    """What is predicted for each patient, such as a survival time or a class label.
+
+    A subclass checks its outcomes in ``__init__`` and stores them in ``frame``, a DataFrame indexed by patient id.
+    Metrics score predictions against ``frame``.
+    """
+
     frame: pd.DataFrame
 
     @property
     def ids(self) -> pd.Index:
+        """The patient ids, from the index of ``frame``."""
         return self.frame.index
 
     @abstractmethod
@@ -27,7 +34,7 @@ class BaseTarget(ABC):
 
     @abstractmethod
     def strata(self, ids: Sequence[str]) -> np.ndarray:
-        """One discrete label per patient for stratified splitters"""
+        """One discrete label per patient for stratified splitters."""
 
     @abstractmethod
     def counts(self, ids: Sequence[str]) -> dict[str, int]:
@@ -70,6 +77,7 @@ class TimeToEvent(BaseTarget):
         )
 
     def tensors(self, ids: Sequence[str]) -> dict[str, Tensor]:
+        """``time`` (float32) and ``event`` (bool) tensors for ``ids``, in that order."""
         rows = self.frame.loc[list(ids)]
         return {
             "time": torch.tensor(rows["time"].to_numpy(dtype=np.float32)),
@@ -77,9 +85,11 @@ class TimeToEvent(BaseTarget):
         }
 
     def strata(self, ids: Sequence[str]) -> np.ndarray:
+        """The event indicators, so stratified splits keep the share of events."""
         return self.frame.loc[list(ids), "event"].to_numpy()
 
     def counts(self, ids: Sequence[str]) -> dict[str, int]:
+        """The number of events among ``ids``."""
         return {"events": int(self.frame.loc[list(ids), "event"].sum())}
 
 
@@ -108,12 +118,15 @@ class Classification(BaseTarget):
         self.frame = pd.DataFrame({"label": labels.to_numpy(dtype=object)}, index=ids)
 
     def tensors(self, ids: Sequence[str]) -> dict[str, Tensor]:
+        """A ``label`` tensor of class indices (int64) for ``ids``, in that order."""
         codes = [self._index[v] for v in self.frame.loc[list(ids), "label"]]
         return {"label": torch.tensor(codes, dtype=torch.int64)}
 
     def strata(self, ids: Sequence[str]) -> np.ndarray:
+        """The labels, so stratified splits keep the share of each class."""
         return self.frame.loc[list(ids), "label"].to_numpy()
 
     def counts(self, ids: Sequence[str]) -> dict[str, int]:
+        """The number of patients in each class, including classes with none."""
         observed = Counter(self.frame.loc[list(ids), "label"])
         return {f"label: {c}": observed.get(c, 0) for c in self.classes}

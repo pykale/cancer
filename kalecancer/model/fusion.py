@@ -192,8 +192,10 @@ class MaskedMean(FusionMethod):
         return present.any(dim=1)
 
     def check(self, context: FusionContext) -> None:
-        """Also needs inputs of one width and, in late fusion, heads of one kind; Cox heads need every branch
-        for every patient."""
+        """Also needs inputs of one width and, in late fusion, heads of one kind.
+
+        Cox heads also need every branch for every patient.
+        """
         super().check(context)
         kinds = set(context.head_kinds.values())
         if len(kinds) > 1:
@@ -222,6 +224,9 @@ class MajorityVote(FusionMethod):
     Scores are ``(votes_c + 0.5 * mean_probability_c) / (n_branches + 0.5)``: they sum to 1, their argmax is the
     majority class, and ties between classes with equal votes are broken by mean probability. The probability
     term can never outweigh a whole vote.
+
+    Args:
+        tie_break: ``"mean_probability"`` breaks ties as above. ``"error"`` raises when a patient's votes are tied.
     """
 
     stages = frozenset({"late"})
