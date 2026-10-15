@@ -115,7 +115,8 @@ select = [
     "B",    # bugbear
     "SIM",  # simplify
     "T20",  # flake8-print
-    "D"     # pycodestyle forcing docstrings
+    "D",    # pycodestyle forcing docstrings
+    "INP",  # implicit namespace packages, which setuptools leaves out of the wheel
 ]
 ignore = [
     "B008",
@@ -125,7 +126,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["D"]
+"tests/*" = ["D", "INP"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
