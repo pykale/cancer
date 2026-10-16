@@ -8,7 +8,7 @@ below records what is now built. Items marked **Open question** are unresolved.
 | --- | --- |
 | WSI loading, cohort matching, patient-level splitting | Implemented |
 | Attention MIL encoder | Implemented |
-| Cox head, loss, and survival metrics | Implemented, using TorchSurv |
+| Cox head, loss, and survival metrics | Implemented: a hand-rolled Efron-corrected Cox loss and C-index, scikit-survival for the IPCW metrics |
 | Attention interpretation | Implemented |
 | Multimodal fusion (early, late, hybrid) | Implemented, with a multimodal cohort loader |
 | Binary classification alongside survival | Implemented, as a swappable `PredictionTask` |
@@ -132,19 +132,52 @@ Survival labels follow a fixed contract: `time` is the time from baseline to eve
 
 Metrics and their leakage rules are documented in the [WSI pipeline reference](../examples/hancock_wsi_survival/).
 
-### Reference implementation: TorchSurv
+### Reference implementation: not TorchSurv
 
-We will use **TorchSurv** as the reference implementation for survival losses and metrics. It was chosen because its losses and metrics are **standalone** and work with custom PyTorch networks — no requirement to adopt a monolithic survival library or a fixed model zoo.
+TorchSurv was the planned reference implementation for survival losses and metrics,
+chosen because its losses and metrics are standalone and work with custom PyTorch
+networks. That plan was not followed, and no TorchSurv import exists anywhere in the
+codebase (`grep -rn "torchsurv" kalecancer/ pyproject.toml` returns nothing). What is
+actually used:
 
-### Core boundary: `kalecancer/survival/`
+- the Cox loss (`neg_partial_log_likelihood` in `kalecancer/model/predict/losses.py`)
+  is a hand-rolled, Efron-corrected partial log-likelihood, not a call into an
+  external survival library;
+- Harrell's C-index is likewise hand-rolled; it needs no censoring-weighting
+  machinery, so nothing external was needed for it either;
+- the metrics that do need IPCW (censoring-weighted) machinery -- the time-dependent
+  AUC and the integrated Brier score -- are computed via **scikit-survival**
+  (`sksurv`), a base dependency (see `pyproject.toml`), in
+  `kalecancer/evaluate/survival_metrics.py`.
 
-Survival code will live in **`kalecancer/survival/`** under strict isolation rules:
+### Survival code: no dedicated boundary
 
-- **Cancer-agnostic** — may import only `torch`, `numpy`, and `pykale`; must not import from other `kalecancer` modules.
-- **Own test suite** — unit tests against synthetic tensors (no real patient data required).
-- **CI enforcement** — `tests/test_survival_boundary.py` will parse every file under `survival/` and fail on forbidden imports.
+The isolated, cancer-agnostic `kalecancer/survival/` package planned above was not
+built, and the directory does not exist. Survival logic instead sits with the kind
+of thing it is, next to its classification counterpart:
 
-This module is intended to **move into PyKale core** once stable, because **`kale-cardiac`** and other domain packages will need the same time-to-event capability without duplicating Cox heads, losses, and metrics.
+- the Cox head and loss (`CoxHead`, the Cox partial likelihood with Efron ties) are
+  in `kalecancer/model/predict/`, beside `LinearHead` and the classification loss;
+- the survival metrics (Harrell's C-index, the Breslow baseline hazard and the
+  survival curve it produces, IPCW time-dependent AUC, the integrated Brier score,
+  calibration) are in `kalecancer/evaluate/`, beside the classification metrics;
+- an endpoint is selected via `kalecancer.pipeline.task.SurvivalTask`, one of the two
+  `PredictionTask` implementations the single `CohortTrainer` accepts (see "One
+  trainer per task and modality, or one trainer" below).
+
+There is consequently no cancer-agnostic import boundary and nothing enforcing one:
+`kalecancer/evaluate/survival_metrics.py` depends on `scikit-survival` for the IPCW
+machinery the C-index does not need, which a `torch`/`numpy`-only module could not
+do. `tests/test_survival_boundary.py` does not exist; it was present at one point
+(see git history around the "Standardized loaddata and other APIs" commit, which
+folded survival code into `evaluate/` and `model/predict/`) and was removed along
+with the package it checked, rather than kept and repointed. Nothing in CI parses
+imports under any `survival/` path today.
+
+Moving a general time-to-event capability into PyKale core, so **`kale-cardiac`**
+and other domain packages can share it without duplicating Cox heads, losses, and
+metrics, remains a reasonable long-term goal. It would need factoring the relevant
+pieces back out of `evaluate`/`model/predict` first, which is not scoped or planned.
 
 ---
 
@@ -190,7 +223,7 @@ Public data will come first. Private NHS integration will reuse the same contrac
 | **Where `embed` and `predict` live** | Kept merged under `model/`, with a separate `pipeline/` for trainers and runners, mirroring `kale.pipeline`. |
 | **One trainer per task and modality, or one trainer** | One. `CohortTrainer` takes a set of modality embedders and a `PredictionTask`; neither constrains the other, so a whole-slide survival model and a multimodal classifier are the same class with different arguments. A bag of patches is an ordinary modality whose value is a list rather than a stacked tensor, which is what removed the need for a whole-slide trainer. A task decides exactly four things — head, loss, whether a batch carries a gradient, and the epoch metric — so a new endpoint costs a task, not a trainer. |
 | **Where orchestration lives** | In `examples/`, not in the library. Assembling a cohort, choosing splits, naming an endpoint and writing a report are experiment concerns; anything naming a dataset or a configuration key is an experiment. The library supplies the pieces an experiment composes. |
-| **Survival library** | TorchSurv, as planned. `LowRankTensorFusion` is the one PyKale component reimplemented rather than reused, because its parameters are not registered with the module. |
+| **Survival library** | Not TorchSurv, despite the plan: the Cox loss and C-index are hand-rolled, and scikit-survival supplies the IPCW metrics (see "Reference implementation" above). `LowRankTensorFusion` is the one PyKale component reimplemented rather than reused, because its parameters are not registered with the module. |
 
 ## Open questions
 
@@ -208,5 +241,4 @@ Public data will come first. Private NHS integration will reuse the same contrac
 - [WSI survival pipeline](../examples/hancock_wsi_survival/) — inputs, configuration, outputs
 - [Multimodal fusion](multimodal_fusion.md) — fusion APIs
 - [AGENTS.md](../AGENTS.md) — conventions and constraints for contributors
-- `tests/test_survival_boundary.py` — CI enforcement of the `survival/` isolation rule
 - PyKale fusion modules — [`kale.embed.multimodal_fusion`](https://pykale.readthedocs.io/en/latest/kale.embed.html)
