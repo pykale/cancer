@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -50,11 +51,14 @@ from torch import nn
 from kalecancer.evaluate.survival_metrics import breslow_baseline_hazard, predict_survival_function
 from kalecancer.evaluate.survival_predictions import SplitPredictions
 from kalecancer.interpret.attention import attention_records, bag_attention, top_k_patches
+from kalecancer.interpret.modality import EMPTY_COALITION_FALLBACK_SCORE
 from kalecancer.loaddata.multimodal_access import ModalityValue, PatientBatch
 from kalecancer.model.embed.tabicl import TabICLEmbedder
 from kalecancer.model.predict.losses import as_event_mask
 from kalecancer.pipeline.task import SurvivalTask
 from kalecancer.utils.io import write_json
+
+logger = logging.getLogger(__name__)
 
 
 def _require_survival_task(model, func_name: str) -> None:
@@ -176,22 +180,66 @@ class _CachedOutput(nn.Module):
         return self._cached_output
 
 
-def _cache_other_modalities(model, batch: PatientBatch, tabular_name: str) -> dict[str, nn.Module]:
-    """See :func:`kalecancer.interpret.attribution._cache_other_modalities`."""
+def _negligible_placeholder(value: ModalityValue) -> ModalityValue:
+    """See :func:`kalecancer.interpret.attribution._negligible_placeholder`."""
+    return torch.empty(0) if isinstance(value, torch.Tensor) else []
+
+
+def _cache_other_modalities(
+    model, batch: PatientBatch, tabular_name: str
+) -> tuple[dict[str, nn.Module], dict[str, ModalityValue]]:
+    """Embed every non-tabular modality once, install a cached replay in its place,
+    and swap its raw input for a negligible placeholder for the rest of the call.
+
+    Unlike :func:`kalecancer.interpret.attribution._cache_other_modalities`, this
+    does NOT reduce peak memory: the raw inputs are kept, in the returned
+    ``original_modalities``, and put back by :func:`_restore_modalities` once
+    scoring is done. They have to be: :func:`patient_report` calls
+    :func:`~kalecancer.interpret.attention.bag_attention` on this same
+    ``requested_batch`` afterwards, which re-runs the bag embedder on its real raw
+    input, so the batch cannot be left consumed the way the internal, never-reused
+    batch in ``attribution.py`` can be.
+
+    What the swap DOES save: without it, ``CohortTrainer.forward()``'s own
+    ``_to_device`` would move a whole cohort's patch bags onto the model's device on
+    every one of the ``n_samples * (d + 1)`` forward passes
+    :func:`_feature_contributions` makes, even though the cached embedder then
+    ignores the result -- real, repeated device transfers and copies whenever the
+    device differs, just never retained afterwards. This is a saving in per-call
+    transfer cost, not in the batch's resident size.
+
+    Returns:
+        ``(original_embedders, original_modalities)``, both needed to restore
+        ``batch`` and ``model.embedders`` with :func:`_restore_modalities`.
+    """
     device = model.device
-    originals: dict[str, nn.Module] = {}
+    original_embedders: dict[str, nn.Module] = {}
+    original_modalities: dict[str, ModalityValue] = {}
     for name, embedder in list(model.embedders.items()):
         if name == tabular_name:
             continue
-        output = embedder(_to_device(batch.modalities[name], device))
-        originals[name] = embedder
+        raw = batch.modalities[name]
+        output = embedder(_to_device(raw, device))
+        original_embedders[name] = embedder
+        original_modalities[name] = raw
         model.embedders[name] = _CachedOutput(output)
-    return originals
+        batch.modalities[name] = _negligible_placeholder(raw)
+    return original_embedders, original_modalities
 
 
-def _restore_modalities(model, originals: dict[str, nn.Module]) -> None:
-    for name, embedder in originals.items():
+def _restore_modalities(
+    model,
+    batch: PatientBatch,
+    original_embedders: dict[str, nn.Module],
+    original_modalities: dict[str, ModalityValue],
+) -> None:
+    """Undo :func:`_cache_other_modalities`: put the real embedders and raw inputs
+    back on ``model``/``batch``, required here (see that function's docstring) so
+    that whatever :func:`patient_report` does with ``batch`` afterwards sees the
+    genuine data rather than a placeholder."""
+    for name, embedder in original_embedders.items():
         model.embedders[name] = embedder
+    batch.modalities.update(original_modalities)
 
 
 def _risk_for(model, batch: PatientBatch) -> np.ndarray:
@@ -211,7 +259,7 @@ def _percentile_rank(value: float, population: np.ndarray) -> float:
     return 100.0 * (below + 0.5 * tied) / population.size
 
 
-def _modality_contributions(model, batch: PatientBatch) -> dict[str, np.ndarray]:
+def _modality_contributions(model, batch: PatientBatch) -> tuple[dict[str, np.ndarray], bool]:
     """Per-row Shapley value of each modality's contribution to RISK, not a metric.
 
     Exactly :func:`kalecancer.interpret.modality.modality_shapley`'s enumeration and
@@ -219,21 +267,63 @@ def _modality_contributions(model, batch: PatientBatch) -> dict[str, np.ndarray]
     "value" is the raw per-row risk vector rather than a cohort metric -- the
     distinction this module exists to keep straight. Exact, not sampled: with ``k``
     modalities (2-4 in practice) this is no more expensive than the cohort version.
+
+    A coalition's risk can come back non-finite. For the empty coalition this is the
+    same degenerate case :data:`~kalecancer.interpret.modality.EMPTY_COALITION_FALLBACK_SCORE`
+    exists for (e.g. a :class:`~kalecancer.model.embed.multimodal_fusion.ProductOfExpertsFusion`
+    with no prior expert). There is no "chance-level" reading of a raw risk VECTOR the
+    way there is for a ranking metric, but every row still needs the SAME constant:
+    the empty coalition means "no information", so every patient must look identical
+    to it, or substituting a per-row value would fabricate patient-to-patient
+    variation the model never produced. Reusing the one named constant from
+    :mod:`~kalecancer.interpret.modality` (rather than a second one here) keeps that
+    choice documented in one place. For a non-empty coalition there is no equivalent
+    fallback -- it is logged and left as NaN, which propagates correctly through the
+    subtractions below (unlike handing it to a reduction metric, which would silently
+    drop the affected patients from a comparison instead).
+
+    Returns:
+        ``(contributions, empty_coalition_fallback_used)``. The second element is
+        ``True`` when the empty coalition could not produce a finite risk and the
+        constant fallback was substituted for every row; the caller records this in
+        ``PatientReport.metadata``.
     """
     modality_names = list(model.embedders)
     k = len(modality_names)
     n = len(batch.patient_id)
 
+    empty_coalition_fallback_used = False
     cache: dict[frozenset[str], np.ndarray] = {}
     for size in range(k + 1):
         for subset in itertools.combinations(modality_names, size):
             coalition = frozenset(subset)
-            if coalition not in cache:
-                masked_present = {
-                    name: (value if name in coalition else torch.zeros_like(value))
-                    for name, value in batch.present.items()
-                }
-                cache[coalition] = _risk_for(model, replace(batch, present=masked_present))
+            if coalition in cache:
+                continue
+            masked_present = {
+                name: (value if name in coalition else torch.zeros_like(value)) for name, value in batch.present.items()
+            }
+            risk = _risk_for(model, replace(batch, present=masked_present))
+            if not np.all(np.isfinite(risk)):
+                non_finite = int(np.sum(~np.isfinite(risk)))
+                if not coalition:
+                    logger.warning(
+                        "the empty modality coalition produced a non-finite risk for %d of %d patients; "
+                        "falling back to the constant %.3f for every patient instead of crashing",
+                        non_finite,
+                        risk.size,
+                        EMPTY_COALITION_FALLBACK_SCORE,
+                    )
+                    risk = np.full(n, EMPTY_COALITION_FALLBACK_SCORE)
+                    empty_coalition_fallback_used = True
+                else:
+                    logger.warning(
+                        "modality coalition %s produced a non-finite risk for %d of %d patients; their "
+                        "modality_contributions will be NaN rather than a value computed from it",
+                        sorted(coalition),
+                        non_finite,
+                        risk.size,
+                    )
+            cache[coalition] = risk
 
     contributions = {}
     for name in modality_names:
@@ -246,7 +336,7 @@ def _modality_contributions(model, batch: PatientBatch) -> dict[str, np.ndarray]
                 weight = math.factorial(size) * math.factorial(k - size - 1) / math.factorial(k)
                 total = total + weight * (cache[with_name] - cache[without])
         contributions[name] = total
-    return contributions
+    return contributions, empty_coalition_fallback_used
 
 
 def _feature_contributions(
@@ -277,7 +367,7 @@ def _feature_contributions(
     m = requested_x.shape[0]
     n_pool = background_pool.shape[0]
 
-    originals = _cache_other_modalities(model, requested_batch, tabular_name)
+    original_embedders, original_modalities = _cache_other_modalities(model, requested_batch, tabular_name)
     try:
         rng = np.random.default_rng(seed)
         contributions = {name: np.zeros(m) for name in feature_names}
@@ -297,7 +387,7 @@ def _feature_contributions(
                 contributions[feature_names[column]] = contributions[feature_names[column]] + (risk - previous_risk)
                 previous_risk = risk
     finally:
-        _restore_modalities(model, originals)
+        _restore_modalities(model, requested_batch, original_embedders, original_modalities)
 
     return {name: values / n_samples for name, values in contributions.items()}
 
@@ -329,11 +419,20 @@ class PatientReport:
             :func:`~kalecancer.interpret.attribution.feature_shapley` reports.
         top_patches: The ``top_k`` most-attended patches for this patient's bag
             modality, in :func:`~kalecancer.interpret.attention.attention_records`'
-            form. ``None`` -- not an empty list -- when the patient has no bag
-            modality at all (no such modality on the model, or this patient is
-            genuinely missing it); an empty list would wrongly suggest a bag with
-            nothing in it.
-        metadata: What was computed and how; see :func:`patient_report`.
+            form. ``None`` -- not an empty list, which would wrongly suggest a bag
+            with nothing in it -- covers two different situations: this patient
+            individually has no bag (their own ``present`` bit is ``False``), or
+            nothing in this call could produce attention at all (no single,
+            unambiguous bag-pooling modality on the model, or the batch carries no
+            patch coordinates). ``metadata["top_patches_unavailable_reason"]``
+            names the second case; it is ``None`` when attention was available at
+            all, so a patient-level ``None`` alongside a ``None`` reason means the
+            first case.
+        metadata: What was computed and how; see :func:`patient_report`. Includes
+            ``"top_patches_unavailable_reason"`` (see ``top_patches`` above) and
+            ``"empty_modality_coalition_fallback_used"`` (whether
+            ``modality_contributions`` fell back to a constant for the empty
+            coalition; see :func:`_modality_contributions`).
     """
 
     patient_id: str
@@ -420,7 +519,7 @@ def patient_report(
             tabular_name = _find_tabular_modality(model)
             bag_modality = _find_bag_modality(model)
 
-            modality_contributions_all = _modality_contributions(model, requested_batch)
+            modality_contributions_all, empty_coalition_fallback_used = _modality_contributions(model, requested_batch)
 
             feature_names = _discover_feature_names(dataloader, tabular_name) if tabular_name is not None else None
             tabular_pool = full_batch.modalities[tabular_name] if tabular_name is not None else None
@@ -444,11 +543,15 @@ def patient_report(
                 )
 
             metadata_ok = {"coords", "slide_index", "slide_ids"} <= set(requested_batch.metadata)
-            attention_weights = (
-                bag_attention(model, requested_batch, bag_modality)
-                if bag_modality is not None and metadata_ok
-                else None
-            )
+            if bag_modality is None:
+                attention_weights = None
+                top_patches_reason: str | None = "no single, unambiguous bag-pooling modality found on the model"
+            elif not metadata_ok:
+                attention_weights = None
+                top_patches_reason = "batch metadata is missing coords/slide_index/slide_ids needed to place attention"
+            else:
+                attention_weights = bag_attention(model, requested_batch, bag_modality)
+                top_patches_reason = None
 
             survival_computable = train_predictions is not None and bool(eval_times)
             survival_reason: str | None = None
@@ -482,6 +585,8 @@ def patient_report(
                 "survival_curve_computable": survival_computable,
                 "survival_curve_unavailable_reason": survival_reason,
                 "feature_contributions_unavailable_reason": feature_contributions_reason,
+                "top_patches_unavailable_reason": top_patches_reason,
+                "empty_modality_coalition_fallback_used": empty_coalition_fallback_used,
                 "contributions_are_risk_deltas": True,
                 "contributions_are_not_cohort_shapley_values": True,
                 "cohort_size": len(full_batch.patient_id),

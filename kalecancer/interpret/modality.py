@@ -111,15 +111,34 @@ def _run_coalition(model, dataloader, coalition: frozenset[str]) -> tuple[np.nda
 
 
 def _score(model, dataloader, coalition: frozenset[str], metric_fn: MetricFn) -> float:
-    """Score one coalition, falling back for an empty coalition the model cannot run."""
+    """Score one coalition, falling back for an empty coalition the model cannot run.
+
+    A non-empty coalition producing a non-finite risk is a different situation: there
+    is no "no information" reading to fall back to the way there is for the empty
+    coalition, so it is logged and reported as NaN instead. Handing a contaminated
+    risk array straight to ``metric_fn`` would not raise or come back NaN either --
+    most ranking metrics (concordance included) treat NaN as neither greater nor
+    less than anything, which quietly drops the affected patients from every
+    comparison and returns a plausible-looking but wrong number.
+    """
     risk, targets = _run_coalition(model, dataloader, coalition)
-    if not coalition and not np.all(np.isfinite(risk)):
+    if not np.all(np.isfinite(risk)):
+        if not coalition:
+            logger.warning(
+                "the empty coalition (every modality marked absent) produced a non-finite prediction; "
+                "falling back to the chance-level score %.3f instead of crashing",
+                EMPTY_COALITION_FALLBACK_SCORE,
+            )
+            return EMPTY_COALITION_FALLBACK_SCORE
         logger.warning(
-            "the empty coalition (every modality marked absent) produced a non-finite prediction; "
-            "falling back to the chance-level score %.3f instead of crashing",
-            EMPTY_COALITION_FALLBACK_SCORE,
+            "coalition %s produced a non-finite risk for %d of %d patients; scoring it as NaN rather "
+            "than handing a contaminated risk array to the metric, which would silently drop those "
+            "patients from every comparison instead of raising",
+            sorted(coalition),
+            int(np.sum(~np.isfinite(risk))),
+            risk.size,
         )
-        return EMPTY_COALITION_FALLBACK_SCORE
+        return float("nan")
     durations, events = _target_arrays(targets)
     return float(metric_fn(risk, durations, events))
 

@@ -8,6 +8,7 @@ exactly rather than needing a model to converge on it.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
@@ -32,11 +33,19 @@ class _SurvivalStub:
     Risk is an exact linear function of each modality's value, gated by its
     ``present`` bit -- the same mechanism :class:`~kalecancer.model.embed.MultimodalFusion`
     uses, simplified so a modality's ground-truth contribution is known exactly.
+
+    ``nan_for_coalition``, when given, makes risk come back entirely non-finite for
+    the one coalition whose present/absent pattern matches it exactly (``frozenset()``
+    for the empty coalition) -- engineered directly, to test the EMPTY_COALITION_FALLBACK_SCORE
+    and non-empty-coalition warning paths without needing to reproduce the exact
+    numerical edge case (e.g. a ProductOfExpertsFusion with no prior) that triggers
+    either one for real.
     """
 
     weights: dict[str, float]
     task: PredictionTask = field(default_factory=SurvivalTask)
     training: bool = True
+    nan_for_coalition: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         self.embedders = dict.fromkeys(self.weights)
@@ -55,6 +64,15 @@ class _SurvivalStub:
             value = modality.squeeze(-1).double()
             present = batch.present[name].double()
             risk = risk + weight * value * present
+
+        if self.nan_for_coalition is not None:
+            matches = torch.ones(len(batch.patient_id), dtype=torch.bool)
+            for name in self.weights:
+                is_present = batch.present[name].bool()
+                should_be_present = name in self.nan_for_coalition
+                matches &= is_present == should_be_present
+            risk = torch.where(matches, torch.full_like(risk, float("nan")), risk)
+
         return SimpleNamespace(prediction=risk)
 
 
@@ -184,3 +202,31 @@ def test_a_classification_task_is_refused_explicitly() -> None:
 
     with pytest.raises(ValueError, match="survival"):
         modality_shapley(model, loader)
+
+
+def test_empty_coalition_fallback_is_used_when_non_finite(caplog: pytest.LogCaptureFixture) -> None:
+    model = _SurvivalStub({FEATURE: 1.0, NOISE: 0.3}, nan_for_coalition=frozenset())
+    loader = [make_survival_batch(seed=12)]
+
+    with caplog.at_level(logging.WARNING):
+        result = modality_shapley(model, loader)
+
+    assert any("empty coalition" in record.message and "non-finite" in record.message for record in caplog.records)
+    # The fallback is a finite constant, so it must not have poisoned the final values.
+    assert all(np.isfinite(value) for value in result.values())
+
+
+def test_non_empty_non_finite_coalition_is_warned_and_reported_as_nan(caplog: pytest.LogCaptureFixture) -> None:
+    model = _SurvivalStub({FEATURE: 1.0, NOISE: 0.0}, nan_for_coalition=frozenset({NOISE}))
+    loader = [make_survival_batch(seed=13)]
+
+    with caplog.at_level(logging.WARNING):
+        result = modality_shapley(model, loader)
+
+    assert any(
+        "produced a non-finite risk" in record.message and "empty coalition" not in record.message
+        for record in caplog.records
+    )
+    # No principled fallback for a non-empty coalition -- it propagates as NaN rather
+    # than silently through a metric that would just drop the affected patients.
+    assert any(np.isnan(value) for value in result.values())

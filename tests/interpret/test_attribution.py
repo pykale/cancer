@@ -243,3 +243,58 @@ def test_a_classification_task_is_refused_explicitly() -> None:
 
     with pytest.raises(ValueError, match="survival"):
         feature_shapley(model, loader, feature_names=list(FEATURES))
+
+
+def _numel(value: torch.Tensor | list[torch.Tensor]) -> int:
+    assert isinstance(value, torch.Tensor)
+    return value.numel()
+
+
+def test_caching_actually_releases_the_other_modalitys_raw_tensor() -> None:
+    """Not just "the batch stops carrying it": a tensor can be absent from the batch
+    and still be alive, retained by something else. This checks it is actually freed,
+    which is what matters for peak memory -- the thing a weakref, not the batch's own
+    dict, can prove."""
+    import gc
+    import weakref
+
+    from kalecancer.interpret.attribution import _cache_other_modalities, _materialise, _restore_modalities
+
+    model, _ = build_model()
+    loader = [make_tabular_batch(seed=14, n=30)]
+
+    with torch.no_grad():
+        full_batch = _materialise(loader)
+        original_other = full_batch.modalities["other"]
+        assert _numel(original_other) > 0
+        tracked = weakref.ref(original_other)
+
+        original_embedders = _cache_other_modalities(model, full_batch, "clinical")
+
+        # Drop every other reference before checking: the weakref itself does not
+        # keep the tensor alive, but this local variable otherwise would.
+        del original_other
+        gc.collect()
+
+        assert tracked() is None, "the raw tensor must actually be freed, not merely dropped from the batch"
+
+        _restore_modalities(model, original_embedders)
+
+
+def test_scoring_never_hands_predict_the_full_other_modality_tensor(monkeypatch: pytest.MonkeyPatch) -> None:
+    model, _ = build_model()
+    loader = [make_tabular_batch(seed=16, n=30)]
+
+    seen_sizes: list[int] = []
+    original_predict = model.predict
+
+    def spying_predict(batch):
+        seen_sizes.append(_numel(batch.modalities["other"]))
+        return original_predict(batch)
+
+    monkeypatch.setattr(model, "predict", spying_predict)
+
+    feature_shapley(model, loader, feature_names=list(FEATURES), metric=discrimination, n_samples=5, seed=0)
+
+    assert seen_sizes  # predict was actually called by the sampling loop
+    assert all(size == 0 for size in seen_sizes)

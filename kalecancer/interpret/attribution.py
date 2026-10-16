@@ -24,7 +24,11 @@ cached output (see :class:`_CachedOutput`); only the tabular embedder re-runs, o
 per perturbation. The whole evaluation set is also materialised into one batch before
 any of this starts, both so the embedder sees its whole split at once (as
 :attr:`~kalecancer.model.embed.tabicl.TabICLEmbedder.needs_full_batch` asks) and so a
-perturbation never has to re-touch the caller's ``dataloader``.
+perturbation never has to re-touch the caller's ``dataloader``. Once a modality's
+output is cached, its raw input (a whole cohort's patch bags, for a real run) is
+dropped outright rather than kept around -- see :func:`_cache_other_modalities` --
+because this module's internal batch is never read or returned afterwards, so there
+is nothing to keep it for.
 
 **Why "absent" means resampled, not zero.** Zero is a real, meaningful value for most
 clinical variables (a dose, a lab count, a one-hot level) -- it is not a stand-in for
@@ -194,24 +198,49 @@ def _materialise(dataloader) -> PatientBatch:
     )
 
 
-def _cache_other_modalities(model, batch: PatientBatch, tabular_name: str) -> dict[str, nn.Module]:
-    """Embed every non-tabular modality once and install a cached replay in its place.
+def _negligible_placeholder(value: ModalityValue) -> ModalityValue:
+    """A structurally-typed stand-in with negligible memory footprint.
 
-    Returns the original embedders, so they can be restored once scoring is done.
+    Safe only because :class:`_CachedOutput`'s ``forward`` ignores its argument
+    entirely -- this must never be substituted for a modality that is still read.
+    """
+    return torch.empty(0) if isinstance(value, torch.Tensor) else []
+
+
+def _cache_other_modalities(model, batch: PatientBatch, tabular_name: str) -> dict[str, nn.Module]:
+    """Embed every non-tabular modality once, install a cached replay in its place,
+    and drop its now-unneeded raw input from ``batch``.
+
+    Nothing downstream of a cached modality ever reads its raw input again --
+    :class:`_CachedOutput`'s ``forward`` ignores it -- so retaining it (a whole
+    cohort's patch bags, for a real run) across however many perturbations follow
+    wastes memory that can reach tens of gigabytes. The raw input is therefore
+    dropped outright, not replaced-and-kept-for-later: ``batch`` is a fresh object
+    :func:`_materialise` built, local to one call of
+    :func:`permutation_importance`/:func:`feature_shapley`, never returned and never
+    read again once the scoring loop below ends -- so there is nothing to restore it
+    for. **This consumes ``batch``**: do not reuse it for anything else afterwards.
+
+    Returns:
+        The original embedders, so :func:`_restore_modalities` can put them back.
+        Unlike ``batch``, ``model`` is the caller's own trainer, not a local, and
+        must come back exactly as it was.
     """
     device = model.device
-    originals: dict[str, nn.Module] = {}
+    original_embedders: dict[str, nn.Module] = {}
     for name, embedder in list(model.embedders.items()):
         if name == tabular_name:
             continue
-        output = embedder(_to_device(batch.modalities[name], device))
-        originals[name] = embedder
+        raw = batch.modalities[name]
+        output = embedder(_to_device(raw, device))
+        original_embedders[name] = embedder
         model.embedders[name] = _CachedOutput(output)
-    return originals
+        batch.modalities[name] = _negligible_placeholder(raw)
+    return original_embedders
 
 
-def _restore_modalities(model, originals: dict[str, nn.Module]) -> None:
-    for name, embedder in originals.items():
+def _restore_modalities(model, original_embedders: dict[str, nn.Module]) -> None:
+    for name, embedder in original_embedders.items():
         model.embedders[name] = embedder
 
 
@@ -304,7 +333,7 @@ def permutation_importance(
         with torch.no_grad():
             full_batch = _materialise(dataloader)
             tabular_x = _resolve_tabular_matrix(full_batch, tabular_name, names)
-            originals = _cache_other_modalities(model, full_batch, tabular_name)
+            original_embedders = _cache_other_modalities(model, full_batch, tabular_name)
             try:
                 durations, events = _target_arrays(full_batch.target)
                 n = tabular_x.shape[0]
@@ -327,7 +356,7 @@ def permutation_importance(
                         "baseline": baseline_score,
                     }
             finally:
-                _restore_modalities(model, originals)
+                _restore_modalities(model, original_embedders)
     finally:
         model.train(was_training)
     return results
@@ -414,7 +443,7 @@ def feature_shapley(
         with torch.no_grad():
             full_batch = _materialise(dataloader)
             tabular_x = _resolve_tabular_matrix(full_batch, tabular_name, names)
-            originals = _cache_other_modalities(model, full_batch, tabular_name)
+            original_embedders = _cache_other_modalities(model, full_batch, tabular_name)
             try:
                 durations, events = _target_arrays(full_batch.target)
                 n = tabular_x.shape[0]
@@ -449,7 +478,7 @@ def feature_shapley(
                         contributions[names[column]].append(score - previous_score)
                         previous_score = score
             finally:
-                _restore_modalities(model, originals)
+                _restore_modalities(model, original_embedders)
     finally:
         model.train(was_training)
 

@@ -17,6 +17,9 @@ hat -- see ``test_per_patient_contributions_are_not_cohort_shapley_values``.
 from __future__ import annotations
 
 import json
+import logging
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -72,6 +75,49 @@ class _ZeroEmbedder(nn.Module):
 
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         return torch.zeros(x.shape[0], self.out_dim)
+
+
+@dataclass
+class _NanCoalitionStub:
+    """A minimal model (not a real CohortTrainer) whose risk comes back entirely
+    non-finite for exactly one modality coalition -- the same ``nan_for_coalition``
+    trick as ``tests/interpret/test_modality.py``'s ``_SurvivalStub``, needed because
+    reproducing the real degenerate case (e.g. a ProductOfExpertsFusion with no prior)
+    numerically is not reliable to engineer in a unit test.
+    """
+
+    weights: dict[str, float]
+    task: SurvivalTask = field(default_factory=SurvivalTask)
+    training: bool = True
+    nan_for_coalition: frozenset[str] | None = None
+
+    def __post_init__(self) -> None:
+        self.embedders = dict.fromkeys(self.weights)
+
+    def eval(self) -> None:
+        self.training = False
+
+    def train(self, mode: bool = True) -> None:
+        self.training = mode
+
+    def predict(self, batch: PatientBatch):
+        risk = torch.zeros(len(batch.patient_id), dtype=torch.float64)
+        for name, weight in self.weights.items():
+            modality = batch.modalities[name]
+            assert isinstance(modality, torch.Tensor)
+            value = modality.squeeze(-1).double()
+            present = batch.present[name].double()
+            risk = risk + weight * value * present
+
+        if self.nan_for_coalition is not None:
+            matches = torch.ones(len(batch.patient_id), dtype=torch.bool)
+            for name in self.weights:
+                is_present = batch.present[name].bool()
+                should_be_present = name in self.nan_for_coalition
+                matches &= is_present == should_be_present
+            risk = torch.where(matches, torch.full_like(risk, float("nan")), risk)
+
+        return SimpleNamespace(prediction=risk)
 
 
 class _Loader:
@@ -247,6 +293,35 @@ def test_patient_without_a_bag_modality_gets_none_top_patches() -> None:
 
     assert reports[0].top_patches is not None
     assert reports[1].top_patches is None
+    # Attention WAS available in this call -- p1's None is "this patient individually
+    # has no bag", not "nothing here could produce attention at all".
+    assert reports[0].metadata["top_patches_unavailable_reason"] is None
+    assert reports[1].metadata["top_patches_unavailable_reason"] is None
+
+
+def test_top_patches_reason_when_no_bag_modality_on_the_model() -> None:
+    model = build_tabular_model()
+    loader = _Loader([make_tabular_batch(seed=23)], feature_names={"clinical": list(FEATURES)})
+
+    reports = patient_report(model, loader, ["000", "001"])
+
+    for report in reports:
+        assert report.top_patches is None
+        assert report.metadata["top_patches_unavailable_reason"]
+        assert "bag-pooling modality" in report.metadata["top_patches_unavailable_reason"]
+
+
+def test_top_patches_reason_when_batch_metadata_is_missing() -> None:
+    model = build_bag_model()
+    batch = make_bag_batch()
+    batch.metadata = {}  # no coords/slide_index/slide_ids: attention cannot be placed
+
+    reports = patient_report(model, [batch], ["p0", "p1"])
+
+    for report in reports:
+        assert report.top_patches is None
+        assert report.metadata["top_patches_unavailable_reason"]
+        assert "metadata" in report.metadata["top_patches_unavailable_reason"]
 
 
 def test_save_reports_round_trips(tmp_path) -> None:
@@ -289,3 +364,84 @@ def test_training_mode_is_restored_after_patient_report() -> None:
     patient_report(model, loader, ["000"])
 
     assert model.training is True
+
+
+def test_empty_modality_coalition_fallback_is_used_and_recorded(caplog: pytest.LogCaptureFixture) -> None:
+    n = 6
+    batch = PatientBatch(
+        patient_id=[f"{i:03d}" for i in range(n)],
+        modalities={
+            "a": torch.arange(n, dtype=torch.float32).unsqueeze(-1),
+            "b": torch.arange(n, dtype=torch.float32).unsqueeze(-1) * 2,
+        },
+        present={"a": torch.ones(n, dtype=torch.bool), "b": torch.ones(n, dtype=torch.bool)},
+        target={"time": torch.linspace(100.0, 500.0, n), "event": torch.ones(n, dtype=torch.bool)},
+    )
+    model = _NanCoalitionStub({"a": 1.0, "b": 0.3}, nan_for_coalition=frozenset())
+
+    with caplog.at_level(logging.WARNING):
+        reports = patient_report(model, [batch], batch.patient_id[:2])
+
+    assert any("empty" in record.message and "non-finite" in record.message for record in caplog.records)
+    assert all(report.metadata["empty_modality_coalition_fallback_used"] is True for report in reports)
+
+
+def _numel(value: torch.Tensor | list[torch.Tensor]) -> int:
+    assert isinstance(value, torch.Tensor)
+    return value.numel()
+
+
+def test_caching_drops_the_other_modalitys_raw_tensor_and_restores_it() -> None:
+    from kalecancer.interpret.report import _cache_other_modalities, _materialise, _restore_modalities
+
+    model = build_tabular_model()
+    loader = _Loader([make_tabular_batch(seed=21, n=30)])
+
+    full_batch = _materialise(loader)
+    original_quiet = full_batch.modalities["quiet"]
+    assert _numel(original_quiet) > 0
+
+    original_embedders, original_modalities = _cache_other_modalities(model, full_batch, "clinical")
+
+    assert full_batch.modalities["quiet"] is not original_quiet
+    assert _numel(full_batch.modalities["quiet"]) == 0
+    assert original_modalities["quiet"] is original_quiet
+
+    _restore_modalities(model, full_batch, original_embedders, original_modalities)
+
+    assert full_batch.modalities["quiet"] is original_quiet
+
+
+def test_feature_contributions_never_hand_predict_the_full_other_modality_tensor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kalecancer.interpret.report import _feature_contributions, _materialise, _subset_batch
+
+    model = build_tabular_model()
+    loader = _Loader([make_tabular_batch(seed=22, n=30)])
+    full_batch = _materialise(loader)
+    requested_batch = _subset_batch(full_batch, [0, 1, 2])
+
+    seen_sizes: list[int] = []
+    original_predict = model.predict
+
+    def spying_predict(batch):
+        seen_sizes.append(_numel(batch.modalities["quiet"]))
+        return original_predict(batch)
+
+    monkeypatch.setattr(model, "predict", spying_predict)
+
+    tabular_pool = full_batch.modalities["clinical"]
+    assert isinstance(tabular_pool, torch.Tensor)
+    _feature_contributions(
+        model,
+        tabular_pool,
+        requested_batch,
+        "clinical",
+        list(FEATURES),
+        n_samples=5,
+        seed=0,
+    )
+
+    assert seen_sizes
+    assert all(size == 0 for size in seen_sizes)
