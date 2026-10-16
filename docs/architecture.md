@@ -53,7 +53,7 @@ flowchart LR
 | `prepdata` | `TableTransform` and `ColumnGroup`: sklearn transforms for table modalities |
 | `model` | Encoders (`MLP`, `ABMIL`, `TabICLEncoder`), `EncoderList`, the `FittedEncoder` and `AttentionEncoder` base classes, fusion methods, heads, the four models, and `BreslowBaseline` |
 | `pipeline` | `Pipeline`, `EarlyStopping`, Lightning training, `load_pipeline` and `dump_config` |
-| `evaluate` | `HarrellC`, `UnoC`, `TimeDependentAUC`, `IntegratedBrier`, `AUROC`, `BalancedAccuracy`, `cross_validate` |
+| `evaluate` | `HarrellC`, `UnoC`, `TimeDependentAUC`, `IntegratedBrier`, `AUROC`, `BalancedAccuracy`, `bootstrap_ci`, `cross_validate` |
 | `interpret` | `attention` |
 
 ---

@@ -68,6 +68,8 @@ def clinical_transform() -> ColumnTransformer:
 
 
 def build_pipeline() -> Pipeline:
+    # Pipeline(random_state=...) seeds training, but the initial weights are drawn here
+    torch.manual_seed(0)
     model = IntermediateFusion(
         encoders={
             "clinical": [

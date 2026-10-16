@@ -1,7 +1,8 @@
 """HANCOCK: clinical table (TabICL) + primary-tumour UNI patch features (attention MIL), intermediate fusion, Cox.
 
 Trains on the chosen split and reports test concordance. With about 40 test events on the "in" split, expect
-Harrell's C of roughly 0.60-0.80.
+Harrell's C of roughly 0.60-0.80. A clinical-only model is trained on the same patients, and a paired bootstrap of the
+difference in Harrell's C shows whether the slides add anything beyond the clinical table.
 
 For a walkthrough with output already captured, see survival_intermediate.ipynb.
 
@@ -19,9 +20,9 @@ from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
-from kalecancer.evaluate import HarrellC, UnoC
+from kalecancer.evaluate import EvalContext, HarrellC, UnoC, bootstrap_ci
 from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent, Tabular
-from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, TabICLEncoder
+from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, TabICLEncoder, Unimodal
 from kalecancer.pipeline import EarlyStopping, Pipeline
 
 DATA = Path(__file__).resolve().parents[2] / "data" / "hancock"
@@ -84,19 +85,25 @@ def clinical_transform() -> ColumnTransformer:
     )
 
 
-def build_pipeline() -> Pipeline:
-    model = IntermediateFusion(
+def clinical_encoders() -> list[torch.nn.Module]:
+    return [
+        TabICLEncoder(
+            checkpoint="tabicl-classifier-v2-20260212.ckpt",
+            output="row",
+            trainable=[],
+            context_folds=5,
+            random_state=0,
+        ),
+        torch.nn.Linear(512, 64),
+    ]
+
+
+def fused_model() -> IntermediateFusion:
+    # Pipeline(random_state=...) seeds training, but the initial weights are drawn here
+    torch.manual_seed(0)
+    return IntermediateFusion(
         encoders={
-            "clinical": [
-                TabICLEncoder(
-                    checkpoint="tabicl-classifier-v2-20260212.ckpt",
-                    output="row",
-                    trainable=[],
-                    context_folds=5,
-                    random_state=0,
-                ),
-                torch.nn.Linear(512, 64),
-            ],
+            "clinical": clinical_encoders(),
             "wsi": [
                 ABMIL(in_dim=1024, hidden_dim=256, attention_dim=128, dropout=0.25),
                 torch.nn.Linear(256, 64),
@@ -105,6 +112,16 @@ def build_pipeline() -> Pipeline:
         fusion=Concat(),
         head=CoxHead(in_dim=128, ties="efron"),
     )
+
+
+def clinical_model() -> Unimodal:
+    """The baseline: the same clinical encoders and head, without the slides."""
+    # the same seed as fused_model, so the clinical encoders of both models start from the same weights
+    torch.manual_seed(0)
+    return Unimodal("clinical", encoders=clinical_encoders(), head=CoxHead(in_dim=64, ties="efron"))
+
+
+def build_pipeline(model: torch.nn.Module) -> Pipeline:
     return Pipeline(
         model=model,
         transforms={"clinical": clinical_transform()},
@@ -124,10 +141,29 @@ def main() -> None:
     data = build_dataset()
     print(data.summary())
     train, test = official_split(data, SPLIT_NAME)
-    pipe = build_pipeline().fit(train)
+    pipe = build_pipeline(fused_model()).fit(train)
     print(pipe.history_)
     print(pipe.fit_report_)
     print(pipe.evaluate(test, metrics={"harrell_c": HarrellC(), "uno_c_5y": UnoC(tau=1825.0)}))
+
+    # The same split, validation carve and seed, so the two models differ only in the slides.
+    baseline = build_pipeline(clinical_model()).fit(train)
+    prediction, baseline_prediction = pipe.predict(test), baseline.predict(test)
+    assert test.target is not None
+    target = test.target.frame.loc[prediction.index]
+    context = EvalContext(train_target=pipe.train_target_, classes=None)
+    baseline_context = EvalContext(train_target=baseline.train_target_, classes=None)
+    print("fused Harrell's C, 95% CI:        ", bootstrap_ci(HarrellC(), prediction, target, context))
+    print(
+        "clinical-only Harrell's C, 95% CI:",
+        bootstrap_ci(HarrellC(), baseline_prediction, target, baseline_context),
+    )
+    print(
+        "gain from the slides, 95% CI:     ",
+        bootstrap_ci(
+            HarrellC(), prediction, target, context, baseline=baseline_prediction, baseline_context=baseline_context
+        ),
+    )
 
 
 if __name__ == "__main__":

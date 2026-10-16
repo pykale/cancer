@@ -25,7 +25,7 @@ Cancer prediction is rarely single-modality. A prognosis draws on a whole-slide 
 - `loaddata` loads tables and patch features keyed by patient id, with survival and classification targets and patient-level splitting
 - `prepdata` preprocesses clinical tables
 - `model` encodes each modality, fuses them (unimodal, early, intermediate or late) and predicts with a survival or classification head
-- `evaluate` computes survival and classification metrics, and cross-validates by patient
+- `evaluate` computes survival and classification metrics with bootstrap confidence intervals, and cross-validates by patient
 - `interpret` explains predictions, starting with attention weights over patches
 - `pipeline` runs the workflow: one `Pipeline` for every model and target, built in Python or from YAML
 

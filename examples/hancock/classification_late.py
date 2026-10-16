@@ -77,6 +77,8 @@ def clinical_transform() -> ColumnTransformer:
 
 
 def build_model() -> LateFusion:
+    # Pipeline(random_state=...) seeds training, but the initial weights are drawn here
+    torch.manual_seed(0)
     return LateFusion(
         branches={
             "clinical": Unimodal(

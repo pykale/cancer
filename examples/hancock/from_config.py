@@ -7,6 +7,7 @@ built in Python.
 from pathlib import Path
 
 import pandas as pd
+import torch
 
 from kalecancer.evaluate import HarrellC
 from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent, Tabular
@@ -58,6 +59,8 @@ def build_dataset() -> MultimodalDataset:
 
 def main() -> None:
     train, test = official_split(build_dataset(), SPLIT_NAME)
+    # Pipeline(random_state=...) seeds training, but load_pipeline builds the model and draws its initial weights
+    torch.manual_seed(0)
     pipe = load_pipeline(CONFIG).fit(train)
     print(pipe.evaluate(test, metrics={"harrell_c": HarrellC()}))
 

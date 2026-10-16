@@ -21,7 +21,7 @@ import pandas as pd
 import torch
 from sklearn.preprocessing import StandardScaler
 
-from kalecancer.evaluate import HarrellC
+from kalecancer.evaluate import EvalContext, HarrellC, bootstrap_ci
 from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent, train_test_split, Tabular
 from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion
 from kalecancer.pipeline import Pipeline
@@ -74,8 +74,10 @@ data = MultimodalDataset(
 print(data.summary())
 train, test = train_test_split(data, test_size=0.25, stratify=True, random_state=0)
 
-# 2. Model: stages for each modality, a fusion method, and a prediction head.
+# 2. Model: stages for each modality, a fusion method, and a prediction head. Pipeline(random_state=...) seeds
+# training, but the initial weights are drawn here, so seed them too.
 
+torch.manual_seed(0)
 model = IntermediateFusion(
     encoders={
         "clinical": [torch.nn.Linear(2, 8)],
@@ -110,6 +112,14 @@ pipeline = Pipeline(
 
 pipeline.fit(train)
 print(pipeline.evaluate(test, metrics={"harrell_c": HarrellC()}))
-print(pipeline.predict(test).head())
+prediction = pipeline.predict(test)
+print(prediction.head())
+
+# 5. Uncertainty: a 95% bootstrap interval of Harrell's C over the test patients.
+
+assert test.target is not None
+target = test.target.frame.loc[prediction.index]
+context = EvalContext(train_target=pipeline.train_target_, classes=None)
+print("Harrell's C, 95% CI:", bootstrap_ci(HarrellC(), prediction, target, context))
 
 workdir.cleanup()
