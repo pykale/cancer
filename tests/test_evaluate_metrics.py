@@ -4,10 +4,24 @@ import numpy as np
 import pandas as pd
 import pytest
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
-from sksurv.metrics import concordance_index_censored, concordance_index_ipcw, cumulative_dynamic_auc
+from sksurv.metrics import (
+    concordance_index_censored,
+    concordance_index_ipcw,
+    cumulative_dynamic_auc,
+    integrated_brier_score,
+)
 from sksurv.util import Surv
 
-from kalecancer.evaluate import AUROC, BalancedAccuracy, EvalContext, HarrellC, TimeDependentAUC, UnoC
+from kalecancer.evaluate import (
+    AUROC,
+    BalancedAccuracy,
+    EvalContext,
+    HarrellC,
+    IntegratedBrier,
+    TimeDependentAUC,
+    UnoC,
+)
+from kalecancer.model import BreslowBaseline
 
 
 def _ids(prefix: str, n: int) -> pd.Index:
@@ -134,6 +148,7 @@ def test_survival_metrics_emit_no_warnings(survival):
         warnings.simplefilter("error")
         for metric in (HarrellC(), UnoC(45.5), TimeDependentAUC(20.0)):
             metric(prediction, test, context)
+        IntegratedBrier()(_with_survival(context.train_target, prediction, [5.0, 20.0]), test, context)
 
 
 @pytest.mark.parametrize("n_classes", [2, 3])
@@ -230,3 +245,59 @@ def test_classification_guards(survival):
         AUROC("lost")(prediction, target.assign(label="alive"), context)
     with pytest.raises(ValueError, match="1 target labels are not in classes"):
         AUROC("lost")(prediction, target.assign(label=["dead"] + target["label"].tolist()[1:]), context)
+
+
+def _with_survival(train, prediction, times):
+    """``prediction`` with ``survival[<time>]`` columns from a baseline fitted on ``train``.
+
+    The training log-hazards follow the fixture's model for the test ones, so the curves are roughly calibrated.
+    """
+    log_hazard = -train["time"].to_numpy() / 20 + np.random.default_rng(3).normal(0, 1, len(train))
+    baseline = BreslowBaseline().fit(log_hazard, train["time"], train["event"].to_numpy())
+    survival = baseline.survival(prediction["log_hazard"], times)
+    columns = [f"survival[{float(t)!r}]" for t in times]
+    return pd.concat([prediction, pd.DataFrame(survival, index=prediction.index, columns=columns)], axis=1)
+
+
+@pytest.mark.parametrize(
+    "times", [[5.0, 20.0, 45.5], [1.0, 3.3, 30.1, 58.0], list(np.linspace(2.0, 55.0, 30))], ids=["3", "edges", "30"]
+)
+def test_integrated_brier_matches_sksurv(survival, times):
+    train, test, prediction, context = survival
+    prediction = _with_survival(train, prediction, times)
+    estimate = prediction[[f"survival[{float(t)!r}]" for t in times]].to_numpy()
+    expected = integrated_brier_score(_surv(train), _surv(test), estimate, times)
+    assert IntegratedBrier()(prediction, test, context) == pytest.approx(expected, abs=1e-6)
+
+
+def test_integrated_brier_is_lower_for_better_calibration(survival):
+    train, test, prediction, context = survival
+    times = [5.0, 20.0, 45.5]
+    good = _with_survival(train, prediction, times)
+    columns = [c for c in good.columns if c.startswith("survival[")]
+    flat = good.copy()
+    flat[columns] = 0.5
+    assert not IntegratedBrier.higher_is_better
+    assert IntegratedBrier()(good, test, context) < IntegratedBrier()(flat, test, context)
+    # column order and row order do not matter
+    shuffled = good[good.columns[::-1]].sample(frac=1.0, random_state=0)
+    assert IntegratedBrier()(shuffled, test, context) == IntegratedBrier()(good, test, context)
+
+
+def test_integrated_brier_guards(survival):
+    train, test, prediction, context = survival
+    with pytest.raises(ValueError, match=r"at least two 'survival\[<time>\]' columns"):
+        IntegratedBrier()(_with_survival(train, prediction, [20.0]), test, context)
+    first, last = float(test["time"].min()), float(test["time"].max())
+    with pytest.raises(ValueError, match="within the follow-up of the target"):
+        IntegratedBrier()(_with_survival(train, prediction, [first - 0.5, 20.0]), test, context)
+    with pytest.raises(ValueError, match="within the follow-up of the target"):
+        IntegratedBrier()(_with_survival(train, prediction, [20.0, last]), test, context)
+    late = test.copy()
+    late.loc[late.index[3], ["time", "event"]] = [90.0, False]
+    with pytest.raises(ValueError, match=r"below the last training time 80\.0"):
+        IntegratedBrier()(_with_survival(train, prediction, [20.0, 85.0]), late, context)
+    undefined = _with_survival(train, prediction, [5.0, 20.0])
+    undefined.iloc[:2, 1] = np.nan
+    with pytest.raises(ValueError, match="2 of 150 predictions are NaN"):
+        IntegratedBrier()(undefined, test, context)

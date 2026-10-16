@@ -9,7 +9,7 @@ from __future__ import annotations
 import copy
 import tempfile
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal
 
 import lightning.pytorch as L
@@ -21,9 +21,10 @@ from sklearn.model_selection import BaseShuffleSplit
 from torch import nn
 from torch.utils.data import DataLoader
 
-from kalecancer.evaluate.metrics import EvalContext, Metric
+from kalecancer.evaluate.metrics import EvalContext, IntegratedBrier, Metric
 from kalecancer.loaddata.dataset import MultimodalDataset
 from kalecancer.loaddata.targets import Classification
+from kalecancer.model.baseline import BreslowBaseline
 from kalecancer.model.encode.encoder_list import EncoderList
 from kalecancer.model.models import EarlyFusion, IntermediateFusion, LateFusion, Unimodal
 from kalecancer.pipeline.training import (
@@ -101,6 +102,11 @@ class EarlyStopping:
     def __init__(self, metric: Metric | Literal["loss"], patience: int, restore_best: bool, min_delta: float = 0.0):
         if metric != "loss" and not isinstance(metric, Metric):
             raise TypeError(f"metric must be a kalecancer Metric or 'loss', got {metric!r}")
+        if isinstance(metric, IntegratedBrier):
+            raise ValueError(
+                "IntegratedBrier cannot be monitored: it needs survival curves, and the baseline hazard that gives them "
+                "is fitted only once training ends"
+            )
         if patience < 1 or min_delta < 0:
             raise ValueError(f"patience must be >= 1 and min_delta >= 0, got {patience} and {min_delta}")
         self.metric = metric
@@ -150,13 +156,17 @@ class Pipeline(BaseEstimator):
         target_: The target of the dataset given to ``fit``.
         train_target_: The target frame of the training patients. Metrics such as ``UnoC`` estimate censoring
             from it.
+        baseline_: For a model that predicts a ``log_hazard``, the ``BreslowBaseline`` fitted on the log-hazards
+            of every patient used in fit (training and validation) once training ends; it gives the survival columns.
+            ``None`` for other models.
         history_: One row per epoch, indexed by ``epoch``, with ``train_loss``, ``val_loss`` (with validation),
             ``val_metric`` (when early stopping on a metric), ``optimizer_steps`` (a running total) and
             ``skipped_batches``.
         fit_report_: A summary of the fit: ``n_train``, ``n_val``, the target's counts (e.g. ``events``),
             ``epochs_run``, ``best_epoch`` and ``best_score`` (``None`` without early stopping), the total
             ``optimizer_steps`` and ``skipped_batches``, and ``non_finite_inputs`` (for each modality, how many
-            patients had NaN or infinite values in their input).
+            patients had NaN or infinite values in their input), and ``baseline_events`` (the events the baseline
+            was fitted on) when there is a baseline.
     """
 
     def __init__(
@@ -199,7 +209,9 @@ class Pipeline(BaseEstimator):
 
         In order, it splits off the validation patients (when ``validation`` is set), fits the transforms and any
         ``FittedEncoder`` on the training patients, runs the model once on a few of them so that errors show up
-        before training starts (the dry run), and trains with Lightning. The results are stored in the attributes
+        before training starts (the dry run), and trains with Lightning. For a model that predicts a ``log_hazard``,
+        it then fits the Breslow baseline hazard on the log-hazards that ``predict`` gives the training and validation
+        patients, so that the baseline matches the final (restored) weights and the fused prediction. The results are stored in the attributes
         that end in ``_``.
 
         It warns with a ``UserWarning`` if some training batches were skipped because their loss had no signal, and
@@ -265,6 +277,7 @@ class Pipeline(BaseEstimator):
         self.val_ids_ = val_ids
         self.target_ = data.target
         self.train_target_ = data.target.frame.loc[train_ids]
+        self.baseline_, baseline_events = self._fit_baseline(data)
         self.history_ = pd.DataFrame(module.history).set_index("epoch") if module.history else pd.DataFrame()
         skipped = int(sum(row["skipped_batches"] for row in module.history))
         self.fit_report_ = {
@@ -277,6 +290,7 @@ class Pipeline(BaseEstimator):
             "optimizer_steps": module.optimizer_steps,
             "skipped_batches": skipped,
             "non_finite_inputs": {name: len(ids) for name, ids in module.non_finite.items()},
+            **({"baseline_events": baseline_events} if self.baseline_ is not None else {}),
         }
         if skipped:
             warnings.warn(
@@ -325,6 +339,22 @@ class Pipeline(BaseEstimator):
                 "would start from weights trained on other patients"
             )
         self.model.check(data)
+
+    def _fit_baseline(self, data: MultimodalDataset) -> tuple[BreslowBaseline | None, int]:
+        """The Breslow baseline of a ``log_hazard`` model, and its number of events; ``(None, 0)`` for other models.
+
+        It is fitted on the fused prediction for every patient used in fit, through ``predict``'s own path, so
+        fold-local state such as TabICL's in-context embedding of training rows is the same as at prediction.
+        """
+        assert data.target is not None, "fit checks that data has a target"
+        if self.model_.columns(self.target_) != ["log_hazard"]:
+            return None, 0
+        # fit has already warned about non-finite inputs of these patients
+        log_hazard = self._predict(data.subset(self.train_ids_ + self.val_ids_), None, stacklevel=None)["log_hazard"]
+        log_hazard = log_hazard[log_hazard.notna()]
+        outcome = data.target.frame.loc[log_hazard.index]
+        baseline = BreslowBaseline().fit(log_hazard.to_numpy(), outcome["time"].to_numpy(), outcome["event"].to_numpy())
+        return baseline, int(outcome["event"].sum())
 
     def _split_validation(self, data: MultimodalDataset) -> tuple[list[str], list[str]]:
         if self.validation is None:
@@ -395,25 +425,68 @@ class Pipeline(BaseEstimator):
         self.model_.check(data)
         return data.with_transforms(self.transforms_)
 
-    def _infer(self, data: MultimodalDataset, step: Callable[[nn.Module, dict], Any]) -> list:
+    def _infer(
+        self, data: MultimodalDataset, step: Callable[[nn.Module, dict], Any], stacklevel: int | None = 3
+    ) -> list:
+        """Run ``step`` on each batch, and warn about non-finite inputs at ``stacklevel`` (``None`` does not warn)."""
         module = _InferenceModule(self.model_, step)
         with _lightning_session(), tempfile.TemporaryDirectory() as root:
             results = self._trainer([], root, max_epochs=1).predict(module, self._loader(data, shuffle=False))
         self.model_.eval().cpu()
         # _infer serves predict and run_encoders, so encode and attention export warn too
-        _warn_non_finite(module.non_finite, data, stacklevel=3)
+        if stacklevel is not None:
+            _warn_non_finite(module.non_finite, data, stacklevel=stacklevel)
         return results
 
-    def predict(self, data: MultimodalDataset, branch: str | None = None) -> pd.DataFrame:
+    def predict(
+        self, data: MultimodalDataset, branch: str | None = None, survival_times: Sequence[float] | None = None
+    ) -> pd.DataFrame:
         """Predictions indexed by patient id, with NaN for patients without a prediction.
 
-        ``branch`` selects one branch of a ``LateFusion`` model.
+        Args:
+            data: The patients to predict.
+            branch: One branch of a ``LateFusion`` model to predict with, instead of the fused model.
+            survival_times: Increasing times >= 0 at which to add the survival probability of a ``log_hazard``
+                prediction, from ``baseline_``, as ``survival[<time>]`` columns (e.g. for ``IntegratedBrier``). Not
+                with ``branch``, because the baseline belongs to the fused log-hazard.
         """
+        times = self._check_survival_times(survival_times, branch)
+        frame = self._predict(data, branch, stacklevel=3)
+        if times is None:
+            return frame
+        assert self.baseline_ is not None, "_check_survival_times requires a baseline"
+        survival = pd.DataFrame(
+            self.baseline_.survival(frame["log_hazard"].to_numpy(), times),
+            index=frame.index,
+            columns=[f"survival[{t!r}]" for t in times],
+        )
+        return pd.concat([frame, survival], axis=1)
+
+    def _check_survival_times(self, survival_times: Sequence[float] | None, branch: str | None) -> list[float] | None:
+        self._require_fitted()
+        if survival_times is None:
+            return None
+        if self.baseline_ is None:
+            raise ValueError(
+                f"survival_times needs a model that predicts a log_hazard (a CoxHead); this one predicts "
+                f"{self.model_.columns(self.target_)}"
+            )
+        if branch is not None:
+            raise ValueError("survival_times cannot be used with branch: the baseline belongs to the fused log-hazard")
+        times = np.asarray(survival_times, dtype=np.float64)
+        if times.ndim != 1 or not len(times) or not np.isfinite(times).all() or (times < 0).any():
+            raise ValueError(f"survival_times must be finite times >= 0, got {survival_times!r}")
+        if (np.diff(times) <= 0).any():
+            raise ValueError(f"survival_times must be strictly increasing, got {survival_times!r}")
+        return times.tolist()
+
+    def _predict(self, data: MultimodalDataset, branch: str | None, stacklevel: int | None) -> pd.DataFrame:
         view = self.transformed(data)
         if branch is not None and (not isinstance(self.model_, LateFusion) or branch not in self.model_.branches):
             names = list(self.model_.branches) if isinstance(self.model_, LateFusion) else []
             raise ValueError(f"branch={branch!r} needs a LateFusion model with that branch; branches: {names}")
-        results = self._infer(view, lambda model, batch: (batch["ids"], _to_cpu(model(batch))))
+        step = lambda model, batch: (batch["ids"], _to_cpu(model(batch)))  # noqa: E731
+        results = self._infer(view, step, None if stacklevel is None else stacklevel + 1)
         ids = [pid for batch_ids, _ in results for pid in batch_ids]
         output = _concatenate([out for _, out in results])
         if branch is None:
@@ -434,8 +507,12 @@ class Pipeline(BaseEstimator):
         metrics: Mapping[str, Metric],
         branch: str | None = None,
         allow_seen: bool = False,
+        survival_times: Sequence[float] | None = None,
     ) -> pd.Series:
-        """Score predictions for ``data``. Patients used in fit (training or validation) raise unless ``allow_seen``."""
+        """Score predictions for ``data``. Patients used in fit (training or validation) raise unless ``allow_seen``.
+
+        ``branch`` and ``survival_times`` are passed to ``predict``.
+        """
         self._require_fitted()
         if data.target is None:
             raise ValueError("evaluate needs a dataset with a target")
@@ -447,7 +524,7 @@ class Pipeline(BaseEstimator):
                 f"{len(seen)} patients were used to fit this pipeline (e.g. {seen[:5]}); evaluate on held-out "
                 "patients, or pass allow_seen=True"
             )
-        prediction = self.predict(data, branch=branch)
+        prediction = self.predict(data, branch=branch, survival_times=survival_times)
         eval_target = data.target.frame.loc[prediction.index]
         context = EvalContext(
             train_target=self.train_target_,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,13 +35,15 @@ def cross_validate(
     cv: Any,
     metrics: Mapping[str, Metric],
     return_estimators: bool = False,
+    survival_times: Sequence[float] | None = None,
 ) -> CVResult:
     """Fit a clone of ``estimator`` on each training fold of ``cv`` and score it on the held-out patients.
 
     ``estimator`` is a ``Pipeline``. ``cv`` is any sklearn splitter; it receives the patient ids and the target's
     strata (events or labels) as ``y``. Every fold refits everything learned from data: validation carve,
     transforms, fitted encoders and weights. Metrics are reported per fold; they are not pooled over out-of-fold
-    predictions, whose scales differ between folds (Cox log-hazards have an arbitrary offset).
+    predictions, whose scales differ between folds (Cox log-hazards have an arbitrary offset). ``survival_times`` is
+    passed to each fold's ``predict``, for metrics such as ``IntegratedBrier``.
     """
     if data.target is None:
         raise ValueError("cross_validate needs a dataset with a target")
@@ -56,7 +58,7 @@ def cross_validate(
         leaked = (set(fitted.train_ids_) | set(fitted.val_ids_)) & set(test_ids)
         if leaked:
             raise AssertionError(f"fold {fold}: {len(leaked)} test patients were used in fit")
-        prediction = fitted.predict(data.subset(test_ids))
+        prediction = fitted.predict(data.subset(test_ids), survival_times=survival_times)
         target = data.target.frame.loc[prediction.index]
         context = EvalContext(
             train_target=fitted.train_target_,

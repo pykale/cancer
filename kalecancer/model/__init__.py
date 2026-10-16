@@ -1,5 +1,6 @@
 """Model: encoders, fusion methods, prediction heads, and the fusion models that wire them together."""
 
+from kalecancer.model.baseline import BreslowBaseline
 from kalecancer.model.encode.base_encoders import AttentionEncoder, FittedEncoder
 from kalecancer.model.encode.encoder_list import EncoderList
 from kalecancer.model.encode.encoders import ABMIL, MLP
@@ -11,6 +12,7 @@ __all__ = [
     "ABMIL",
     "MLP",
     "AttentionEncoder",
+    "BreslowBaseline",
     "ClassificationHead",
     "Concat",
     "EncoderList",

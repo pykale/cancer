@@ -8,15 +8,16 @@ import torch
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.model_selection import StratifiedShuffleSplit
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 from torch import nn
 
-from kalecancer.evaluate import AUROC, BalancedAccuracy, HarrellC
+from kalecancer.evaluate import AUROC, BalancedAccuracy, HarrellC, IntegratedBrier, cross_validate
 from kalecancer.interpret import attention
 from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
 from kalecancer.model import (
     ABMIL,
+    BreslowBaseline,
     ClassificationHead,
     Concat,
     CoxHead,
@@ -391,6 +392,101 @@ def test_clean_inputs_raise_no_warning_and_the_warning_can_be_silenced(cohort):
     train = split(dataset(cohort))[0]
     _, caught = fit_recording_non_finite_warnings(pipeline(nan_handling_model()), train, silence=True)
     assert not caught
+
+
+# ---------------------------------------------------------------- baseline hazard and survival curves
+
+
+def inner_times(data, quantiles=(0.2, 0.4, 0.6)):
+    """Times inside the follow-up of ``data``'s patients, where survival metrics are defined."""
+    return [float(t) for t in np.quantile(data.target.frame.loc[data.ids, "time"], quantiles)]
+
+
+def test_the_baseline_is_fitted_on_the_fused_log_hazards_of_every_patient_used_in_fit(cohort):
+    train, test = split(dataset(cohort))
+    pipe = pipeline(validation=StratifiedShuffleSplit(n_splits=1, test_size=0.3, random_state=0)).fit(train)
+    assert pipe.val_ids_
+    seen = pipe.predict(train)
+    outcome = train.target.frame.loc[seen.index]
+    expected = BreslowBaseline().fit(seen["log_hazard"], outcome["time"], outcome["event"].to_numpy())
+    np.testing.assert_allclose(pipe.baseline_.cumulative_hazard_, expected.cumulative_hazard_, rtol=1e-6)
+    np.testing.assert_array_equal(pipe.baseline_.event_times_, expected.event_times_)
+    assert pipe.fit_report_["baseline_events"] == train.target.counts(train.ids)["events"]
+
+
+def test_survival_times_add_survival_columns_at_prediction(cohort):
+    train, test = split(dataset(cohort))
+    pipe = pipeline().fit(train)
+    times = inner_times(test)
+    plain = pipe.predict(test)
+    prediction = pipe.predict(test, survival_times=times)
+    columns = [f"survival[{t!r}]" for t in times]
+    assert list(plain.columns) == ["log_hazard"] and list(prediction.columns) == ["log_hazard", *columns]
+    pd.testing.assert_frame_equal(prediction[["log_hazard"]], plain)
+    np.testing.assert_allclose(
+        prediction[columns].to_numpy(), pipe.baseline_.survival(prediction["log_hazard"], times), rtol=1e-12
+    )
+    assert (np.diff(prediction[columns].to_numpy(), axis=1) <= 0).all()
+
+    with pytest.raises(ValueError, match=r"at least two 'survival\[<time>\]' columns"):
+        pipe.evaluate(test, metrics={"ibs": IntegratedBrier()})
+    # the same fitted pipeline scores the Brier score once given times, without refitting
+    scores = pipe.evaluate(test, metrics={"ibs": IntegratedBrier(), "c": HarrellC()}, survival_times=times)
+    assert 0.0 <= scores["ibs"] <= 1.0
+
+
+def test_a_classifier_has_no_baseline_and_rejects_survival_times(cohort):
+    train, test = split(dataset(cohort, task="classification"))
+    pipe = pipeline(late_classifier()).fit(train)
+    assert pipe.baseline_ is None and "baseline_events" not in pipe.fit_report_
+    with pytest.raises(ValueError, match="survival_times needs a model that predicts a log_hazard"):
+        pipe.predict(test, survival_times=[1.0, 2.0])
+
+
+@pytest.mark.parametrize(
+    ("times", "match"),
+    [([], "finite times >= 0"), ([-1.0, 2.0], "finite times >= 0"), ([np.inf], "finite"), ([5.0, 5.0], "increasing")],
+)
+def test_survival_times_are_checked(cohort, times, match):
+    train, test = split(dataset(cohort))
+    pipe = pipeline().fit(train)
+    with pytest.raises(ValueError, match=match):
+        pipe.predict(test, survival_times=times)
+
+
+def test_integrated_brier_cannot_be_monitored():
+    with pytest.raises(ValueError, match="IntegratedBrier cannot be monitored"):
+        EarlyStopping(metric=IntegratedBrier(), patience=2, restore_best=True)
+
+
+def test_late_fusion_survival_columns_belong_to_the_fused_prediction(cohort):
+    train, test = split(dataset(cohort))
+    model = LateFusion(
+        branches={
+            "clinical": Unimodal("clinical", [nn.Linear(3, 4)], CoxHead(in_dim=4, ties="efron")),
+            "wsi": Unimodal("wsi", [ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)], CoxHead(4, "efron")),
+        },
+        fusion=MaskedMean(),
+    )
+    times = inner_times(test)
+    pipe = pipeline(model).fit(train)
+    fused = pipe.predict(test, survival_times=times)
+    assert list(fused.columns) == ["log_hazard", *[f"survival[{t!r}]" for t in times]]
+    with pytest.raises(ValueError, match="cannot be used with branch"):
+        pipe.predict(test, branch="wsi", survival_times=times)
+
+
+def test_cross_validation_scores_the_integrated_brier_per_fold(cohort):
+    data = dataset(cohort, required=["clinical"])
+    result = cross_validate(
+        pipeline(intermediate(fusion=MaskedMean(), head_dim=4)),
+        data,
+        StratifiedKFold(n_splits=2, shuffle=True, random_state=0),
+        metrics={"ibs": IntegratedBrier()},
+        survival_times=inner_times(data, quantiles=(0.3, 0.5)),
+    )
+    assert result.folds["ibs"].between(0.0, 1.0).all()
+    assert (result.folds["baseline_events"] > 0).all()
 
 
 # ---------------------------------------------------------------- late fusion, encode, attention

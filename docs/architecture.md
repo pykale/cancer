@@ -51,9 +51,9 @@ flowchart LR
 | --- | --- |
 | `loaddata` | `MultimodalDataset`, `train_test_split`, the `Modality` base class and its two kinds `FixedShapeModality` and `BagModality`, `Tabular`, `PatchFeatures`, `BaseTarget` and the `TimeToEvent` and `Classification` targets |
 | `prepdata` | `TableTransform` and `ColumnGroup`: sklearn transforms for table modalities |
-| `model` | Encoders (`MLP`, `ABMIL`, `TabICLEncoder`), `EncoderList`, the `FittedEncoder` and `AttentionEncoder` base classes, fusion methods, heads, and the four models |
+| `model` | Encoders (`MLP`, `ABMIL`, `TabICLEncoder`), `EncoderList`, the `FittedEncoder` and `AttentionEncoder` base classes, fusion methods, heads, the four models, and `BreslowBaseline` |
 | `pipeline` | `Pipeline`, `EarlyStopping`, Lightning training, `load_pipeline` and `dump_config` |
-| `evaluate` | `HarrellC`, `UnoC`, `TimeDependentAUC`, `AUROC`, `BalancedAccuracy`, `cross_validate` |
+| `evaluate` | `HarrellC`, `UnoC`, `TimeDependentAUC`, `IntegratedBrier`, `AUROC`, `BalancedAccuracy`, `cross_validate` |
 | `interpret` | `attention` |
 
 ---
@@ -62,7 +62,7 @@ flowchart LR
 
 ### Patients are the identifier
 
-`MultimodalDataset` joins modalities and a target by **patient id**. Ids are strings, unique within each source, and checked across sources for ids that differ only by leading zeros. Splitting is always by patient, never by slide or patch: `subset` and `train_test_split` take patient ids. Read ids from JSON with `dtype={"patient_id": str}`, or `"001"` becomes `1`.
+`MultimodalDataset` joins modalities and a target by **patient id**. Ids are strings, unique within each source, and checked across sources for ids that differ only by leading zeros. Splitting is always by patient, never by slide or patch: `subset` and `train_test_split` take patient ids. Read ids from JSON with `dtype={"patient_id": str}`, or `"01"` becomes `1`.
 
 ### Modalities
 
@@ -256,7 +256,7 @@ subclass of it, and `columns` reads the target, for example the class order of a
 
 Censoring is why survival cannot be treated as regression on observed times: many patients are followed until the
 study ends or they are lost, and ignoring that biases estimates. Cox ranks patients by hazard without specifying a full
-survival curve.
+survival curve; the pipeline adds one after training with a Breslow baseline hazard.
 
 ---
 
@@ -273,11 +273,13 @@ state. Training runs on Lightning.
 3. fits the transforms on training patients;
 4. deep-copies the model, keeping the weights it was built with, and fits any `FittedEncoder`;
 5. runs the dry run on a few training patients;
-6. trains with Lightning, optionally early-stopping on a validation metric and restoring the best weights.
+6. trains with Lightning, optionally early-stopping on a validation metric and restoring the best weights;
+7. for a model that predicts a `log_hazard`, fits a `BreslowBaseline` on the fused log-hazards that `predict` gives
+   every patient used in fit (training and validation).
 
-`fit` produces `model_`, `transforms_`, `train_ids_`, `val_ids_`, `target_`, `train_target_`, `history_` and
-`fit_report_`. The remaining methods are `predict` (a frame indexed by patient id, with a `branch` option for late
-fusion), `evaluate`, `encode`, which returns a modality's embeddings, and `run_encoders`, which runs one modality's
+`fit` produces `model_`, `transforms_`, `train_ids_`, `val_ids_`, `target_`, `train_target_`, `baseline_`, `history_`
+and `fit_report_`. The remaining methods are `predict` (a frame indexed by patient id, with a `branch` option for late
+fusion, and, given `survival_times`, a `survival[<time>]` column per time), `evaluate`, `encode`, which returns a modality's embeddings, and `run_encoders`, which runs one modality's
 fitted encoders over a dataset with a callback and is what interpretation tools build on.
 
 ### Leakage guards
@@ -288,7 +290,10 @@ The pipeline is built so a leak fails loudly rather than quietly inflating a sco
   no cross-validation fold can start from weights trained on other patients.
 - Transforms, the validation carve and in-context fitting all use training patients only.
 - `evaluate` rejects patients used in `fit` (training or validation) unless `allow_seen=True`.
-- Metrics that need a censoring distribution (Uno's C, time-dependent AUC) estimate it from the training target only.
+- Metrics that need a censoring distribution (Uno's C, time-dependent AUC, integrated Brier score) estimate it from
+  the training target only.
+- The baseline hazard that gives survival curves is fitted on the patients used in fit only, never on the ones
+  predicted.
 - `cross_validate` checks after every fold that no test patient was used in `fit`.
 
 ### Configuration
@@ -306,7 +311,7 @@ training target and the class order.
 
 | Target | Metrics |
 | --- | --- |
-| Time-to-event | `HarrellC`, `UnoC(tau)`, `TimeDependentAUC(time)`, from TorchSurv |
+| Time-to-event | `HarrellC`, `UnoC(tau)`, `TimeDependentAUC(time)` and `IntegratedBrier` (on the `survival[<time>]` columns), from TorchSurv |
 | Classification | `AUROC(positive_class)`, `BalancedAccuracy`, from scikit-learn |
 
 `cross_validate(estimator, data, cv, metrics)` fits a clone of the pipeline on each fold, predicts the held-out

@@ -6,6 +6,7 @@ Survival metrics come from torchsurv and classification metrics from scikit-lear
 from __future__ import annotations
 
 import math
+import re
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Sequence
@@ -20,6 +21,7 @@ with warnings.catch_warnings():
     # torchsurv applies torch.jit.script when imported, which recent torch deprecates; users cannot act on it
     warnings.filterwarnings("ignore", message=r".*torch\.jit\.script.* is deprecated", category=FutureWarning)
     from torchsurv.metrics.auc import Auc
+    from torchsurv.metrics.brier_score import BrierScore
     from torchsurv.metrics.cindex import ConcordanceIndex
     from torchsurv.stats.ipcw import get_ipcw
     from torchsurv.stats.kaplan_meier import KaplanMeierEstimator
@@ -211,6 +213,57 @@ class TimeDependentAUC(Metric):
             weight_new_time=get_ipcw(train_event, train_time, new_time=new_time.float()),
         )
         return _defined(float(auc[0]), f"{self!r} is undefined: no target event at or before time")
+
+
+_SURVIVAL_COLUMN = re.compile(r"survival\[(.+)\]")
+
+
+class IntegratedBrier(Metric):
+    """Integrated Brier score of the ``survival[<time>]`` columns: how far predicted survival is from the outcome.
+
+    At each column's time t, patients with an event by t contribute S(t)², weighted by 1 / G(event time), and patients
+    still event-free after t contribute (1 - S(t))², weighted by 1 / G(t), with G the Kaplan–Meier censoring survival
+    of ``context.train_target``. These Brier scores are integrated over the column times with the trapezoidal rule and
+    divided by their range. Unlike the concordances it scores calibration as well as ranking. ``Pipeline.predict`` and
+    ``Pipeline.evaluate`` add the columns when given ``survival_times``.
+
+    Raises unless there are at least two columns, their last time is below the last training time with G > 0, and
+    they lie within the target's follow-up: min target time <= first time and last time < max target time.
+    """
+
+    higher_is_better = False
+
+    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
+        """The integrated Brier score of the ``survival[<time>]`` columns."""
+        columns = {float(m[1]): c for c in prediction.columns if (m := _SURVIVAL_COLUMN.fullmatch(str(c)))}
+        if len(columns) < 2:
+            raise ValueError(
+                f"{self!r} needs at least two 'survival[<time>]' columns, got {list(prediction.columns)}; set "
+                "survival_times with two or more times in Pipeline.predict, evaluate or cross_validate"
+            )
+        times = sorted(columns)
+        event, time = _event_time(target, "target")
+        survival = torch.tensor(_aligned_values(prediction, target, [columns[t] for t in times], np.float64))
+        train_event, train_time = _ipcw_training(self, "the last survival time", times[-1], context)
+        first, last = float(time.min()), float(time.max())
+        if not (first <= times[0] and times[-1] < last):
+            raise ValueError(
+                f"{self!r}: survival times {times[0]}..{times[-1]} must lie within the follow-up of the target, "
+                f"[{first}, {last})"
+            )
+        # float64 so event times are compared with the column times themselves, as in sksurv: torchsurv compares each
+        # time as a 0-dim tensor, which would not promote float32 event times
+        new_time = torch.tensor(times, dtype=torch.float64)
+        brier = BrierScore()
+        brier(
+            survival,
+            event,
+            time.double(),
+            new_time=new_time,
+            weight=get_ipcw(train_event, train_time, new_time=time),
+            weight_new_time=get_ipcw(train_event, train_time, new_time=new_time.float()),
+        )
+        return float(brier.integral())
 
 
 def _classification_inputs(
