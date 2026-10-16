@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Multimodal cancer AI for the PyKale ecosystem — CT, whole-slide pathology, and clinical tabular data, with time-to-event prediction"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 authors = [{ name = "PyKale" }]
 keywords = ["pykale", "cancer", "multimodal", "survival", "pytorch"]
 classifiers = [
