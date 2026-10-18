@@ -53,11 +53,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # installs pip by default
+      # installs pip by default. Only the pip jobs cache pip's downloads: the uv jobs never create ~/.cache/pip,
+      # and setup-python fails the job when that folder is missing at the end.
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
+          cache: ${{ matrix.installer == 'pip' && 'pip' || '' }}
           cache-dependency-path: pyproject.toml
 
       # install uv
