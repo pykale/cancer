@@ -1,212 +1,345 @@
 # kalecancer architecture
 
-The design of the `kalecancer` package and the reasoning behind it. Much of this
-document was written before implementation and remains in future tense; the table
-below records what is now built. Items marked **Open question** are unresolved.
+## Design in one paragraph
 
-| Area | State |
-| --- | --- |
-| WSI loading, cohort matching, patient-level splitting | Implemented |
-| Attention MIL encoder | Implemented |
-| Cox head, loss, and survival metrics | Implemented, using TorchSurv |
-| Attention interpretation | Implemented |
-| Multimodal fusion (early, late, hybrid) | Implemented, with a multimodal cohort loader |
-| Binary classification alongside survival | Implemented, as a swappable `PredictionTask` |
-| CT/MRI encoders | Planned |
-
-For usage rather than rationale, see the [quickstart](quickstart.md), the
-[WSI pipeline reference](../examples/hancock_wsi_survival/) and the
-[fusion reference](multimodal_fusion.md).
+There is **one estimator**, `Pipeline`. It takes a model, transforms for each modality and training settings, and it
+behaves the same for every model and target.
 
 ---
 
-## Scope
+## Package layout
 
-The initial clinical focus will be **head and neck cancer (HNC)**.
+```mermaid
+flowchart LR
+    subgraph loaddata["loaddata"]
+        MOD["Modalities\nTabular, PatchFeatures"]
+        TGT["Targets\nTimeToEvent, Classification"]
+        DS["MultimodalDataset\nkeyed by patient id"]
+        MOD --> DS
+        TGT --> DS
+    end
 
-The intended use case is **treatment decision support**, not diagnosis. Models will aim to inform clinicians about expected outcomes and relative risk under different treatment contexts — not to replace histopathological or radiological diagnosis.
+    subgraph prepdata["prepdata"]
+        TT["TableTransform\nsklearn, fitted on\ntraining patients"]
+    end
 
-Planned outcome targets:
+    subgraph model["model"]
+        STG["Encoder lists\nMLP, ABMIL, TabICLEncoder,\nany nn.Module"]
+        FUS["Fusion method\nConcat, MaskedMean,\nMajorityVote"]
+        HEAD["Head\nCoxHead,\nClassificationHead"]
+        STG --> FUS --> HEAD
+    end
 
-| Outcome | Definition | Priority |
+    subgraph pipeline["pipeline"]
+        PIPE["Pipeline\nfit, predict, evaluate,\nencode, run_encoders"]
+        CFG["load_pipeline,\ndump_config"]
+    end
+
+    subgraph downstream["evaluate, interpret"]
+        MET["Metrics,\ncross_validate"]
+        ATT["attention export"]
+    end
+
+    DS --> TT --> PIPE
+    model --> PIPE
+    CFG --> PIPE
+    PIPE --> MET
+    PIPE --> ATT
+```
+
+| Subpackage | Contents |
+| --- | --- |
+| `loaddata` | `MultimodalDataset`, `train_test_split`, the `Modality` base class and its two kinds `FixedShapeModality` and `BagModality`, `Tabular`, `PatchFeatures`, `BaseTarget` and the `TimeToEvent` and `Classification` targets |
+| `prepdata` | `TableTransform` and `ColumnGroup`: sklearn transforms for table modalities |
+| `model` | Encoders (`MLP`, `ABMIL`, `TabICLEncoder`), `EncoderList`, the `FittedEncoder` and `AttentionEncoder` base classes, fusion methods, heads, the four models, and `BreslowBaseline` |
+| `pipeline` | `Pipeline`, `EarlyStopping`, Lightning training, `load_pipeline` and `dump_config` |
+| `evaluate` | `HarrellC`, `UnoC`, `TimeDependentAUC`, `IntegratedBrier`, `AUROC`, `BalancedAccuracy`, `bootstrap_ci`, `cross_validate` |
+| `interpret` | `attention` |
+
+---
+
+## Data
+
+### Patients are the identifier
+
+`MultimodalDataset` joins modalities and a target by **patient id**. Ids are strings, unique within each source, and checked across sources for ids that differ only by leading zeros. Splitting is always by patient, never by slide or patch: `subset` and `train_test_split` take patient ids. Read ids from JSON with `dtype={"patient_id": str}`, or `"01"` becomes `1`.
+
+### Modalities
+
+A modality holds one kind of data for a set of patients, keyed by patient id. `modality[id]` loads one patient's item
+and `modality[ids]` loads a batch in the order given. Every modality subclasses one of two kinds, and the kind decides
+how a batch is formed:
+
+| Kind | Item per patient | Batch |
 | --- | --- | --- |
-| **Overall survival (OS)** | Death from any cause | **v1 primary target** — death is unambiguous and better recorded than recurrence |
-| **Disease-free survival (DFS)** | Recurrence or progression | v1 secondary / v2 competing-risk target |
-| **Treatment response** | Short-term response to therapy | Planned; exact definition TBD with clinical partners |
+| `FixedShapeModality` | the same shape for every patient | one stacked tensor `(n, *shape)` |
+| `BagModality` | an `(N_i, d)` bag of instances, where `N_i` varies | a list of tensors |
 
-**Overall survival** will be the first modelling target because event ascertainment is clearer and more consistently recorded across sites than recurrence.
+A new modality picks its kind and implements `_load(id)`. A bag also implements `instances(id)`, one row describing
+each instance, which attention export joins to the attention weights. A kind that is neither would subclass `Modality`
+directly and implement `collate` too. To add one, see [extending/modalities.md](extending/modalities.md).
+
+| Modality | Kind | Value per patient |
+| --- | --- | --- |
+| `Tabular(frame)` | fixed shape | one float32 vector: the patient's row of a DataFrame indexed by patient id |
+| `PatchFeatures` | bag | `(N_i, D)` pre-extracted patch features, read lazily from HDF5 |
+
+Tables are passed as `Tabular(frame)`; a bare DataFrame is rejected. `Tabular` is the modality that accepts sklearn
+transforms, through `transform_input` and `with_transform`; any other modality given a transform raises an error.
+
+`MultimodalDataset` follows the standard PyTorch pattern: `data[i]` loads one patient, and
+`DataLoader(data, collate_fn=data.collate)` batches them, with each modality's kind forming its part of the batch. A
+modality that no patient in a batch has gets no entry in that batch's inputs.
+
+A whole slide is therefore a bag of pre-extracted patch features: an ordinary modality whose batch is a list rather
+than a stacked tensor, and whose `instances` are its patch coordinates. Feature extraction from raw slides is out of
+scope: it happens before the library.
+
+Raw imaging (CT, MRI) would differ in kind: a 3D volume with voxel spacing and orientation to respect, where a
+slide is flat but gigapixel-scale. A volume resampled to a fixed size would be one new `FixedShapeModality`, plus
+encoders for it. Neither exists yet.
+
+### Targets
+
+| Target | Contents | Head |
+| --- | --- | --- |
+| `TimeToEvent(time, event)` | `time` finite and > 0; `event` is a `bool`, `True` observed, `False` censored | `CoxHead` |
+| `Classification(labels, classes)` | labels drawn from an explicit, ordered class list | `ClassificationHead` |
+
+To add an endpoint, see [extending/endpoints.md](extending/endpoints.md).
+
+A missing `event` raises an error: an unknown outcome is not a censored one. Each target reports strata (events or
+labels), which drive stratified splitting.
+
+Both subclass `BaseTarget`, and so does a new endpoint. A target implements `tensors` (the values the head's loss
+reads), `strata` (one discrete label per patient for stratified splitters) and `counts` (the summary counts in fit
+reports and cross-validation folds). The fitted pipeline keeps the target itself, so a head can read what it needs from
+it, such as the class order of a `Classification`.
+
+### Preparing tables
+
+`TableTransform` is a `ColumnTransformer` whose steps are typed, so a YAML config validates nested steps. Every input
+column must be in exactly one `ColumnGroup` or in `drop`, so a column can never be silently dropped or left
+untransformed. Transforms are **fitted on the training patients only**, inside `Pipeline.fit`, and only on the
+patients who have that modality.
+
+---
+
+## Models
+
+A model is built from a list of encoders per modality, a fusion method, and a head.
+
+| Model | Structure |
+| --- | --- |
+| `Unimodal` | one modality's encoders, then a head |
+| `EarlyFusion` | fuse the raw vector modalities, then one encoder list, then a head |
+| `IntermediateFusion` | encoders per modality, then a fusion method, then a head |
+| `LateFusion` | branch models (each `Unimodal`, `EarlyFusion` or `IntermediateFusion`) trained jointly, then a fusion method |
+
+Inputs from different modalities are incommensurable in shape, so raw inputs are never fused except when they are
+already vectors (early fusion). Intermediate fusion first encodes each modality to a vector.
+
+Choosing a fusion strategy changes the model, not the encoders, heads or `Pipeline`:
+
+```python
+from torch import nn
+
+from kalecancer.model import (
+    ABMIL, MLP, ClassificationHead, Concat, CoxHead, IntermediateFusion, LateFusion, MaskedMean, Unimodal,
+)
+from kalecancer.pipeline import Pipeline
+
+# Intermediate: encode each modality, concatenate, one Cox head.
+intermediate = IntermediateFusion(
+    encoders={
+        "clinical": [MLP(in_dim=12, hidden_dims=[64], out_dim=64, dropout=0.1)],
+        "wsi": [ABMIL(in_dim=1024, hidden_dim=256, attention_dim=128, dropout=0.25), nn.Linear(256, 64)],
+    },
+    fusion=Concat(),
+    head=CoxHead(in_dim=128, ties="efron"),
+)
+
+# Late: a classifier per modality, logits averaged.
+late = LateFusion(
+    branches={
+        "clinical": Unimodal("clinical", [MLP(12, [64], 64, 0.1)], ClassificationHead(64, n_classes=2)),
+        "wsi": Unimodal("wsi", [ABMIL(1024, 256, 128, 0.25), nn.Linear(256, 64)], ClassificationHead(64, n_classes=2)),
+    },
+    fusion=MaskedMean(),
+)
+
+pipeline = Pipeline(model=intermediate, ...)
+```
+
+Runnable versions are in [examples/hancock/](../examples/hancock/): `survival_intermediate.py` (intermediate, Cox),
+`classification_late.py` (late, classification) and `configs/intermediate_cox.yaml` (the same model as YAML).
+
+### Encoders
+
+An encoder is any `nn.Module` whose `forward(x)` takes the modality's batch (an `(n, ...)` tensor for a fixed-shape
+modality, a list of `(N_i, d)` bags for a bag modality) or the previous encoder's output. Each modality's encoders are
+held in an `EncoderList`, which runs them in order. Encoders available so far:
+
+- `MLP`: linear, ReLU and dropout blocks;
+- `ABMIL`: gated attention-based multiple-instance pooling over a bag of patch features, which reports its attention;
+- `TabICLEncoder`: a pretrained TabICL row encoder (optional `tabular` extra);
+- any `nn.Module`, such as `torch.nn.Linear`.
+
+To add one, see [extending/encoders.md](extending/encoders.md).
+
+An encoder checks its own input; nothing reads declared widths. Instead, `fit` runs the model once on up to two
+training patients per modality before training starts (the dry run), so a wrong width or input fails before the first
+optimizer step. Errors carry a note naming the encoder that raised them (`encoders['wsi'][1]`), the head, and in late
+fusion the branch.
+
+An encoder list must end in an embedding: a finite, floating-point `(len(ids), d)` tensor, one row per patient. The
+`EncoderList` checks this in every forward pass, in training and in prediction. When an embedding has NaN or infinite
+values, the error names the patients and says whether their input already had them, in which case they should be
+imputed in the modality's transform, or the encoders produced them. The input itself is not checked, so an encoder
+that handles missing values needs no flag. When some patients' input has NaN or infinite values and the encoders
+still produce finite embeddings, `fit`, `predict` and `run_encoders` each report it once per modality in a
+`NonFiniteInputWarning`, which can be silenced with a warnings filter; `fit` also records the counts in
+`fit_report_["non_finite_inputs"]`.
+
+Encoders keep a bag's instances one to one with the rows the modality loaded, which is what lets attention export
+match weights to coordinates. An encoder samples instances at random only in training mode; a fixed selection, such as
+dropping background patches, is made in the modality instead.
+
+A `FittedEncoder` is fitted on the training patients before training starts, and receives their ids. It may only be
+the first encoder, because the inputs of later encoders change as the encoders before them train. `TabICLEncoder` is
+one: it embeds each row against a context of labelled training rows. To keep labels from leaking, a training row is
+embedded against the context minus its own stratified fold rather than against itself.
+
+### Fusion
+
+| Method | Stages | Combines | Handles missing modalities |
+| --- | --- | --- | --- |
+| `Concat` | early, intermediate | vectors, concatenated | No: every patient must have every modality |
+| `MaskedMean` | early, intermediate, late | equal-width vectors averaged over those present; in late fusion, branch head outputs (logits or log-hazards) | Yes; in Cox late fusion, only when every patient has every branch |
+| `MajorityVote` | late | branch class votes, ties broken by mean probability | Yes |
+
+Every method is a `FusionMethod`. It declares the stages it supports, says through `defined` which patients it can
+combine, and owns the rules for when it can be used in `check`. A model describes the experiment in a
+`FusionContext` (the stage, which patients have which inputs and which must be combined, the input widths and, in late
+fusion, the target type each branch head predicts) and calls `check` when it is built, in `model.check(data)`, and in
+the dry run. Only the dry run knows the widths of the encoders' embeddings, so width rules run there. Models never test for a particular method, and they use the same `defined` in the forward pass,
+so the check and training cannot disagree. In late fusion, `MaskedMean` refuses Cox branches over patients with
+different branch subsets because each branch's log-hazard has an arbitrary offset, so averaging different subsets
+would reorder patients.
+
+### Missing modalities
+
+Real cohorts rarely have every modality for every patient, so absence is handled in the execution rule shared by all
+models rather than as an edge case:
+
+1. Encoders run **only on patients who have the modality**.
+2. Their outputs are scattered back into the batch with NaN for the others.
+3. Fusion **selects** the defined rows. It never multiplies by a mask, because `NaN * 0` is `NaN` and would poison
+   gradients.
+4. Heads run on defined rows only, and patients without a prediction get NaN.
+
+Absent modalities are therefore not zero-padded or imputed with placeholders: they are absent. Whether a combination
+is valid is settled up front by `model.check(data)`, which raises if the fusion method cannot handle the missing
+patterns in the data.
+
+### Heads
+
+A head owns everything endpoint-specific: its output, the prediction, the loss, the target check, and the names of the
+prediction columns. It declares the target class it predicts as `target_type`; `check_target` accepts that class or a
+subclass of it, and `columns` reads the target, for example the class order of a `Classification`.
+
+- **`CoxHead`** outputs a `log_hazard` (higher means higher risk) and trains with the Cox partial likelihood from
+  TorchSurv, using Efron or Breslow ties. It has no bias because the partial likelihood is invariant to an additive
+  constant. The risk set is the batch, so a batch with no event that has anyone else at risk carries no signal and its
+  `loss` returns `None`; the pipeline skips such batches and reports them.
+- **`ClassificationHead`** outputs logits, predicts softmax probabilities and trains with cross-entropy.
+
+Censoring is why survival cannot be treated as regression on observed times: many patients are followed until the
+study ends or they are lost, and ignoring that biases estimates. Cox ranks patients by hazard without specifying a full
+survival curve; the pipeline adds one after training with a Breslow baseline hazard.
 
 ---
 
 ## Pipeline
 
-The package will follow PyKale’s verb-oriented pipeline, extended with a dedicated **`survival`** stage for time-to-event tasks.
+`Pipeline` is a scikit-learn `BaseEstimator` over a `MultimodalDataset`. Its constructor takes the model, transforms,
+optimizer, batch size, epochs, an optional validation splitter and early stopping, accelerator, precision and random
+state. Training runs on Lightning.
 
-```mermaid
-flowchart LR
-    subgraph loaddata["loaddata"]
-        CT["CT / MRI\n(DICOM, NIfTI)"]
-        WSI["Whole-slide\n(.svs, TIFF)"]
-        TAB["Clinical tabular\n(CSV)"]
-    end
+`fit`:
 
-    subgraph prepdata["prepdata"]
-        PCT["Windowing,\nresampling, crop"]
-        PWSI["Tiling, stain norm,\nbackground filter"]
-        PTAB["Imputation,\nnormalisation"]
-    end
+1. validates arguments against the data and model;
+2. carves validation patients out of the training patients, stratified by the target;
+3. fits the transforms on training patients;
+4. deep-copies the model, keeping the weights it was built with, and fits any `FittedEncoder`;
+5. runs the dry run on a few training patients;
+6. trains with Lightning, optionally early-stopping on a validation metric and restoring the best weights;
+7. for a model that predicts a `log_hazard`, fits a `BreslowBaseline` on the fused log-hazards that `predict` gives
+   every patient used in fit (training and validation).
 
-    subgraph model["model"]
-        ECT["3D encoder"]
-        EWSI["Tile encoder\n+ MIL pool"]
-        ETAB["MLP +\ncategorical embed"]
-        FUSE["Latent fusion\n(default)"]
-        PRED["Task head\n(classify / regress / Cox)"]
-        ECT --> FUSE
-        EWSI --> FUSE
-        ETAB --> FUSE
-        FUSE --> PRED
-    end
+`fit` produces `model_`, `transforms_`, `train_ids_`, `val_ids_`, `target_`, `train_target_`, `baseline_`, `history_`
+and `fit_report_`. The remaining methods are `predict` (a frame indexed by patient id, with a `branch` option for late
+fusion, and, given `survival_times`, a `survival[<time>]` column per time), `evaluate`, `encode`, which returns a modality's embeddings, and `run_encoders`, which runs one modality's
+fitted encoders over a dataset with a callback and is what interpretation tools build on.
 
-    subgraph downstream["downstream"]
-        EVAL["evaluate"]
-        INTERP["interpret"]
-    end
+### Leakage guards
 
-    CT --> PCT --> ECT
-    WSI --> PWSI --> EWSI
-    TAB --> PTAB --> ETAB
-    PRED --> EVAL --> INTERP
-```
+The pipeline is built so a leak fails loudly rather than quietly inflating a score:
 
-Each stage will expose a stable data contract so components can be built and tested independently before real cohort data arrives.
+- `fit` trains a **copy** and leaves `model` unchanged, and a model that already carries fitted weights is rejected, so
+  no cross-validation fold can start from weights trained on other patients.
+- Transforms, the validation carve and in-context fitting all use training patients only.
+- `evaluate` rejects patients used in `fit` (training or validation) unless `allow_seen=True`.
+- Metrics that need a censoring distribution (Uno's C, time-dependent AUC, integrated Brier score) estimate it from
+  the training target only.
+- The baseline hazard that gives survival curves is fitted on the patients used in fit only, never on the ones
+  predicted.
+- `cross_validate` checks after every fold that no test patient was used in `fit`.
 
----
+### Configuration
 
-## Modality handling
-
-CT/MRI and WSI differ **in kind**, not just in file format:
-
-- **CT/MRI** is a **3D radiology volume** with genuine depth between slices. Preprocessing must respect voxel spacing, orientation, and volumetric continuity (resampling, windowing, field-of-view cropping).
-- **WSI** is **flat 2D but gigapixel-scale**. Preprocessing must handle tile boundaries, background filtering, stain variation, and stitching logic at inference — not volumetric resampling.
-
-| Modality | Format | Dimensionality | Preprocessing (planned) | Planned v1 encoder |
-| --- | --- | --- | --- | --- |
-| **CT / MRI** | DICOM, NIfTI | 3D volume | Hounsfield windowing, isotropic resampling, ROI crop | MONAI 3D encoder — UNETR or SwinUNETR trunk, or 3D ResNet feature extractor |
-| **WSI** | `.svs`, TIFF | Gigapixel 2D (processed as tile bag) | Fixed-size tiling, stain normalisation (e.g. Macenko/Vahadane), background filtering | Tile-level CNN/ViT encoder with **MIL aggregation**; will use MONAI `WSIReader` and `PatchWSIDataset` |
-| **Tabular** | CSV | ~50 features, missing values | Imputation, scaling, categorical encoding | MLP with **categorical embeddings** for nominal fields |
-
-Loaders in `kalecancer.loaddata` will normalise each modality into a typed record (tensor + metadata + modality mask). Transforms in `kalecancer.prepdata` will be composable and config-driven.
+A pipeline can be written as YAML in jsonargparse's `class_path`/`init_args` format, read with `load_pipeline` and
+written with `dump_config`. This depends on each component storing every `__init__` argument under an attribute of the
+same name, which is also what `sklearn.base.clone` needs. Dumped configs record the `kalecancer` version, and loading warns on a mismatch.
 
 ---
 
-## Fusion
+## Evaluation
 
-Because input shapes are **incommensurable** — a 3D volume, a variable-size tile bag, and a ~50-dimensional vector — fusion at the raw input level is not viable. Each modality is encoded to a fixed-dimensional latent vector first, and fusion operates in that shared latent space.
+Metrics score a prediction frame against a target frame, both indexed by patient id, with an `EvalContext` carrying the
+training target and the class order.
 
-Three strategies are implemented, distinguished by what they combine: **features** (early), **decisions** (late), or both (hybrid). The fusion operator is config-swappable, so the same encoders and task head work with any of them. They build on `kale.embed.multimodal_fusion`, and `ProductOfExperts` is the preferred route when modalities can be missing, because absent experts drop out of the product without retraining a model per combination.
+| Target | Metrics |
+| --- | --- |
+| Time-to-event | `HarrellC`, `UnoC(tau)`, `TimeDependentAUC(time)` and `IntegratedBrier` (on the `survival[<time>]` columns), from TorchSurv |
+| Classification | `AUROC(positive_class)`, `BalancedAccuracy`, from scikit-learn |
 
-Missing modalities are a **first-class requirement**, not an edge case: real cohorts rarely have every modality for every patient. A per-sample modality mask is carried from `loaddata` through to the model, absent modalities are represented by learned placeholders rather than zero-padding, and modality dropout during training builds robustness. This supports the clinically required combinations — imaging plus clinical, pathology plus clinical, and a clinical-only baseline.
-
-See [multimodal_fusion.md](multimodal_fusion.md) for the API, the fusion operators, and the per-mechanism behaviour under missing modalities.
-
-`BANLayer` in `kale.embed.attention` remains a candidate for cross-modal attention between latent representations.
-
----
-
-## Time-to-event
-
-Survival outcomes require dedicated handling. Many patients will be **censored** — followed until study end or loss to follow-up without the event occurring. Treating time-to-event as plain regression on observed times ignores censoring and will bias estimates.
-
-### v1: Cox proportional hazards
-
-The v1 task head will emit a **risk score** via a Cox partial likelihood loss. The model will learn a linear combination of fused latent features that ranks patients by hazard without specifying a full survival curve parametrically.
-
-### v2: Competing risks
-
-Overall survival and disease-free survival **compete** — a patient who dies cannot subsequently recur. v2 will add **discrete-time / DeepHit-style** heads for competing risks, allowing separate hazard estimates per event type.
-
-### Label contract
-
-Survival labels follow a fixed contract: `time` is the time from baseline to event or censoring in a config-defined unit, and `event` is `1` when observed and `0` when censored. Competing-risk models will add an optional `event_type` naming the event category.
-
-Metrics and their leakage rules are documented in the [WSI pipeline reference](../examples/hancock_wsi_survival/).
-
-### Reference implementation: TorchSurv
-
-We will use **TorchSurv** as the reference implementation for survival losses and metrics. It was chosen because its losses and metrics are **standalone** and work with custom PyTorch networks — no requirement to adopt a monolithic survival library or a fixed model zoo.
-
-### Core boundary: `kalecancer/survival/`
-
-Survival code will live in **`kalecancer/survival/`** under strict isolation rules:
-
-- **Cancer-agnostic** — may import only `torch`, `numpy`, and `pykale`; must not import from other `kalecancer` modules.
-- **Own test suite** — unit tests against synthetic tensors (no real patient data required).
-- **CI enforcement** — `tests/test_survival_boundary.py` will parse every file under `survival/` and fail on forbidden imports.
-
-This module is intended to **move into PyKale core** once stable, because **`kale-cardiac`** and other domain packages will need the same time-to-event capability without duplicating Cox heads, losses, and metrics.
+`cross_validate(estimator, data, cv, metrics)` fits a clone of the pipeline on each fold, predicts the held-out
+patients and returns per-fold scores, fit reports and out-of-fold predictions. Scores are **not pooled** across folds,
+because Cox log-hazards have an arbitrary offset that differs between folds.
 
 ---
 
 ## Interpretability
 
-Interpretability will be built into the pipeline as a post-prediction stage (`kalecancer.interpret`), not bolted on after deployment.
+What exists is **attention export**: `kalecancer.interpret.attention(pipe, data, modality)` returns per-patch
+attention weights from the modality's one `AttentionEncoder`, joined with the modality's patch coordinates, so weights
+can be mapped back onto slides.
 
-| Modality | Planned method | Output |
-| --- | --- | --- |
-| **Tabular** | SHAP (TreeExplainer or KernelExplainer on MLP) | Per-feature importance for clinical variables |
-| **CT / MRI** | Grad-CAM via Captum | Spatial attribution on 3D volumes (projected to slices for display) |
-| **WSI** | Grad-CAM on tile encoder + MIL aggregation | Tile-level heatmaps stitched to slide coordinates |
-| **Modality-level** | **v1:** ablation — zero out a modality at inference and measure change in predicted risk | Relative contribution of CT vs WSI vs tabular |
-| **Modality-level** | **v2:** hybrid fusion auxiliary heads or ProductOfExperts variance | Learned per-modality contribution without full forward-pass ablation |
+Attention weights show what the pooling step relied on, not causal importance. Because the head here is a Cox
+model, high attention marks patches that shaped a **risk score**, not patches that predict death with some probability.
 
-### Caveat: Grad-CAM on Cox models
-
-Grad-CAM on a **Cox risk score** attributes regions that drive **higher predicted hazard**, not a class logit. Heatmaps will mean *"regions associated with higher predicted risk"* rather than *"regions predicting death with probability p"*. This distinction will be documented in user-facing outputs and example notebooks so clinical collaborators interpret attributions correctly.
-
-The `interpret` optional dependency group (`shap`, `captum`) will keep heavy explanation libraries out of the core install.
+The `interpret` extra declares `shap`, `captum` and `umap-learn`, but no code uses them yet. Feature attribution for
+tables, spatial attribution for imaging, and modality-level ablation remain future work.
 
 ---
 
-## Development strategy
+## Design decisions
 
-Components will be built and tested against **synthetic data first**. This defines the data contract explicitly — tensor shapes, label fields, modality masks, censoring patterns — before real clinical data arrives.
-
-| Phase | Data source | Goal |
-| --- | --- | --- |
-| **1. Synthetic** | Generated tensors and CSV in `tests/` and `examples/` | Validate loaders, transforms, encoders, fusion, Cox head, and metrics in isolation |
-| **2. Public** | Public oncology datasets (once confirmed — see open questions) | End-to-end pipeline on real formats with known outcomes |
-| **3. Private NHS** | Site-specific cohort (future) | Any private pipeline will be **validated on synthetic data first** before it touches real patient records |
-
-Public data will come first. Private NHS integration will reuse the same contracts proven on synthetic and public data, with additional governance and access controls outside this package.
-
----
-
-## Resolved questions
-
-| Question | Resolution |
+| Decision | Reasoning |
 | --- | --- |
-| **Which public dataset** to validate against | **HANCOCK** (763 head and neck patients, CC BY 4.0). Pre-extracted UNI encodings are part of the release and are streamed directly from the published archives. |
-| **Where `embed` and `predict` live** | Kept merged under `model/`, with a separate `pipeline/` for trainers and runners, mirroring `kale.pipeline`. |
-| **One trainer per task and modality, or one trainer** | One. `CohortTrainer` takes a set of modality embedders and a `PredictionTask`; neither constrains the other, so a whole-slide survival model and a multimodal classifier are the same class with different arguments. A bag of patches is an ordinary modality whose value is a list rather than a stacked tensor, which is what removed the need for a whole-slide trainer. A task decides exactly four things — head, loss, whether a batch carries a gradient, and the epoch metric — so a new endpoint costs a task, not a trainer. |
-| **Where orchestration lives** | In `examples/`, not in the library. Assembling a cohort, choosing splits, naming an endpoint and writing a report are experiment concerns; anything naming a dataset or a configuration key is an experiment. The library supplies the pieces an experiment composes. |
-| **Survival library** | TorchSurv, as planned. `LowRankTensorFusion` is the one PyKale component reimplemented rather than reused, because its parameters are not registered with the module. |
-
-## Open questions
-
-| # | Question | Impact |
-| --- | --- | --- |
-| 1 | **Exact tabular schema** and missingness rate for the tabular branch | Affects imputation strategy and model capacity |
-| 2 | **FT-Transformer vs MLP** for tabular encoding — depends on sample size | At a few hundred patients an MLP with embeddings is likely sufficient |
-| 3 | **How patients are matched across modalities** when a multimodal cohort loader is added | Determines whether the fusion APIs need a modality-mask loader or a joined cohort record |
-
----
-
-## Related documents
-
-- [Quickstart](quickstart.md) — running the pipeline
-- [WSI survival pipeline](../examples/hancock_wsi_survival/) — inputs, configuration, outputs
-- [Multimodal fusion](multimodal_fusion.md) — fusion APIs
-- [AGENTS.md](../AGENTS.md) — conventions and constraints for contributors
-- `tests/test_survival_boundary.py` — CI enforcement of the `survival/` isolation rule
-- PyKale fusion modules — [`kale.embed.multimodal_fusion`](https://pykale.readthedocs.io/en/latest/kale.embed.html)
+| One `Pipeline`, no per-modality or per-endpoint trainers | A bag of patches is an ordinary modality and a head decides the endpoint, so nothing about a trainer needs to change with either. |
+| Head owns output, prediction, loss and target check | A new endpoint costs a head and a target, not a trainer. |
+| Encoders run on present patients, fusion selects rows | Masking or zero-filling spreads NaN through gradients; selecting rows keeps them finite. |
+| Validate each rule as soon as its information exists | Structural rules run at construction; missing-modality patterns and target/head mismatches at the start of `fit`; widths in a dry run before training. All surface before the first optimizer step, not mid-training. |
+| Orchestration lives in `examples/` | Choosing splits, naming an endpoint and writing a report are experiment concerns; the library supplies pieces to compose. |
