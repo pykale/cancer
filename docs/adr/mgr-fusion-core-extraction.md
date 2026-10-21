@@ -1,4 +1,4 @@
-# ADR 0003: Fusion extraction compatibility boundary
+# Migration record: Fusion extraction compatibility boundary
 
 - **Date:** 2026-10-21
 - **Status:** Baseline accepted for local development; core extraction remains proposed.
