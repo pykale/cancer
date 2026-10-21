@@ -59,7 +59,7 @@ def test_every_patient_is_predicted_once_by_a_model_that_never_saw_it(cohort):
         return_estimators=True,
     )
     assert len(result.folds) == 3
-    assert sorted(result.predictions.index) == data.ids and result.predictions.index.is_unique
+    assert sorted(result.predictions.index) == list(data.ids) and result.predictions.index.is_unique
     assert list(result.summary().index) == ["harrell_c"] and list(result.summary().columns) == ["mean", "std"]
     assert result.folds["n_train"].sum() == 2 * len(data)
     for fold, estimator in enumerate(result.estimators):

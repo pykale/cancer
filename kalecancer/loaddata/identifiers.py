@@ -15,13 +15,16 @@ class _NotFoundError(KeyError):
 
 
 def _as_ids(values: Iterable, what: str) -> pd.Index:
-    index = pd.Index(list(values))
-    not_str = [i for i in index if not isinstance(i, str)]
+    """``values`` as an Index of unique str named ``"id"``, in the order given (ADR 0003)."""
+    values = list(values)
+    not_str = [i for i in values if not isinstance(i, str)]
     if not_str:
         raise TypeError(
             f"{what}: patient ids must be str, got {type(not_str[0]).__name__} {not_str[0]!r}. "
             "pd.read_json turns '001' into 1 unless dtype={'patient_id': str}"
         )
+    # Built after the check, because dtype="str" would silently turn 1 into "1"
+    index = pd.Index(values, dtype="str", name="id")
     if not index.is_unique:
         raise ValueError(f"{what}: duplicate ids {index[index.duplicated()].unique()[:5].tolist()}")
     return index

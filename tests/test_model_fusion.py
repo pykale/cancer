@@ -189,7 +189,7 @@ def test_early_fusion_fits_and_runs_on_concatenated_rows_in_forward_order(cohort
     clinical, lab = tables(cohort)
     expected = torch.tensor(np.concatenate([clinical.loc[train.ids].to_numpy(), lab.loc[train.ids].to_numpy()], axis=1))
     torch.testing.assert_close(recorder.fit_x, expected.float())
-    assert recorder.fit_ids == train.ids
+    assert recorder.fit_ids == list(train.ids)
     assert model(whole_batch(train)).prediction.shape == (20, 1)
 
 

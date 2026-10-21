@@ -62,7 +62,7 @@ flowchart LR
 
 ### Patients are the identifier
 
-`MultimodalDataset` joins modalities and a target by **patient id**. Ids are strings, unique within each source, and checked across sources for ids that differ only by leading zeros. Splitting is always by patient, never by slide or patch: `subset` and `train_test_split` take patient ids. Read ids from JSON with `dtype={"patient_id": str}`, or `"01"` becomes `1`.
+`MultimodalDataset` joins modalities and a target by **patient id**. Ids are strings, unique within each source, and checked across sources for ids that differ only by leading zeros. Every `ids` attribute is a sorted `pd.Index` of str named `"id"` ([ADR 0003](adr/0003-patient-ids.md)). Splitting is always by patient, never by slide or patch: `subset` and `train_test_split` take patient ids. Read ids from JSON with `dtype={"patient_id": str}`, or `"01"` becomes `1`.
 
 ### Modalities
 
