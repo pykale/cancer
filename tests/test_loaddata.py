@@ -61,6 +61,28 @@ def test_ids_differing_only_by_leading_zeros_raise(cohort):
         )
 
 
+def test_every_ids_is_a_sorted_str_index_named_id(cohort):
+    order = cohort.clinical.index[::-1]
+    labels = cohort.event.map({True: "event", False: "censored"}).loc[order]
+    holders = {
+        "tabular": Tabular(cohort.clinical.loc[order].rename_axis("patient_id")),
+        "patches": wsi(cohort),
+        "time_to_event": TimeToEvent(time=cohort.time.loc[order], event=cohort.event),
+        "classification": Classification(labels, classes=["censored", "event"]),
+        "dataset": dataset(cohort),
+    }
+    expected = pd.Index(sorted(cohort.clinical.index), dtype="str", name="id")
+    for name, holder in holders.items():
+        assert isinstance(holder.ids, pd.Index), name
+        assert holder.ids.dtype == expected.dtype and holder.ids.name == "id", name
+        assert holder.ids.is_monotonic_increasing and holder.ids.is_unique, name
+    assert holders["time_to_event"].ids.equals(expected)
+    assert (
+        holders["time_to_event"].frame["time"].equals(cohort.time.loc[expected].astype(np.float32).set_axis(expected))
+    )
+    assert holders["dataset"].present.index.equals(holders["dataset"].ids)
+
+
 # ---------------------------------------------------------------- targets
 
 
@@ -257,7 +279,7 @@ def test_subset_raises_on_excluded_ids_with_reason(cohort):
 
 def test_subset_is_sorted_and_recorded(cohort):
     part = dataset(cohort).subset(["010", "002", "005"])
-    assert part.ids == ["002", "005", "010"]
+    assert list(part.ids) == ["002", "005", "010"]
     assert part.summary()["count"]["excluded: outside subset"] == 27
 
 

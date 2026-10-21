@@ -110,8 +110,9 @@ class Tabular(FixedShapeModality):
 
     def __init__(self, frame: pd.DataFrame):
         self._frame = frame.copy()
-        self.ids = _as_ids(self._frame.index, f"{self.__class__.__name__}")
-        self._position = {pid: k for k, pid in enumerate(self.ids)}
+        self._frame.index = _as_ids(self._frame.index, f"{self.__class__.__name__}")
+        self.ids = self._frame.index.sort_values()
+        self._position = {pid: k for k, pid in enumerate(self._frame.index)}
 
     @property
     def frame(self) -> pd.DataFrame:
@@ -176,15 +177,14 @@ class PatchFeatures(BagModality):
         self.features_key = features_key
         self.coords_key = coords_key
         self.multiple_files = multiple_files
-        _as_ids(pd.Index(files.index).unique(), f"{self.__class__.__name__}")
-        self._paths = {str(pid): sorted(str(p) for p in paths) for pid, paths in files.groupby(level=0)}
+        self.ids = _as_ids(pd.Index(files.index).unique(), f"{self.__class__.__name__}").sort_values()
+        self._paths = {pid: sorted(str(p) for p in paths) for pid, paths in files.groupby(level=0)}
         several = sorted(pid for pid, paths in self._paths.items() if len(paths) > 1)
         if several and multiple_files == "error":
             raise ValueError(
                 f"{len(several)} patients have several files (e.g. {several[:3]}); "
                 "pass multiple_files='concatenate' to read each patient's files as one bag"
             )
-        self.ids = pd.Index(sorted(self._paths))
 
     @classmethod
     def from_glob(

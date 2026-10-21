@@ -56,7 +56,7 @@ class MultimodalDataset(torch.utils.data.Dataset):
         self._target_ids = set(target.ids) if target is not None else None
         candidates = set().union(*self._modality_ids.values(), self._target_ids or set())
         self._excluded = {pid: reason for pid in candidates if (reason := self._exclusion_reason(pid))}
-        self._set_ids(sorted(candidates - self._excluded.keys()))
+        self._set_ids(candidates - self._excluded.keys())
 
     def _exclusion_reason(self, pid: str) -> str | None:
         if self._target_ids is not None and pid not in self._target_ids:
@@ -68,12 +68,12 @@ class MultimodalDataset(torch.utils.data.Dataset):
             return "no modality"
         return None
 
-    def _set_ids(self, ids: list[str]) -> None:
-        self.ids = ids
-        self._id_set = set(ids)
+    def _set_ids(self, ids: Iterable[str]) -> None:
+        self.ids = _as_ids(ids, "MultimodalDataset").sort_values()
+        self._id_set = set(self.ids)
         self.present = pd.DataFrame(
-            {name: [pid in self._modality_ids[name] for pid in ids] for name in self.modalities},
-            index=pd.Index(ids, name="id"),
+            {name: [pid in self._modality_ids[name] for pid in self.ids] for name in self.modalities},
+            index=self.ids,
             dtype=bool,
         )
 
@@ -91,7 +91,7 @@ class MultimodalDataset(torch.utils.data.Dataset):
         kept = set(requested)
         new = copy.copy(self)
         new._excluded = {**self._excluded, **{pid: "outside subset" for pid in self.ids if pid not in kept}}
-        new._set_ids(sorted(kept))
+        new._set_ids(kept)
         return new
 
     def summary(self) -> pd.DataFrame:
