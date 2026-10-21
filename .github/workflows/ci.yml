@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, migration/pykale-core]
+    branches: [main]
   pull_request:
-    branches: [main, migration/pykale-core]
+    branches: [main]
 
 env:
   # The checkpoint test_tabicl.py needs
