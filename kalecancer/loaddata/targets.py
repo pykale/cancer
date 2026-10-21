@@ -53,10 +53,10 @@ class TimeToEvent(BaseTarget):
     def __init__(self, time: pd.Series, event: pd.Series):
         self.time = time
         self.event = event
-        ids = _as_ids(time.index, "TimeToEvent.time")
+        ids = _as_ids(time.index, "TimeToEvent.time").sort_values()
         if set(_as_ids(event.index, "TimeToEvent.event")) != set(ids):
             raise ValueError("TimeToEvent: time and event must be indexed by the same ids")
-        event = event.loc[ids]
+        time, event = time.loc[ids], event.loc[ids]
         if event.isna().any():
             examples = event.index[event.isna()][:5].tolist()
             raise ValueError(
@@ -107,7 +107,8 @@ class Classification(BaseTarget):
         ordered = list(classes)
         if len(ordered) < 2 or len(set(ordered)) != len(ordered):
             raise ValueError(f"Classification: classes must hold at least two distinct values, got {ordered}")
-        ids = _as_ids(labels.index, "Classification")
+        ids = _as_ids(labels.index, "Classification").sort_values()
+        labels = labels.loc[ids]
         if labels.isna().any():
             examples = labels.index[labels.isna()][:5].tolist()
             raise ValueError(f"Classification: {int(labels.isna().sum())} labels are missing (e.g. {examples})")
