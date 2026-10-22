@@ -6,6 +6,7 @@ from sklearn.base import clone
 from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import FunctionTransformer, OrdinalEncoder, StandardScaler
+from torch.utils.data import DataLoader
 
 from kalecancer.loaddata import (
     BagModality,
@@ -138,6 +139,16 @@ def test_classification_indices_follow_classes_order(cohort):
     assert reversed_order.tensors(ids)["label"].tolist() == [1 - k for k in expected]
 
 
+def test_viewing_a_target_gives_a_dataframe_even_for_one_id(cohort):
+    target = Classification(cohort.labels, classes=["low", "high"])
+    one = target["002"]
+    assert isinstance(one, pd.DataFrame)
+    assert list(one.index) == ["002"] and list(one.columns) == ["label"]
+    assert list(survival(cohort)[["003", "001"]].index) == ["003", "001"]
+    with pytest.raises(KeyError, match="1 unknown ids"):
+        target["999"]
+
+
 def test_target_subclasses_must_implement_the_target_methods():
     class Incomplete(BaseTarget):
         def tensors(self, ids):
@@ -158,7 +169,7 @@ def test_several_files_per_patient_raise_by_default(cohort):
 def test_concatenated_bag_and_coords_are_row_aligned_regardless_of_file_order(cohort):
     reversed_files = cohort.wsi_files.iloc[::-1]
     source = PatchFeatures(reversed_files, multiple_files="concatenate")
-    bag = source["005"]
+    bag = source.tensors("005")
     coords = source.instances("005")
     np.testing.assert_array_equal(bag.numpy(), cohort.bags["005"])
     np.testing.assert_array_equal(coords[["x", "y"]].to_numpy(), cohort.coords["005"])
@@ -173,32 +184,69 @@ def test_id_pattern_must_match_every_file(cohort):
 def test_missing_h5_key_raises(cohort):
     source = PatchFeatures(cohort.wsi_files, features_key="feats", multiple_files="concatenate")
     with pytest.raises(KeyError, match="no dataset 'feats'"):
+        source.tensors("001")
+    with pytest.raises(KeyError, match="no dataset 'feats'"):
         source["001"]
+
+
+def test_patch_view_is_row_aligned_with_tensors_and_instances(cohort):
+    source = wsi(cohort)
+    view = source[["005", "001"]]
+    assert view.index.names == ["id", "patch"]
+    assert list(view.index.unique("id")) == ["005", "001"]
+    assert list(view.columns[:3]) == ["file", "x", "y"]
+    five = view.loc["005"]
+    np.testing.assert_array_equal(five.filter(like="feature_").to_numpy(), source.tensors("005").numpy())
+    np.testing.assert_array_equal(five[["x", "y"]].to_numpy(), source.instances("005")[["x", "y"]].to_numpy())
+    assert five["file"].nunique() == 2
 
 
 # ---------------------------------------------------------------- modalities
 
 
-def test_one_id_gives_an_item_and_several_give_a_batch_in_the_order_asked(cohort):
+def test_tensors_of_one_id_give_an_item_and_of_several_a_batch_in_the_order_asked(cohort):
     table = Tabular(cohort.clinical[["age"]])
-    assert table["002"].shape == (1,)
-    batch = table[["003", "001"]]
+    assert table.tensors("002").shape == (1,)
+    batch = table.tensors(["003", "001"])
     assert batch.shape == (2, 1)
     assert batch[:, 0].tolist() == pytest.approx(cohort.clinical.loc[["003", "001"], "age"].tolist())
 
-    bags = wsi(cohort)[["005", "001"]]
+    bags = wsi(cohort).tensors(["005", "001"])
     assert isinstance(bags, list)
     assert [len(bag) for bag in bags] == [len(cohort.bags["005"]), len(cohort.bags["001"])]
 
 
-def test_indexing_a_modality_checks_the_ids(cohort):
+def test_tensors_of_a_modality_check_the_ids(cohort):
     table = Tabular(cohort.clinical[["age"]])
     with pytest.raises(ValueError, match="no ids requested"):
-        table[[]]
-    with pytest.raises(KeyError, match="unknown id '999'"):
-        table["999"]
+        table.tensors([])
+    with pytest.raises(KeyError, match=r"1 unknown ids, e\.g\. \['999'\]"):
+        table.tensors("999")
     with pytest.raises(KeyError, match="1 unknown ids"):
+        table.tensors(["001", "999"])
+
+
+def test_viewing_a_table_gives_a_dataframe_in_the_order_asked(cohort):
+    table = Tabular(cohort.clinical)
+    one = table["002"]
+    assert isinstance(one, pd.DataFrame)
+    assert list(one.index) == ["002"] and list(one.columns) == ["age", "sex", "smoking"]
+    pd.testing.assert_frame_equal(table[["003", "001"]], cohort.clinical.loc[["003", "001"]], check_names=False)
+    assert list(table[pd.Index(["003", "001"])].index) == ["003", "001"]
+    assert list(table[(pid for pid in ["003", "001"])].index) == ["003", "001"]
+
+
+def test_viewing_a_modality_takes_patient_ids_only(cohort):
+    table = Tabular(cohort.clinical)
+    with pytest.raises(ValueError, match="no ids requested"):
+        table[[]]
+    with pytest.raises(KeyError, match=r"1 unknown ids, e\.g\. \['999'\]"):
         table[["001", "999"]]
+    for key in (0, {"001"}):
+        with pytest.raises(TypeError, match=r"index with \.ids\[i\]"):
+            table[key]
+    with pytest.raises(TypeError, match="must be str"):
+        table[[1]]
 
 
 def test_datasets_take_modality_instances_only(cohort):
@@ -222,16 +270,22 @@ def test_modality_subclasses_must_implement_load_and_bags_their_instances():
         NoInstances()
 
 
-def test_a_new_fixed_shape_modality_needs_only_ids_and_load():
+def test_a_new_fixed_shape_modality_needs_only_ids_a_view_and_load():
     class Constant(FixedShapeModality):
         def __init__(self, ids):
             self.ids = pd.Index(ids)
+
+        def _view(self, ids):
+            return pd.DataFrame({"value": [float(pid) for pid in ids]}, index=ids)
 
         def _load(self, id):
             return torch.full((2, 3), float(id))
 
     data = MultimodalDataset({"grid": Constant(["001", "002"])}, target=None, required_modalities=[])
-    batch = data.collate([data[i] for i in range(len(data))])
+    assert data["002"]["grid"]["value"].tolist() == [2.0]
+    assert data["002"]["target"] is None
+    torch_data = data.as_torch()
+    batch = torch_data.collate([torch_data[i] for i in range(len(torch_data))])
     assert batch["inputs"]["grid"].shape == (2, 2, 3)
     assert batch["inputs"]["grid"][1, 0, 0].item() == 2.0
 
@@ -289,7 +343,8 @@ def test_batch_contract(cohort):
     data = MultimodalDataset(
         {"clinical": Tabular(clinical), "wsi": wsi(cohort)}, target=survival(cohort), required_modalities=["clinical"]
     ).subset(data.ids)
-    batch = data.collate([data[i] for i in range(len(data))])
+    torch_data = data.as_torch()
+    batch = torch_data.collate([torch_data[i] for i in range(len(torch_data))])
     assert batch["ids"] == ["001", "005", "039", "040"]
     assert batch["present"]["wsi"].tolist() == [True, True, False, False]
     assert batch["present"]["clinical"].tolist() == [True] * 4
@@ -303,9 +358,64 @@ def test_a_modality_no_patient_in_the_batch_has_gets_no_input(cohort):
     data = MultimodalDataset(
         {"clinical": Tabular(numeric), "wsi": wsi(cohort)}, target=None, required_modalities=["clinical"]
     ).subset(["039", "040"])
-    batch = data.collate([data[i] for i in range(len(data))])
+    torch_data = data.as_torch()
+    batch = torch_data.collate([torch_data[i] for i in range(len(torch_data))])
     assert batch["present"]["wsi"].tolist() == [False, False]
     assert list(batch["inputs"]) == ["clinical"]
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_as_torch_feeds_a_dataloader_every_patient_once(cohort, num_workers):
+    # spawned workers, the default on macOS and Windows, receive the torch dataset, its modalities and the target by
+    # pickling; forked workers would copy them and test nothing
+    data = MultimodalDataset(
+        {"clinical": Tabular(cohort.clinical[["age"]]), "wsi": wsi(cohort)},
+        target=survival(cohort),
+        required_modalities=[],
+    )
+    torch_data = data.as_torch()
+    loader = DataLoader(
+        torch_data,
+        batch_size=4,
+        shuffle=True,
+        collate_fn=torch_data.collate,
+        generator=torch.Generator().manual_seed(0),
+        num_workers=num_workers,
+        multiprocessing_context="spawn" if num_workers else None,
+    )
+    assert sorted(pid for batch in loader for pid in batch["ids"]) == list(data.ids)
+
+
+def test_viewing_a_dataset_gives_each_modalitys_view_and_the_target(cohort):
+    data = dataset(cohort, required=["clinical"])
+    view = data[["040", "001"]]
+    assert list(view) == ["clinical", "wsi", "target"]
+    pd.testing.assert_frame_equal(view["clinical"], data.modalities["clinical"][["040", "001"]])
+    assert list(view["wsi"].index.unique("id")) == ["001"]
+    pd.testing.assert_frame_equal(view["target"], data.target[["040", "001"]])
+    assert list(data["001"]["clinical"].index) == ["001"]
+
+
+def test_a_modality_a_viewed_patient_lacks_is_none(cohort):
+    data = dataset(cohort, required=["clinical"])
+    view = data["040"]
+    assert list(view) == ["clinical", "wsi", "target"]
+    assert view["wsi"] is None
+
+
+def test_a_modality_cannot_be_called_target(cohort):
+    with pytest.raises(ValueError, match="cannot be called 'target'"):
+        MultimodalDataset({"target": Tabular(cohort.clinical)}, target=None, required_modalities=[])
+
+
+def test_viewing_a_dataset_takes_included_patient_ids(cohort):
+    data = dataset(cohort)
+    with pytest.raises(KeyError, match="missing required modality 'wsi'"):
+        data["040"]
+    with pytest.raises(KeyError, match="not in any modality or target"):
+        data[["001", "999"]]
+    with pytest.raises(TypeError, match=r"MultimodalDataset is indexed by .*index with \.ids\[i\]"):
+        data[0]
 
 
 def test_train_test_split_is_stratified_and_disjoint(cohort):
@@ -322,7 +432,7 @@ def test_train_test_split_is_stratified_and_disjoint(cohort):
 def test_non_numeric_table_needs_a_transform(cohort):
     data = MultimodalDataset({"clinical": Tabular(cohort.clinical)}, target=None, required_modalities=[])
     with pytest.raises(TypeError, match="give this modality a transform"):
-        data[0]
+        data.as_torch()[0]
 
 
 def test_nan_in_table_loads_as_nan(cohort):
@@ -330,7 +440,7 @@ def test_nan_in_table_loads_as_nan(cohort):
     numeric = pd.DataFrame({"age": cohort.clinical["age"]})
     numeric.iloc[1, 0] = np.nan
     data = MultimodalDataset({"clinical": Tabular(numeric)}, target=None, required_modalities=[])
-    assert torch.isnan(data[1]["inputs"]["clinical"]).all()
+    assert torch.isnan(data.as_torch()[1]["inputs"]["clinical"]).all()
 
 
 def column_transform():
@@ -349,8 +459,9 @@ def test_table_transform_output_feeds_the_dataset(cohort):
     data = MultimodalDataset({"clinical": Tabular(cohort.clinical)}, target=None, required_modalities=[])
     fitted = clone(column_transform()).fit(data.modalities["clinical"].transform_input(data.ids))
     transformed = data.with_transforms({"clinical": fitted})
-    assert transformed[0]["inputs"]["clinical"].shape == (3,)
-    assert transformed[0]["inputs"]["clinical"].dtype == torch.float32
+    sample = transformed.as_torch()[0]
+    assert sample["inputs"]["clinical"].shape == (3,)
+    assert sample["inputs"]["clinical"].dtype == torch.float32
     assert list(transformed.modalities["clinical"].frame.columns) == ["age", "sex", "smoking"]
 
 

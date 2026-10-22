@@ -66,30 +66,33 @@ flowchart LR
 
 ### Modalities
 
-A modality holds one kind of data for a set of patients, keyed by patient id. `modality[id]` loads one patient's item
-and `modality[ids]` loads a batch in the order given. Every modality subclasses one of two kinds, and the kind decides
-how a batch is formed:
+A modality holds one kind of data for a set of patients, keyed by patient id. Both ways of reading it take one id or an ordered collection of ids, and answer in the order given ([ADR 0004](adr/0004-patient-data-access.md)):
+
+- `modality[ids]`, the **view**, is for people: readable data, such as a DataFrame indexed by patient id, even for one id.
+- `modality.tensors(ids)` is for the **model**: one patient's item, or a batch for several ids.
+
+Every modality subclasses one of two kinds, and the kind decides how a batch of tensors is formed:
 
 | Kind | Item per patient | Batch |
 | --- | --- | --- |
 | `FixedShapeModality` | the same shape for every patient | one stacked tensor `(n, *shape)` |
 | `BagModality` | an `(N_i, d)` bag of instances, where `N_i` varies | a list of tensors |
 
-A new modality picks its kind and implements `_load(id)`. A bag also implements `instances(id)`, one row describing
-each instance, which attention export joins to the attention weights. A kind that is neither would subclass `Modality`
-directly and implement `collate` too. To add one, see [extending/modalities.md](extending/modalities.md).
+A new modality picks its kind and implements `_view(ids)` and `_load(id)`, which `[ids]` and `tensors` use. A bag also implements `instances(id)`, one row describing each instance, which attention export joins to the attention weights. A kind that is neither would subclass `Modality` directly and implement `collate` too. To add one, see [extending/modalities.md](extending/modalities.md).
 
-| Modality | Kind | Value per patient |
-| --- | --- | --- |
-| `Tabular(frame)` | fixed shape | one float32 vector: the patient's row of a DataFrame indexed by patient id |
-| `PatchFeatures` | bag | `(N_i, D)` pre-extracted patch features, read lazily from HDF5 |
+| Modality | Kind | Tensors per patient | View |
+| --- | --- | --- | --- |
+| `Tabular(frame)` | fixed shape | one float32 vector: the patient's row of a DataFrame indexed by patient id | the rows of the frame |
+| `PatchFeatures` | bag | `(N_i, D)` pre-extracted patch features, read lazily from HDF5 | one row per patch, indexed by `(id, patch)`, with `file`, `x`, `y` and `feature_0`… |
 
 Tables are passed as `Tabular(frame)`; a bare DataFrame is rejected. `Tabular` is the modality that accepts sklearn
 transforms, through `transform_input` and `with_transform`; any other modality given a transform raises an error.
 
-`MultimodalDataset` follows the standard PyTorch pattern: `data[i]` loads one patient, and
-`DataLoader(data, collate_fn=data.collate)` batches them, with each modality's kind forming its part of the batch. A
-modality that no patient in a batch has gets no entry in that batch's inputs.
+`data[ids]` returns a dict of views of the requested patients, one per modality plus `"target"`. A modality none of
+them have, or the target of unlabelled data, is `None`. An excluded id raises `KeyError` with the reason.
+
+For training, `data.as_torch()` returns a `MultimodalTorchDataset`: `torch_data[i]` loads the tensors of patient
+`data.ids[i]`, and `DataLoader(torch_data, collate_fn=torch_data.collate)` batches them, with each modality's kind forming its part of the batch. A modality that no patient in a batch has gets no entry in that batch's inputs.
 
 A whole slide is therefore a bag of pre-extracted patch features: an ordinary modality whose batch is a list rather
 than a stacked tensor, and whose `instances` are its patch coordinates. Feature extraction from raw slides is out of
@@ -113,8 +116,9 @@ labels), which drive stratified splitting.
 
 Both subclass `BaseTarget`, and so does a new endpoint. A target implements `tensors` (the values the head's loss
 reads), `strata` (one discrete label per patient for stratified splitters) and `counts` (the summary counts in fit
-reports and cross-validation folds). The fitted pipeline keeps the target itself, so a head can read what it needs from
-it, such as the class order of a `Classification`.
+reports and cross-validation folds). `BaseTarget` provides the view, `target[ids]`: the rows of `frame`. The fitted
+pipeline keeps the target itself, so a head can read what it needs from it, such as the class order of a
+`Classification`.
 
 ### Preparing tables
 
