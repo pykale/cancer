@@ -7,6 +7,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Sequence
 from functools import cached_property
+from pathlib import Path
 from typing import Any, Literal, Self
 
 import h5py
@@ -169,7 +170,8 @@ class PatchFeatures(BagModality):
     """Pre-extracted patch features: one h5 file (or several) per patient, read lazily per patient.
 
     Args:
-        files: Paths indexed by patient id. A repeated id means that patient has several files.
+        files: Paths indexed by patient id. A repeated id means that patient has several files. Each file must be
+        listed once,as a repeated file would put a patch in a bag twice, or give two patients the same inputs.
         features_key: Dataset holding the (N, D) features in each file.
         coords_key: Dataset holding the (N, 2) patch coordinates, row-aligned with the features.
         multiple_files: What to do when a patient has several files. ``"error"`` raises;
@@ -190,6 +192,19 @@ class PatchFeatures(BagModality):
         self.coords_key = coords_key
         self.multiple_files = multiple_files
         self.ids = _as_ids(pd.Index(files.index).unique(), f"{self.__class__.__name__}").sort_values()
+
+        # file <-> id mapping should always be 1-to-1
+        owners: dict[Path, list[str]] = {}
+        for pid, path in files.items():
+            # use resolve() for absolute paths
+            owners.setdefault(Path(path).resolve(), []).append(pid)
+        repeated = sorted((path, pids) for path, pids in owners.items() if len(pids) > 1)
+        if repeated:
+            path, pids = repeated[0]
+            raise ValueError(
+                f"{len(repeated)} files are listed more than once (e.g. {path} for {pids}); "
+                "each file must be listed once, for one patient"
+            )
         self._paths = {pid: sorted(str(p) for p in paths) for pid, paths in files.groupby(level=0)}
         several = sorted(pid for pid, paths in self._paths.items() if len(paths) > 1)
         if several and multiple_files == "error":
@@ -247,20 +262,18 @@ class PatchFeatures(BagModality):
         # Pass 2: read straight into preallocated buffers.
         features = np.empty((total, n_features), dtype=np.float32)
         xy = np.empty((total, 2), dtype=np.int64)
-        file_codes = np.empty(total, dtype=np.int32)
         patch = np.empty(total, dtype=np.int64)
         id_codes = np.empty(total, dtype=np.int32)
+        files = np.repeat(np.array([path for _, path, _ in plan], dtype=object), [rows for _, _, rows in plan])
 
-        paths = [path for _, path, _ in plan]
         id_position = {pid: k for k, pid in enumerate(ids)}
         start = 0
         next_patch = dict.fromkeys(ids, 0)
-        for k, (pid, path, rows) in enumerate(plan):
+        for pid, path, rows in plan:
             stop = start + rows
             with h5py.File(path, "r") as f:
                 f[self.features_key].read_direct(features, dest_sel=np.s_[start:stop])
                 f[self.coords_key].read_direct(xy, source_sel=np.s_[:, :2], dest_sel=np.s_[start:stop])
-            file_codes[start:stop] = k
             id_codes[start:stop] = id_position[pid]
             patch[start:stop] = np.arange(next_patch[pid], next_patch[pid] + rows)
             next_patch[pid] += rows
@@ -274,7 +287,7 @@ class PatchFeatures(BagModality):
         df = pd.DataFrame(features, index=index, columns=[f"feature_{j}" for j in range(n_features)], copy=False)
         df.insert(0, "y", xy[:, 1])
         df.insert(0, "x", xy[:, 0])
-        df.insert(0, "file", pd.Categorical.from_codes(file_codes, categories=paths))
+        df.insert(0, "file", files)
         return df
 
     @staticmethod

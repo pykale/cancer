@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -176,6 +178,19 @@ def test_concatenated_bag_and_coords_are_row_aligned_regardless_of_file_order(co
     assert coords["file"].nunique() == 2
 
 
+def test_a_file_shared_by_two_patients_raises(cohort):
+    files = pd.Series([cohort.wsi_files.iloc[0]] * 2, index=pd.Index(["001", "002"], name="id"))
+    with pytest.raises(ValueError, match=r"listed more than once .*\['001', '002'\]"):
+        PatchFeatures(files)
+
+
+def test_a_file_listed_twice_for_one_patient_raises_however_it_is_spelled(cohort):
+    path = Path(cohort.wsi_files.iloc[0])
+    files = pd.Series([str(path), f"{path.parent}/./{path.name}"], index=pd.Index(["001", "001"], name="id"))
+    with pytest.raises(ValueError, match=r"listed more than once .*\['001', '001'\]"):
+        PatchFeatures(files, multiple_files="concatenate")
+
+
 def test_id_pattern_must_match_every_file(cohort):
     with pytest.raises(ValueError, match="does not match id_pattern"):
         PatchFeatures.from_glob(cohort.wsi_pattern, id_pattern=r"XX_(\d{3})\.h5$")
@@ -198,6 +213,7 @@ def test_patch_view_is_row_aligned_with_tensors_and_instances(cohort):
     five = view.loc["005"]
     np.testing.assert_array_equal(five.filter(like="feature_").to_numpy(), source.tensors("005").numpy())
     np.testing.assert_array_equal(five[["x", "y"]].to_numpy(), source.instances("005")[["x", "y"]].to_numpy())
+    pd.testing.assert_series_equal(five["file"].reset_index(drop=True), source.instances("005")["file"])
     assert five["file"].nunique() == 2
 
 

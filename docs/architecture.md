@@ -299,6 +299,8 @@ The pipeline is built so a leak fails loudly rather than quietly inflating a sco
 - The baseline hazard that gives survival curves is fitted on the patients used in fit only, never on the ones
   predicted.
 - `cross_validate` checks after every fold that no test patient was used in `fit`.
+- `PatchFeatures` rejects a file listed more than once, so two patients never share inputs that a split could put on
+  both sides.
 
 ### Configuration
 
