@@ -55,12 +55,12 @@ A bag also implements `instances(id)`: a DataFrame with one row per instance, **
 ```python
 class NpyBags(BagModality):
     ...  # __init__ and _load as above, with _load returning an (N_i, d) tensor
-     def _view(self, ids: pd.Index) -> pd.DataFrame:
-         frames = []
-         for pid in ids:
-             rows = np.load(self.files[pid])
-             frames.append(pd.DataFrame(rows, columns=[f"feature_{j}" for j in range(rows.shape[1])]))
-         return pd.concat(frames, keys=ids, names=["id", "instance"])
+    def _view(self, ids: pd.Index) -> pd.DataFrame:
+        frames = []
+        for pid in ids:
+            rows = np.load(self.files[pid])
+            frames.append(pd.DataFrame(rows, columns=[f"feature_{j}" for j in range(rows.shape[1])]))
+        return pd.concat(frames, keys=ids, names=["id", "instance"])
 
     def instances(self, id: str) -> pd.DataFrame:
         n = np.load(self.files[id], mmap_mode="r").shape[0]
