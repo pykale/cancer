@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pandas as pd
 import pytest
@@ -212,9 +213,21 @@ def test_patch_view_is_row_aligned_with_tensors_and_instances(cohort):
     assert list(view.columns[:3]) == ["file", "x", "y"]
     five = view.loc["005"]
     np.testing.assert_array_equal(five.filter(like="feature_").to_numpy(), source.tensors("005").numpy())
-    np.testing.assert_array_equal(five[["x", "y"]].to_numpy(), source.instances("005")[["x", "y"]].to_numpy())
-    pd.testing.assert_series_equal(five["file"].reset_index(drop=True), source.instances("005")["file"])
+    pd.testing.assert_frame_equal(five[["file", "x", "y"]].reset_index(drop=True), source.instances("005"))
     assert five["file"].nunique() == 2
+
+
+def test_patch_view_keeps_coordinates_as_stored(tmp_path):
+    coords = {"a.h5": np.array([[0, 0], [256, 0]], dtype=np.int32), "b.h5": np.array([[12.5, 3.0]], dtype=np.float32)}
+    for name, xy in coords.items():
+        with h5py.File(tmp_path / name, "w") as f:
+            f["features"] = np.zeros((len(xy), 4), dtype=np.float32)
+            f["coords"] = xy
+    files = pd.Series([str(tmp_path / name) for name in coords], index=pd.Index(["001", "001"], name="id"))
+    source = PatchFeatures(files, multiple_files="concatenate")
+    view = source["001"][["file", "x", "y"]].reset_index(drop=True)
+    pd.testing.assert_frame_equal(view, source.instances("001"))
+    assert view["x"].tolist() == [0, 256, 12.5]
 
 
 # ---------------------------------------------------------------- modalities

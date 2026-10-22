@@ -244,11 +244,14 @@ class PatchFeatures(BagModality):
         # Pass 1: shapes only (reads HDF5 headers, not data).
         plan = []  # (id, path, n_rows)
         n_features = None
+        coord_dtypes = []
         for pid in ids:
             for path in self._paths[pid]:
                 with h5py.File(path, "r") as f:
                     rows, d = self._dataset(f, path, self.features_key).shape
-                    n_coords = self._dataset(f, path, self.coords_key).shape[0]
+                    coord_dataset = self._dataset(f, path, self.coords_key)
+                    n_coords = coord_dataset.shape[0]
+                    coord_dtypes.append(coord_dataset.dtype)
                 if n_coords != rows:
                     raise ValueError(f"{path}: {n_coords} coordinates for {rows} feature rows")
                 if n_features is None:
@@ -257,11 +260,12 @@ class PatchFeatures(BagModality):
                     raise ValueError(f"{path}: {d} features, expected {n_features}")
                 plan.append((pid, path, rows))
         total = sum(rows for _, _, rows in plan)
-        assert n_features is not None  # for pre-commit only - it cannot be None due to _requrested_ids()
+        # for mypy check only: _requested_ids() guarantees a non-empty selection
+        assert n_features is not None
 
         # Pass 2: read straight into preallocated buffers.
         features = np.empty((total, n_features), dtype=np.float32)
-        xy = np.empty((total, 2), dtype=np.int64)
+        xy = np.empty((total, 2), dtype=np.result_type(*coord_dtypes))
         patch = np.empty(total, dtype=np.int64)
         id_codes = np.empty(total, dtype=np.int32)
         files = np.repeat(np.array([path for _, path, _ in plan], dtype=object), [rows for _, _, rows in plan])
