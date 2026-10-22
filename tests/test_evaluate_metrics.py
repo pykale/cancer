@@ -16,6 +16,7 @@ from sksurv.util import Surv
 from kalecancer.evaluate import (
     AUROC,
     BalancedAccuracy,
+    CalibrationError,
     EvalContext,
     HarrellC,
     IntegratedBrier,
@@ -74,12 +75,15 @@ def test_arguments_are_stored_under_their_names():
     assert TimeDependentAUC(time=5.0).time == 5.0
     assert AUROC(positive_class="deceased").positive_class == "deceased"
     assert LogRank(n_groups=3).n_groups == 3
+    assert CalibrationError(n_bins=10).n_bins == 10
     assert repr(UnoC(5.0)) == "UnoC(tau=5.0)"
     assert repr(LogRank(3)) == "LogRank(n_groups=3)"
+    assert repr(CalibrationError(10)) == "CalibrationError(n_bins=10)"
     assert all(
         m.higher_is_better
         for m in (HarrellC(), UnoC(1.0), TimeDependentAUC(1.0), AUROC(1), BalancedAccuracy(), LogRank())
     )
+    assert not CalibrationError().higher_is_better
 
 
 def test_harrell_c_matches_sksurv(survival):

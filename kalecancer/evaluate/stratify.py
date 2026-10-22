@@ -93,6 +93,26 @@ def _kaplan_meier_curve(time: np.ndarray, event: np.ndarray) -> pd.DataFrame:
     return curve
 
 
+def _km_survival_at(time: np.ndarray, event: np.ndarray, horizon: float) -> float:
+    """The Kaplan-Meier survival estimate at ``horizon``, for one bin/group of subjects.
+
+    Reads :func:`_kaplan_meier_curve`'s own step function at ``horizon`` -- the value from the last row at or
+    before it (``1.0`` before the first observation, via that function's own ``time=0`` anchor row). ``NaN`` if
+    ``horizon`` falls beyond every observed time while survival has not yet reached 0: the last observation was a
+    censoring, so the curve has nothing to say past where its data ends. If survival already reached 0 by then, it
+    stays 0 -- not an extrapolation, since reaching 0 means everyone in the bin is already known to have had the
+    event.
+    """
+    curve = _kaplan_meier_curve(time, event)
+    at_or_before = curve[curve["time"] <= horizon]
+    if at_or_before.empty:
+        return 1.0
+    last = at_or_before.iloc[-1]
+    if horizon > curve["time"].iloc[-1] and last["survival"] > 0.0:
+        return float("nan")
+    return float(last["survival"])
+
+
 def kaplan_meier(
     prediction: pd.DataFrame,
     target: pd.DataFrame,
