@@ -118,7 +118,7 @@ print(prediction.head())
 # 5. Uncertainty: a 95% bootstrap interval of Harrell's C over the test patients.
 
 assert test.target is not None
-target = test.target.frame.loc[prediction.index]
+target = test.target[prediction.index]
 context = EvalContext(train_target=pipeline.train_target_, classes=None)
 print("Harrell's C, 95% CI:", bootstrap_ci(HarrellC(), prediction, target, context))
 

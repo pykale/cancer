@@ -63,7 +63,8 @@ def make_data(cohort, required, task="survival", with_lab=False):
 
 
 def whole_batch(data):
-    return data.collate([data[i] for i in range(len(data))])
+    torch_data = data.as_torch()
+    return torch_data.collate([torch_data[i] for i in range(len(torch_data))])
 
 
 def intermediate(fusion=None, head_dim=8):

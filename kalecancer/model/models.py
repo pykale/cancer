@@ -53,7 +53,7 @@ def _selected_ids(ids: Sequence[str], mask: Tensor) -> list[str]:
 
 def _loader(source: Modality) -> Callable[[list[str]], Any]:
     """A function that loads the given patients from ``source`` and collates them into one batch."""
-    return lambda ids: source[ids]
+    return lambda ids: source.tensors(ids)
 
 
 def _fit_encoders(

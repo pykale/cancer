@@ -10,13 +10,14 @@ from typing import Any
 import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split as _sklearn_train_test_split
+from torch.utils.data import Dataset
 
-from kalecancer.loaddata.identifiers import _as_ids, _check_leading_zeros, _NotFoundError
+from kalecancer.loaddata.identifiers import _as_ids, _check_leading_zeros, _NotFoundError, _requested_ids
 from kalecancer.loaddata.modalities import Modality
 from kalecancer.loaddata.targets import BaseTarget
 
 
-class MultimodalDataset(torch.utils.data.Dataset):
+class MultimodalDataset:
     """Modalities and a target joined by patient id.
 
     Args:
@@ -37,6 +38,8 @@ class MultimodalDataset(torch.utils.data.Dataset):
         wrong = [name for name, modality in modalities.items() if not isinstance(modality, Modality)]
         if wrong:
             raise TypeError(f"modalities {wrong} are not Modality instances. Wrap a DataFrame in Tabular(frame)")
+        if "target" in modalities:
+            raise ValueError("'target' names the target in data[ids], so a modality cannot be called 'target'")
         if isinstance(required_modalities, str):
             raise TypeError("required_modalities must be a list of modality names, not a single string")
         self.modalities = modalities
@@ -82,17 +85,21 @@ class MultimodalDataset(torch.utils.data.Dataset):
         if isinstance(ids, pd.DataFrame):
             raise TypeError("subset takes ids (a list, Index or Series of str), not a DataFrame")
         requested = _as_ids(ids, "subset")
-        missing = [pid for pid in requested if pid not in self._id_set]
-        if missing:
-            reasons = Counter(self._excluded.get(pid, "not in any modality or target") for pid in missing)
-            raise _NotFoundError(
-                f"subset: {len(missing)} ids are not in this dataset {dict(reasons)}, e.g. {missing[:5]}"
-            )
+        self._check_included(requested, "subset")
         kept = set(requested)
         new = copy.copy(self)
         new._excluded = {**self._excluded, **{pid: "outside subset" for pid in self.ids if pid not in kept}}
         new._set_ids(kept)
         return new
+
+    def _check_included(self, requested: pd.Index, what: str) -> None:
+        """Raise if any of ``requested`` is not in this dataset, with the reason each was excluded."""
+        missing = [pid for pid in requested if pid not in self._id_set]
+        if missing:
+            reasons = Counter(self._excluded.get(pid, "not in any modality or target") for pid in missing)
+            raise _NotFoundError(
+                f"{what}: {len(missing)} ids are not in this dataset {dict(reasons)}, e.g. {missing[:5]}"
+            )
 
     def summary(self) -> pd.DataFrame:
         """Patient counts, as a DataFrame with one ``count`` column.
@@ -126,20 +133,53 @@ class MultimodalDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.ids)
 
+    def __getitem__(self, ids: Iterable[str] | str) -> dict[str, Any]:
+        """The views of ``ids``, keyed by modality name, with the target's rows under ``"target"``.
+
+        Each modality's view holds the requested patients who have that modality, in the order given, and is ``None``
+        when none of them do. ``"target"`` is ``None`` for unlabelled data. The keys are the same for every call.
+        """
+        requested = _requested_ids(ids, None, type(self).__name__)
+        self._check_included(requested, type(self).__name__)
+        views: dict[str, Any] = {}
+        for name, source in self.modalities.items():
+            have = [pid for pid in requested if pid in self._modality_ids[name]]
+            views[name] = source[have] if have else None
+        views["target"] = self.target[requested] if self.target is not None else None
+        return views
+
+    def as_torch(self) -> MultimodalTorchDataset:
+        """This dataset as a map-style torch dataset, for ``DataLoader(torch_data, collate_fn=torch_data.collate)``."""
+        return MultimodalTorchDataset(self)
+
+
+class MultimodalTorchDataset(Dataset):
+    """A ``MultimodalDataset`` as a map-style torch dataset: ``torch_data[i]`` is the tensors of patient ``data.ids[i]``."""
+
+    def __init__(self, data: MultimodalDataset):
+        self.data = data
+
+    def __len__(self) -> int:
+        return len(self.data.ids)
+
     def __getitem__(self, index: int) -> dict:
-        pid = self.ids[index]
-        inputs = {name: source[pid] for name, source in self.modalities.items() if pid in self._modality_ids[name]}
+        pid = self.data.ids[index]
+        inputs = {
+            name: source.tensors(pid)
+            for name, source in self.data.modalities.items()
+            if pid in self.data._modality_ids[name]
+        }
         return {"id": pid, "inputs": inputs}
 
     def collate(self, samples: list[dict]) -> dict:
-        """Collate samples into a batch, for ``DataLoader(collate_fn=data.collate)``.
+        """Collate samples into a batch, for ``DataLoader(torch_data, collate_fn=torch_data.collate)``.
 
         The batch holds the ids, presence masks, the inputs of present patients in batch order, and the target. A
         modality that no patient in the batch has gets no entry in ``inputs``.
         """
         ids = [sample["id"] for sample in samples]
         inputs = {}
-        for name, source in self.modalities.items():
+        for name, source in self.data.modalities.items():
             items = [sample["inputs"][name] for sample in samples if name in sample["inputs"]]
             if items:
                 inputs[name] = source.collate(items)
@@ -147,12 +187,12 @@ class MultimodalDataset(torch.utils.data.Dataset):
             "ids": ids,
             "present": {
                 name: torch.tensor([name in sample["inputs"] for sample in samples], dtype=torch.bool)
-                for name in self.modalities
+                for name in self.data.modalities
             },
             "inputs": inputs,
         }
-        if self.target is not None:
-            batch["target"] = self.target.tensors(ids)
+        if self.data.target is not None:
+            batch["target"] = self.data.target.tensors(ids)
         return batch
 
 
