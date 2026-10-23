@@ -19,10 +19,15 @@ import pytest
 import torch
 from torch import nn
 
-from kalecancer.evaluate import EvalContext, HarrellC, Metric
+from kalecancer.evaluate import HarrellC, IntegratedBrier
 from kalecancer.interpret import feature_shapley, permutation_importance
 from kalecancer.loaddata import MultimodalDataset, Tabular
 from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion
+
+
+def _inner_times(data, quantiles=(0.2, 0.4, 0.6)):
+    """Times inside the follow-up of ``data``'s patients, where survival metrics are defined."""
+    return [float(t) for t in np.quantile(data.target.frame.loc[data.ids, "time"], quantiles)]
 
 
 def informative_model() -> IntermediateFusion:
@@ -48,21 +53,6 @@ def informative_model() -> IntermediateFusion:
     with torch.no_grad():
         model.head.linear.weight[:] = torch.tensor([[1.0, 0.0]])
     return model
-
-
-class InvertedHarrellC(Metric):
-    """``1 - HarrellC``, so smaller is better: a ``higher_is_better = False`` metric to test the sign flip with.
-
-    ``IntegratedBrier``/``CalibrationError`` (the task's suggested examples) both need ``survival_times`` columns
-    that neither ``permutation_importance`` nor ``feature_shapley`` expose a way to request, so they cannot be
-    driven through these two functions directly. This metric needs no such column, exercises the exact same
-    ``higher_is_better = False`` branch, and inverts a metric this file already uses elsewhere.
-    """
-
-    higher_is_better = False
-
-    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
-        return 1.0 - HarrellC()(prediction, target, context)
 
 
 @pytest.fixture
@@ -140,12 +130,24 @@ def test_modality_discovery_raises_naming_what_it_found(fitted):
 
 def test_sign_is_flipped_for_a_lower_is_better_metric(fitted):
     pipe, _train, test = fitted
+    times = _inner_times(test)
 
-    importance = permutation_importance(pipe, test, InvertedHarrellC(), n_repeats=5, seed=0)
+    # IntegratedBrier has higher_is_better=False (lower is better): shuffling the informative feature must still
+    # be reported as a POSITIVE drop -- this is the whole reason the sign flip exists.
+    importance = permutation_importance(pipe, test, IntegratedBrier(), n_repeats=5, seed=0, survival_times=times)
     assert importance.loc["age", "mean"] > 0.0
 
-    shapley = feature_shapley(pipe, test, InvertedHarrellC(), n_samples=10, seed=0)
+    shapley = feature_shapley(pipe, test, IntegratedBrier(), n_samples=10, seed=0, survival_times=times)
     assert shapley["age"] > 0.0
+
+
+def test_a_survival_column_metric_without_survival_times_raises_naming_the_parameter(fitted):
+    pipe, _train, test = fitted
+
+    with pytest.raises(ValueError, match="survival_times"):
+        permutation_importance(pipe, test, IntegratedBrier())
+    with pytest.raises(ValueError, match="survival_times"):
+        feature_shapley(pipe, test, IntegratedBrier())
 
 
 def test_allow_seen_default_false_raises_on_training_patients_allow_seen_true_works(fitted):
