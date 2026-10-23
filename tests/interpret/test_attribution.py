@@ -1,0 +1,162 @@
+"""Tests for permutation_importance and feature_shapley.
+
+The fitted pipeline's clinical encoder and Cox head are hand-built, with a learning rate of 0 so training leaves
+them untouched (as in ``test_pipeline.test_fit_starts_from_the_weights_the_model_was_built_with``): the clinical
+encoder reads only ``age`` (zero weight on ``sex``/``smoking``), and the head reads only the clinical embedding
+(zero weight on the wsi branch). That makes ``log_hazard`` an exact, deterministic function of ``age`` alone --
+sex/smoking get exactly zero importance by construction, and age's importance does not depend on how training
+happened to converge (with everything frozen at its random initial value, nothing converges at all; a wsi branch
+with an untrained, randomly initialised combining weight would otherwise make age's sign and rank a coin flip).
+"""
+
+from __future__ import annotations
+
+from functools import partial
+
+import numpy as np
+import pandas as pd
+import pytest
+import torch
+from torch import nn
+
+from kalecancer.evaluate import EvalContext, HarrellC, Metric
+from kalecancer.interpret import feature_shapley, permutation_importance
+from kalecancer.loaddata import MultimodalDataset, Tabular
+from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion
+
+
+def informative_model() -> IntermediateFusion:
+    """``log_hazard`` is an exact, deterministic function of ``age`` alone.
+
+    The clinical encoder reads only the first (scaled ``age``) column of the transformed frame -- ``sex``/
+    ``smoking`` get exactly zero weight. The Cox head then reads only the clinical embedding -- the wsi branch
+    gets exactly zero weight too, so its randomly initialised (and, with ``lr=0``, never trained) weights cannot
+    affect which feature the model turns out to rely on.
+    """
+    clinical_encoder = nn.Linear(3, 1)
+    with torch.no_grad():
+        clinical_encoder.weight[:] = torch.tensor([[1.0, 0.0, 0.0]])
+        clinical_encoder.bias.zero_()
+    model = IntermediateFusion(
+        encoders={
+            "clinical": [clinical_encoder],
+            "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 1)],
+        },
+        fusion=Concat(),
+        head=CoxHead(in_dim=2, ties="efron"),
+    )
+    with torch.no_grad():
+        model.head.linear.weight[:] = torch.tensor([[1.0, 0.0]])
+    return model
+
+
+class InvertedHarrellC(Metric):
+    """``1 - HarrellC``, so smaller is better: a ``higher_is_better = False`` metric to test the sign flip with.
+
+    ``IntegratedBrier``/``CalibrationError`` (the task's suggested examples) both need ``survival_times`` columns
+    that neither ``permutation_importance`` nor ``feature_shapley`` expose a way to request, so they cannot be
+    driven through these two functions directly. This metric needs no such column, exercises the exact same
+    ``higher_is_better = False`` branch, and inverts a metric this file already uses elsewhere.
+    """
+
+    higher_is_better = False
+
+    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
+        return 1.0 - HarrellC()(prediction, target, context)
+
+
+@pytest.fixture
+def fitted(cohort_factory, dataset_factory, split_factory, pipeline_factory):
+    # Bigger than the shared `cohort` fixture's default 40/30: age's signal, isolated from the (here irrelevant)
+    # wsi branch, needs enough held-out patients for its true positive effect on Harrell's C to not be swamped by
+    # small-sample noise -- 8 test patients (the shared fixture's default split) was not enough to reliably tell
+    # the two apart.
+    cohort = cohort_factory(n_patients=150, n_with_wsi=120, seed=0)
+    train, test = split_factory(dataset_factory(cohort), n_train=90)
+    pipe = pipeline_factory(informative_model(), optimizer=partial(torch.optim.AdamW, lr=0.0)).fit(train)
+    return pipe, train, test
+
+
+def test_informative_feature_ranks_first_and_noise_features_are_exactly_zero(fitted):
+    pipe, _train, test = fitted
+
+    importance = permutation_importance(pipe, test, HarrellC(), n_repeats=5, seed=0)
+    assert importance["mean"].idxmax() == "age"
+    assert importance.loc["age", "mean"] > 0.01
+    np.testing.assert_allclose(importance.loc[["sex", "smoking"], ["mean", "std"]].to_numpy(), 0.0, atol=1e-9)
+
+    shapley = feature_shapley(pipe, test, HarrellC(), n_samples=10, seed=0)
+    assert shapley.idxmax() == "age"
+    assert shapley["age"] > 0.0
+    np.testing.assert_allclose(shapley[["sex", "smoking"]].to_numpy(), 0.0, atol=1e-9)
+
+
+def test_deterministic_for_a_fixed_seed_and_a_different_seed_changes_the_value_not_the_rank(fitted):
+    pipe, _train, test = fitted
+
+    first = permutation_importance(pipe, test, HarrellC(), n_repeats=5, seed=0)
+    again = permutation_importance(pipe, test, HarrellC(), n_repeats=5, seed=0)
+    pd.testing.assert_frame_equal(first, again)
+    other_seed = permutation_importance(pipe, test, HarrellC(), n_repeats=5, seed=1)
+    assert other_seed.loc["age", "mean"] != pytest.approx(first.loc["age", "mean"])
+    assert other_seed["mean"].idxmax() == "age"
+
+    first_shapley = feature_shapley(pipe, test, HarrellC(), n_samples=10, seed=0)
+    again_shapley = feature_shapley(pipe, test, HarrellC(), n_samples=10, seed=0)
+    pd.testing.assert_series_equal(first_shapley, again_shapley)
+    other_seed_shapley = feature_shapley(pipe, test, HarrellC(), n_samples=10, seed=1)
+    assert other_seed_shapley["age"] != pytest.approx(first_shapley["age"])
+    assert other_seed_shapley.idxmax() == "age"
+
+
+def test_n_repeats_changes_std_but_not_materially_the_mean(fitted):
+    pipe, _train, test = fitted
+
+    few = permutation_importance(pipe, test, HarrellC(), n_repeats=3, seed=0)
+    many = permutation_importance(pipe, test, HarrellC(), n_repeats=30, seed=0)
+    assert few.loc["age", "mean"] == pytest.approx(many.loc["age", "mean"], abs=0.05)
+    assert few.loc["age", "std"] != pytest.approx(many.loc["age", "std"])
+
+
+def test_modality_discovery_raises_naming_what_it_found(fitted):
+    pipe, _train, test = fitted
+
+    no_tabular = MultimodalDataset({"wsi": test.modalities["wsi"]}, target=test.target, required_modalities=["wsi"])
+    with pytest.raises(ValueError, match=r"found \[\] of \['wsi'\]"):
+        permutation_importance(pipe, no_tabular, HarrellC())
+    with pytest.raises(ValueError, match=r"found \[\] of \['wsi'\]"):
+        feature_shapley(pipe, no_tabular, HarrellC())
+
+    two_tabular = MultimodalDataset(
+        {**test.modalities, "demographics": Tabular(test.modalities["clinical"].frame)},
+        target=test.target,
+        required_modalities=list(test.required_modalities),
+    )
+    with pytest.raises(ValueError, match=r"found \['clinical', 'demographics'\]"):
+        permutation_importance(pipe, two_tabular, HarrellC())
+    with pytest.raises(ValueError, match=r"found \['clinical', 'demographics'\]"):
+        feature_shapley(pipe, two_tabular, HarrellC())
+
+
+def test_sign_is_flipped_for_a_lower_is_better_metric(fitted):
+    pipe, _train, test = fitted
+
+    importance = permutation_importance(pipe, test, InvertedHarrellC(), n_repeats=5, seed=0)
+    assert importance.loc["age", "mean"] > 0.0
+
+    shapley = feature_shapley(pipe, test, InvertedHarrellC(), n_samples=10, seed=0)
+    assert shapley["age"] > 0.0
+
+
+def test_allow_seen_default_false_raises_on_training_patients_allow_seen_true_works(fitted):
+    pipe, train, _test = fitted
+
+    with pytest.raises(ValueError, match="90 patients were used to fit"):
+        permutation_importance(pipe, train, HarrellC(), n_repeats=2)
+    importance = permutation_importance(pipe, train, HarrellC(), n_repeats=2, allow_seen=True)
+    assert not importance.empty
+
+    with pytest.raises(ValueError, match="90 patients were used to fit"):
+        feature_shapley(pipe, train, HarrellC(), n_samples=2)
+    shapley = feature_shapley(pipe, train, HarrellC(), n_samples=2, allow_seen=True)
+    assert not shapley.empty
