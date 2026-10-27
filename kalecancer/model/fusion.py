@@ -11,15 +11,19 @@ the two cannot disagree, and ``forward`` only ever receives rows it accepts.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import ClassVar, Literal
 
 import pandas as pd
 import torch
-import torch.nn.functional as F
-from torch import Tensor, nn
+from kale.embed.multimodal_fusion import FusionMethod as CoreFusionMethod
+from kale.embed.multimodal_fusion import MajorityVote as CoreMajorityVote
+from kale.embed.multimodal_fusion import MaskedMean as CoreMaskedMean
+from kale.embed.multimodal_fusion import NamedInputConcat as CoreNamedInputConcat
+from kale.embed.multimodal_fusion import masked_mean, stack_present
+from torch import Tensor
 
 from kalecancer.loaddata.targets import BaseTarget, Classification, TimeToEvent
 
@@ -81,21 +85,34 @@ def _heads_predict(context: FusionContext, target_type: type[BaseTarget]) -> boo
 
 
 def _stack_defined(values: Mapping[str, Tensor], defined: Mapping[str, Tensor]) -> tuple[Tensor, Tensor]:
-    """Stack the inputs into ``(n_inputs, n, d)`` values and an ``(n_inputs, n)`` presence mask."""
-    stacked = torch.stack([values[name] for name in values])
-    mask = torch.stack([defined[name] for name in values])
-    return stacked, mask
+    """Stack named inputs and match their presence masks by name.
+
+    Args:
+        values: Floating ``(n, d)`` tensors in input order. Entirely absent inputs may be omitted.
+        defined: Boolean ``(n,)`` masks keyed by input name.
+
+    Returns:
+        Values shaped ``(n_inputs, n, d)`` and boolean masks shaped ``(n_inputs, n)``.
+    """
+    # preserve the helper used by existing custom fusion methods
+    return stack_present(values, defined)
 
 
 def _masked_mean(stacked: Tensor, mask: Tensor) -> Tensor:
-    """Mean of each row over the inputs it has; 0 for a row that has none."""
-    # where() rather than multiplication: absent rows hold NaN, and NaN * 0 is NaN
-    filled = torch.where(mask.unsqueeze(-1), stacked, torch.zeros((), dtype=stacked.dtype, device=stacked.device))
-    count = mask.sum(dim=0).clamp(min=1).unsqueeze(-1).to(stacked.dtype)
-    return filled.sum(dim=0) / count
+    """Average available inputs without propagating absent NaNs.
+
+    Args:
+        stacked: Floating values shaped ``(n_inputs, n, d)``.
+        mask: Boolean availability shaped ``(n_inputs, n)``.
+
+    Returns:
+        Means shaped ``(n, d)`` with the input dtype and device; zero for rows with no inputs.
+        Absent entries have zero gradient. Half-precision inputs accumulate in float32.
+    """
+    return masked_mean(stacked, mask)
 
 
-class FusionMethod(nn.Module, ABC):
+class FusionMethod(CoreFusionMethod):
     """Combines named ``(n, d)`` inputs, which a patient may lack, into one ``(n, d')`` tensor.
 
     Subclasses set ``stages`` and implement ``defined`` and ``forward``. To add rules, override
@@ -108,6 +125,8 @@ class FusionMethod(nn.Module, ABC):
 
     stages: ClassVar[frozenset[Stage]]
     input_space: ClassVar[Literal["output", "prediction"]] = "output"
+    # models validate in check and the dry run, and pass forward only defined rows, so skip core's per-batch checks
+    validate_inputs: bool = False
 
     @abstractmethod
     def defined(self, present: Tensor) -> Tensor:
@@ -124,10 +143,18 @@ class FusionMethod(nn.Module, ABC):
         """``defined`` for a presence table with one row per patient, as a bool Series indexed like it."""
         return pd.Series(self.defined(torch.tensor(present.to_numpy(dtype=bool))).numpy(), index=present.index)
 
-    def check(self, context: FusionContext) -> None:
+    def check(self, context: FusionContext) -> None:  # type: ignore[override]
         """Raise if this method cannot be fitted in ``context``.
 
+        It takes this module's ``FusionContext``, not core's, and keeps the messages that name patients and inputs.
         By default, the method must support ``context.stage``, and every required patient must be defined.
+
+        Args:
+            context: KaleCancer's stage, input availability, widths and branch head kinds.
+
+        Raises:
+            TypeError: If the method does not support the model's fusion stage.
+            ValueError: If a required patient cannot be combined.
         """
         name = type(self).__name__
         if context.stage not in self.stages:
@@ -159,6 +186,9 @@ class FusionMethod(nn.Module, ABC):
             values: ``(n, d)`` tensor for each input, with NaN in rows that lack it. An input that no row has may be
                 left out.
             present: ``(n,)`` bool for every input, ``True`` where the row has it.
+
+        Returns:
+            A floating ``(n, d_out)`` tensor of combined inputs on the input device.
         """
 
 
@@ -170,26 +200,21 @@ class Concat(FusionMethod):
 
     stages = frozenset({"early", "intermediate"})
 
-    def defined(self, present: Tensor) -> Tensor:
-        """The patients who have every input."""
-        return present.all(dim=1)
-
-    def forward(self, values: Mapping[str, Tensor], present: Mapping[str, Tensor]) -> Tensor:
-        """Concatenate the inputs along the feature dimension, in input order."""
-        return torch.cat([values[name] for name in values], dim=-1)
+    # borrow stateless operations without introducing a second FusionMethod inheritance path
+    defined = CoreNamedInputConcat.defined
+    forward = CoreNamedInputConcat.forward
 
 
 class MaskedMean(FusionMethod):
     """Mean of equal-width inputs over the ones each patient has.
 
     In late fusion the inputs are the branch head outputs (logits or log-hazards).
+    Float16 and bfloat16 inputs accumulate in float32 before returning the input dtype.
     """
 
     stages = frozenset({"early", "intermediate", "late"})
 
-    def defined(self, present: Tensor) -> Tensor:
-        """The patients who have at least one input."""
-        return present.any(dim=1)
+    defined = CoreMaskedMean.defined
 
     def check(self, context: FusionContext) -> None:
         """Also needs inputs of one width and, in late fusion, heads of one kind.
@@ -213,9 +238,7 @@ class MaskedMean(FusionMethod):
                 "reorder patients"
             )
 
-    def forward(self, values: Mapping[str, Tensor], present: Mapping[str, Tensor]) -> Tensor:
-        """Average each row over the inputs it has."""
-        return _masked_mean(*_stack_defined(values, present))
+    forward = CoreMaskedMean.forward
 
 
 class MajorityVote(FusionMethod):
@@ -224,6 +247,8 @@ class MajorityVote(FusionMethod):
     Scores are ``(votes_c + 0.5 * mean_probability_c) / (n_branches + 0.5)``: they sum to 1, their argmax is the
     majority class, and ties between classes with equal votes are broken by mean probability. The probability
     term can never outweigh a whole vote.
+    Scores are not calibrated probabilities. Float16 and bfloat16 inputs produce float32 scores;
+    float32 and float64 inputs retain their dtype.
 
     Args:
         tie_break: ``"mean_probability"`` breaks ties as above. ``"error"`` raises when a patient's votes are tied.
@@ -232,15 +257,13 @@ class MajorityVote(FusionMethod):
     stages = frozenset({"late"})
     input_space = "prediction"
 
-    def __init__(self, tie_break: Literal["mean_probability", "error"]):
+    def __init__(self, tie_break: Literal["mean_probability", "error"]) -> None:
         super().__init__()
         if tie_break not in ("mean_probability", "error"):
             raise ValueError(f"tie_break must be 'mean_probability' or 'error', got {tie_break!r}")
         self.tie_break = tie_break
 
-    def defined(self, present: Tensor) -> Tensor:
-        """The patients who have at least one input."""
-        return present.any(dim=1)
+    defined = CoreMajorityVote.defined
 
     def check(self, context: FusionContext) -> None:
         """Also needs classification heads with one output width."""
@@ -253,16 +276,4 @@ class MajorityVote(FusionMethod):
         """One vote-score column per class."""
         return [f"vote_score[{c}]" for c in target.classes]
 
-    def forward(self, values: Mapping[str, Tensor], present: Mapping[str, Tensor]) -> Tensor:
-        """Score each class from the votes of the branches each row has; with ``tie_break="error"``, raise on a tie."""
-        stacked, mask = _stack_defined(values, present)
-        n_classes = stacked.shape[-1]
-        choice = torch.nan_to_num(stacked, nan=-1.0).argmax(dim=-1)
-        votes = (F.one_hot(choice, n_classes).to(stacked.dtype) * mask.unsqueeze(-1)).sum(dim=0)
-        n_branches = mask.sum(dim=0).to(stacked.dtype).unsqueeze(-1)
-        if self.tie_break == "error":
-            top = votes.max(dim=-1, keepdim=True).values
-            tied = ((votes == top).sum(dim=-1) > 1) & (n_branches.squeeze(-1) > 0)
-            if bool(tied.any()):
-                raise ValueError(f"MajorityVote: {int(tied.sum())} patients have tied votes and tie_break='error'")
-        return (votes + 0.5 * _masked_mean(stacked, mask)) / (n_branches + 0.5)
+    forward = CoreMajorityVote.forward
