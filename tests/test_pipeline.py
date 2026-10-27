@@ -121,7 +121,7 @@ def test_fit_predict_evaluate(cohort, tmp_path, monkeypatch):
     pipe.fit(train)
 
     prediction = pipe.predict(test)
-    assert list(prediction.index) == test.ids and list(prediction.columns) == ["log_hazard"]
+    assert list(prediction.index) == list(test.ids) and list(prediction.columns) == ["log_hazard"]
     assert np.isfinite(prediction.to_numpy()).all()
     scores = pipe.evaluate(test, metrics={"harrell_c": HarrellC()})
     assert 0.0 <= scores["harrell_c"] <= 1.0
@@ -513,7 +513,7 @@ def test_encode_is_deterministic_and_attention_aligns_with_coordinates(cohort):
     pipe = pipeline().fit(train)
     first = pipe.encode(test, modality="wsi")
     pd.testing.assert_frame_equal(first, pipe.encode(test, modality="wsi"))
-    assert list(first.index) == test.ids and first.shape[1] == 4
+    assert list(first.index) == list(test.ids) and first.shape[1] == 4
 
     weights = attention(pipe, test, "wsi")
     assert len(weights) == sum(len(cohort.bags[pid]) for pid in test.ids)

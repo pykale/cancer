@@ -150,7 +150,7 @@ def main() -> None:
     baseline = build_pipeline(clinical_model()).fit(train)
     prediction, baseline_prediction = pipe.predict(test), baseline.predict(test)
     assert test.target is not None
-    target = test.target.frame.loc[prediction.index]
+    target = test.target[prediction.index]
     context = EvalContext(train_target=pipe.train_target_, classes=None)
     baseline_context = EvalContext(train_target=baseline.train_target_, classes=None)
     print("fused Harrell's C, 95% CI:        ", bootstrap_ci(HarrellC(), prediction, target, context))

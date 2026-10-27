@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import Counter
-from collections.abc import Hashable, Sequence
+from collections.abc import Hashable, Iterable, Sequence
 
 import numpy as np
 import pandas as pd
 import torch
 from torch import Tensor
 
-from kalecancer.loaddata.identifiers import _as_ids
+from kalecancer.loaddata.identifiers import _as_ids, _requested_ids
 
 
 class BaseTarget(ABC):
@@ -23,13 +23,20 @@ class BaseTarget(ABC):
 
     frame: pd.DataFrame
 
+    def __getitem__(self, ids: Iterable[str] | str) -> pd.DataFrame:
+        """An easy way for users to view the target, indexed by ids.
+
+        Although users can access `self.frame` easily, this keeps the API consistent with `MultimodalDataset` and `Modalities`.
+        """
+        return self.frame.loc[_requested_ids(ids, self.ids, type(self).__name__)]
+
     @property
     def ids(self) -> pd.Index:
         """The patient ids, from the index of ``frame``."""
         return self.frame.index
 
     @abstractmethod
-    def tensors(self, ids: Sequence[str]) -> dict[str, Tensor]:
+    def tensors(self, ids: Iterable[str]) -> dict[str, Tensor]:
         """The target for ``ids``, in that order, as the tensors the head's loss reads."""
 
     @abstractmethod
@@ -53,10 +60,10 @@ class TimeToEvent(BaseTarget):
     def __init__(self, time: pd.Series, event: pd.Series):
         self.time = time
         self.event = event
-        ids = _as_ids(time.index, "TimeToEvent.time")
+        ids = _as_ids(time.index, "TimeToEvent.time").sort_values()
         if set(_as_ids(event.index, "TimeToEvent.event")) != set(ids):
             raise ValueError("TimeToEvent: time and event must be indexed by the same ids")
-        event = event.loc[ids]
+        time, event = time.loc[ids], event.loc[ids]
         if event.isna().any():
             examples = event.index[event.isna()][:5].tolist()
             raise ValueError(
@@ -76,7 +83,7 @@ class TimeToEvent(BaseTarget):
             {"time": numeric_time.to_numpy(dtype=np.float32), "event": event.to_numpy(dtype=bool)}, index=ids
         )
 
-    def tensors(self, ids: Sequence[str]) -> dict[str, Tensor]:
+    def tensors(self, ids: Iterable[str]) -> dict[str, Tensor]:
         """``time`` (float32) and ``event`` (bool) tensors for ``ids``, in that order."""
         rows = self.frame.loc[list(ids)]
         return {
@@ -107,7 +114,8 @@ class Classification(BaseTarget):
         ordered = list(classes)
         if len(ordered) < 2 or len(set(ordered)) != len(ordered):
             raise ValueError(f"Classification: classes must hold at least two distinct values, got {ordered}")
-        ids = _as_ids(labels.index, "Classification")
+        ids = _as_ids(labels.index, "Classification").sort_values()
+        labels = labels.loc[ids]
         if labels.isna().any():
             examples = labels.index[labels.isna()][:5].tolist()
             raise ValueError(f"Classification: {int(labels.isna().sum())} labels are missing (e.g. {examples})")
@@ -117,7 +125,7 @@ class Classification(BaseTarget):
         self._index = {c: k for k, c in enumerate(ordered)}
         self.frame = pd.DataFrame({"label": labels.to_numpy(dtype=object)}, index=ids)
 
-    def tensors(self, ids: Sequence[str]) -> dict[str, Tensor]:
+    def tensors(self, ids: Iterable[str]) -> dict[str, Tensor]:
         """A ``label`` tensor of class indices (int64) for ``ids``, in that order."""
         codes = [self._index[v] for v in self.frame.loc[list(ids), "label"]]
         return {"label": torch.tensor(codes, dtype=torch.int64)}
