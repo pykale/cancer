@@ -150,14 +150,18 @@ def permutation_importance(
     Returns:
         DataFrame indexed by feature name, columns ``mean`` and ``std`` (of the signed drop, over the
         ``n_repeats`` shuffles) and ``baseline`` (the unperturbed score, in ``metric``'s own units, repeated on
-        every row).
+        every row). ``.attrs["n_excluded"]`` is how many of ``data``'s patients lack the ``Tabular`` modality
+        (possible when it is not in ``required_modalities`` -- a ``MaskedMean``-style fusion can still predict
+        such a patient from another modality): they are scored every time, same as everyone else, but never
+        perturbed, since there is no value of theirs to shuffle.
 
     Raises:
         ValueError: Under the conditions of :func:`_resolve_tabular_modality` and :func:`_feature_names`, or if
             ``metric`` needs ``survival_times`` and none was given.
     """
     name, source = _resolve_tabular_modality(data, modality)
-    frame = source.transform_input(data.ids)
+    present_ids = data.present_ids(name)
+    frame = source.transform_input(present_ids)
     features = _feature_names(frame, feature_names)
     sign = 1.0 if metric.higher_is_better else -1.0
 
@@ -173,7 +177,9 @@ def permutation_importance(
             score = _evaluate(pipeline, view, metric, allow_seen=allow_seen, survival_times=survival_times)
             drops[repeat] = sign * (baseline - score)
         rows[feature] = {"mean": float(drops.mean()), "std": float(drops.std()), "baseline": baseline}
-    return pd.DataFrame.from_dict(rows, orient="index")[["mean", "std", "baseline"]]
+    result = pd.DataFrame.from_dict(rows, orient="index")[["mean", "std", "baseline"]]
+    result.attrs["n_excluded"] = len(data.ids) - len(present_ids)
+    return result
 
 
 def feature_shapley(
@@ -226,14 +232,17 @@ def feature_shapley(
             ``CalibrationError``.
 
     Returns:
-        Series indexed by feature name, named ``"shapley"``.
+        Series indexed by feature name, named ``"shapley"``. ``.attrs["n_excluded"]`` is how many of ``data``'s
+        patients lack the ``Tabular`` modality, as in :func:`permutation_importance`: scored every time, never
+        perturbed.
 
     Raises:
         ValueError: Under the conditions of :func:`_resolve_tabular_modality` and :func:`_feature_names`, or if
             ``metric`` needs ``survival_times`` and none was given.
     """
     name, source = _resolve_tabular_modality(data, modality)
-    frame = source.transform_input(data.ids)
+    present_ids = data.present_ids(name)
+    frame = source.transform_input(present_ids)
     features = _feature_names(frame, feature_names)
     sign = 1.0 if metric.higher_is_better else -1.0
 
@@ -271,4 +280,6 @@ def feature_shapley(
             n_samples,
         )
 
-    return pd.Series(values, name="shapley")
+    result = pd.Series(values, name="shapley")
+    result.attrs["n_excluded"] = len(data.ids) - len(present_ids)
+    return result

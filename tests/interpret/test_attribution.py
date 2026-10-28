@@ -21,8 +21,8 @@ from torch import nn
 
 from kalecancer.evaluate import HarrellC, IntegratedBrier
 from kalecancer.interpret import feature_shapley, permutation_importance
-from kalecancer.loaddata import MultimodalDataset, Tabular
-from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion
+from kalecancer.loaddata import MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
+from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, MaskedMean
 
 
 def _inner_times(data, quantiles=(0.2, 0.4, 0.6)):
@@ -53,6 +53,66 @@ def informative_model() -> IntermediateFusion:
     with torch.no_grad():
         model.head.linear.weight[:] = torch.tensor([[1.0, 0.0]])
     return model
+
+
+def masked_mean_model() -> IntermediateFusion:
+    """``log_hazard`` is an exact, deterministic function of ``age`` alone, like ``informative_model``, but fused
+    with ``MaskedMean`` rather than ``Concat`` so a patient missing the (here optional) clinical modality can
+    still be scored from wsi alone -- wsi's own embedding is still a constant zero, same as ``informative_model``.
+    """
+    clinical_encoder = nn.Linear(3, 2)
+    with torch.no_grad():
+        clinical_encoder.weight[:] = torch.tensor([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]])
+        clinical_encoder.bias.zero_()
+    wsi_final = nn.Linear(6, 2)
+    with torch.no_grad():
+        wsi_final.weight.zero_()
+        wsi_final.bias.zero_()
+    model = IntermediateFusion(
+        encoders={
+            "clinical": [clinical_encoder],
+            "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), wsi_final],
+        },
+        fusion=MaskedMean(),
+        head=CoxHead(in_dim=2, ties="efron"),
+    )
+    with torch.no_grad():
+        model.head.linear.weight[:] = torch.tensor([[1.0, 0.0]])
+    return model
+
+
+@pytest.fixture
+def fitted_with_optional_clinical(cohort_factory, pipeline_factory):
+    """Like ``fitted``, but ``clinical`` is not required, and 10 of the patients who do have ``wsi`` have no
+    clinical row at all -- the configuration FINDING 2 is about: a dataset where the Tabular modality is not in
+    ``required_modalities`` and a ``MaskedMean``-style fusion can still predict a patient who lacks it.
+    """
+    cohort = cohort_factory(n_patients=150, n_with_wsi=120, seed=0)
+    clinical = Tabular(cohort.clinical.drop(index=cohort.clinical.index[110:120]))
+    wsi = PatchFeatures(cohort.wsi_files, multiple_files="concatenate")
+    target = TimeToEvent(cohort.time, cohort.event)
+    data = MultimodalDataset({"clinical": clinical, "wsi": wsi}, target=target, required_modalities=["wsi"])
+    train, test = data.subset(data.ids[:90]), data.subset(data.ids[90:])
+    pipe = pipeline_factory(masked_mean_model(), optimizer=partial(torch.optim.AdamW, lr=0.0)).fit(train)
+    return pipe, train, test
+
+
+def test_a_patient_without_the_optional_tabular_modality_is_scored_but_not_perturbed(fitted_with_optional_clinical):
+    pipe, _train, test = fitted_with_optional_clinical
+    missing = int((~test.present["clinical"]).sum())
+    assert missing == 10
+
+    importance = permutation_importance(pipe, test, HarrellC(), n_repeats=3, seed=0)
+    assert importance.attrs["n_excluded"] == missing
+
+    shapley = feature_shapley(pipe, test, HarrellC(), n_samples=5, seed=0)
+    assert shapley.attrs["n_excluded"] == missing
+
+    # the scored cohort -- what the baseline and every perturbed coalition is evaluated over -- is the FULL test
+    # set (30 patients), unchanged by restricting which rows get shuffled; it must not have silently shrunk to
+    # just the 20 patients who have the modality.
+    baseline_direct = pipe.evaluate(test, {"c": HarrellC()})["c"]
+    assert importance["baseline"].iloc[0] == pytest.approx(baseline_direct)
 
 
 @pytest.fixture

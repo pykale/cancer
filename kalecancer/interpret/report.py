@@ -48,9 +48,16 @@ import pandas as pd
 from kalecancer.evaluate.metrics import _SURVIVAL_COLUMN
 from kalecancer.interpret.attention import attention
 from kalecancer.interpret.attribution import _feature_names, _perturbed_view, _resolve_tabular_modality
-from kalecancer.interpret.modality import _coalition_view, _fusion_of, _model_modalities, _require_ablatable
+from kalecancer.interpret.modality import (
+    _coalition_view,
+    _defined_mask,
+    _fusion_of,
+    _model_modalities,
+    _require_ablatable,
+)
 from kalecancer.loaddata.dataset import MultimodalDataset
 from kalecancer.loaddata.modalities import BagModality
+from kalecancer.model.fusion import FusionMethod
 from kalecancer.pipeline.pipeline import Pipeline
 
 logger = logging.getLogger(__name__)
@@ -101,7 +108,7 @@ def _percentile_rank(value: float, population: pd.Series) -> float:
 
 
 def _modality_risk_contributions(
-    pipeline: Pipeline, requested: MultimodalDataset, names: Sequence[str]
+    pipeline: Pipeline, requested: MultimodalDataset, fusion: FusionMethod, names: Sequence[str]
 ) -> pd.DataFrame:
     """Per-patient Shapley value (a risk delta, not a metric) of each modality in ``names``.
 
@@ -110,6 +117,14 @@ def _modality_risk_contributions(
     duplicated here (not imported) because that scoring, not the coalition bookkeeping, is the whole distinction
     this module exists to keep separate. Exact, not sampled: with ``len(names)`` typically 2-4, ``2**k`` is no
     more expensive here than for the cohort version.
+
+    A patient who already lacks one of ``names`` naturally (possible when it is not in ``required_modalities``)
+    can be left with none at all once a coalition ablates the rest -- ``fusion.defined`` is ``False`` for them
+    under that one coalition specifically, not because the fusion method itself can never tolerate a missing
+    modality (:func:`kalecancer.interpret.modality._require_ablatable` already checked that). Scoring only the
+    patients that coalition still defines (:func:`kalecancer.interpret.modality._defined_mask`) and leaving the
+    rest ``NaN`` for it -- rather than handing ``_coalition_view`` a patient it would have to drop entirely,
+    which raises -- keeps that one coalition's missing information from crashing the whole computation.
     """
     k = len(names)
     present_subsets = [frozenset(s) for size in range(1, k + 1) for s in itertools.combinations(names, size)]
@@ -117,8 +132,14 @@ def _modality_risk_contributions(
 
     scores: dict[frozenset[str], pd.Series] = {}
     for present, ablated in zip(present_subsets, ablated_sets, strict=True):
-        view = _coalition_view(requested, ablated)
-        scores[present] = pipeline.predict(view)["log_hazard"].reindex(requested.ids)
+        defined = _defined_mask(requested, fusion, names, ablated)
+        survivors = [pid for pid in requested.ids if defined.loc[pid]]
+        predicted = (
+            pipeline.predict(_coalition_view(requested.subset(survivors), ablated))["log_hazard"]
+            if survivors
+            else pd.Series(dtype=float)
+        )
+        scores[present] = predicted.reindex(requested.ids)
 
     full = frozenset(names)
     loo_drops = (scores[full] - scores[full - {name}] for name in names)
@@ -152,35 +173,43 @@ def _feature_risk_contributions(
     The same permutation-sampling procedure as :func:`kalecancer.interpret.attribution.feature_shapley` -- a
     random feature ordering, an independently-resampled "absent" background, revealed one column at a time -- but
     the per-draw contribution is a risk delta read off directly, never reduced through a metric. The background
-    is resampled from ``data`` (the full, representative cohort), while every ``pipeline.predict`` call here runs
-    only over ``requested`` (just the patients being reported on; see the module docstring on row-independence).
+    is resampled from the patients in ``data`` who HAVE ``name`` (the full, representative cohort; ``name`` need
+    not be required, so not every cohort member has it), while every ``pipeline.predict`` call here runs only
+    over ``requested`` (just the patients being reported on; see the module docstring on row-independence).
+
+    A requested patient without ``name`` at all has no raw value of it to perturb, so their row is NaN for every
+    feature -- never dropped (which would silently narrow who gets a row) and never zero (which would claim
+    "measured, found no effect" about something never measured). ``patient_report`` records who this affected in
+    ``metadata["patients_without_tabular_modality"]``.
     """
     source = data.modalities[name]
-    pool = source.transform_input(data.ids)
-    frame = source.transform_input(requested.ids)
-    m = len(requested.ids)
+    pool = source.transform_input(data.present_ids(name))
+    present = requested.present_ids(name)
+    frame = source.transform_input(present)
+    m = len(present)
     rng = np.random.default_rng(seed)
-    contributions = {f: pd.Series(0.0, index=requested.ids) for f in features}
+    contributions = {f: pd.Series(0.0, index=present) for f in features}
     log_every = max(1, n_samples // 10)
 
-    for sample in range(n_samples):
+    for sample in range(n_samples if m else 0):
         background = {
             f: pd.Series(pool[f].to_numpy()[rng.integers(0, len(pool), size=m)], index=frame.index) for f in features
         }
         order = [features[i] for i in rng.permutation(len(features))]
         still_background = dict(background)
         view = _perturbed_view(requested, name, frame, still_background)
-        previous = pipeline.predict(view)["log_hazard"].reindex(requested.ids)
+        previous = pipeline.predict(view)["log_hazard"].reindex(present)
         for f in order:
             del still_background[f]
             view = _perturbed_view(requested, name, frame, still_background)
-            current = pipeline.predict(view)["log_hazard"].reindex(requested.ids)
+            current = pipeline.predict(view)["log_hazard"].reindex(present)
             contributions[f] = contributions[f] + (current - previous)
             previous = current
         if (sample + 1) % log_every == 0 or sample + 1 == n_samples:
             logger.info("patient_report feature_contributions: %d/%d samples", sample + 1, n_samples)
 
-    return pd.DataFrame({f: values / n_samples for f, values in contributions.items()}, index=requested.ids)
+    result = pd.DataFrame({f: values / n_samples for f, values in contributions.items()}, index=present)
+    return result.reindex(requested.ids)
 
 
 def _find_bag_modality(pipeline: Pipeline, data: MultimodalDataset) -> str | None:
@@ -219,6 +248,13 @@ class PatientReport:
             patient's own risk. Exact Shapley value over modality coalitions, NOT the cohort-level number
             :func:`kalecancer.interpret.modality.modality_shapley` reports.
 
+            ``NaN`` for every modality when this patient already lacks one modality naturally (an optional one
+            they do not have) and some coalition the exact Shapley weighting needs ablates the rest too, leaving
+            them with none at all for that one coalition -- the same kind of "nothing to score" this module
+            otherwise avoids by restricting ``feature_contributions`` to the patients who have the Tabular
+            modality (see that field); here it shows up as ``NaN`` rather than a crash, because exact Shapley
+            combines every coalition's value and one missing value makes the combination undefined too.
+
             This is a risk delta under the model's OWN fusion method (named in ``metadata["fusion"]``), not a
             clean measurement of "how much information this modality carries". For a mean-style fusion
             (``MaskedMean``), marking a modality absent changes how many inputs the mean divides by, which
@@ -231,12 +267,20 @@ class PatientReport:
         feature_contributions: Risk delta per raw clinical feature, by the same logic, for the model's one
             Tabular modality. A sampling estimate (see ``metadata["n_feature_samples"]``). NOT the cohort-level
             number :func:`kalecancer.interpret.attribution.feature_shapley` reports.
+
+            ``NaN`` for every feature when this patient has no row of the Tabular modality at all (possible when
+            it is not in ``required_modalities``): there is no raw value of theirs to perturb, so there is
+            nothing to estimate. ``NaN`` rather than dropping the patient (which would silently narrow who gets
+            a row) or zero (which would claim "measured, found no effect" about something never measured); see
+            ``metadata["patients_without_tabular_modality"]`` for who this affected.
         top_patches: The ``top_k`` most-attended patches for this patient's bag modality. ``None`` when this
             patient individually has no bag (their own ``present`` bit is ``False``) or the model has no single,
             unambiguous bag-pooling modality (see ``metadata["bag_modality"]``).
         metadata: What was computed and how -- ``seed``, ``n_feature_samples``, ``modalities``,
-            ``tabular_modality``, ``bag_modality``, ``cohort_size``, and ``fusion`` (the fusion method
-            ``modality_contributions`` was computed under -- the context needed to read it; see that field).
+            ``tabular_modality``, ``bag_modality``, ``cohort_size``, ``fusion`` (the fusion method
+            ``modality_contributions`` was computed under -- the context needed to read it; see that field), and
+            ``patients_without_tabular_modality`` (which requested patients' ``feature_contributions`` are
+            ``NaN`` for lacking the Tabular modality entirely; see that field).
     """
 
     patient_id: str
@@ -303,14 +347,14 @@ def patient_report(
     fusion = _fusion_of(pipeline)
     _require_ablatable(fusion, model_modalities, model_modalities)
     tabular_name, tabular_source = _resolve_tabular_modality(data, None)
-    features = _feature_names(tabular_source.transform_input(data.ids), None)
+    features = _feature_names(tabular_source.transform_input(data.present_ids(tabular_name)), None)
     bag_modality = _find_bag_modality(pipeline, data)
 
     full_prediction = pipeline.predict(data, survival_times=survival_times)
     population = full_prediction["log_hazard"]
 
     requested = data.subset(list(patient_ids))
-    modality_contributions = _modality_risk_contributions(pipeline, requested, model_modalities)
+    modality_contributions = _modality_risk_contributions(pipeline, requested, fusion, model_modalities)
     feature_contributions = _feature_risk_contributions(
         pipeline, data, requested, tabular_name, features, n_feature_samples, seed
     )
@@ -319,12 +363,16 @@ def patient_report(
     survival_columns = {float(m[1]): c for c in full_prediction.columns if (m := _SURVIVAL_COLUMN.fullmatch(str(c)))}
     times_sorted = sorted(survival_columns)
 
+    present_tabular = set(requested.present_ids(tabular_name))
+    patients_without_tabular = [pid for pid in patient_ids if pid not in present_tabular]
+
     metadata = {
         "seed": seed,
         "n_feature_samples": n_feature_samples,
         "modalities": model_modalities,
         "tabular_modality": tabular_name,
         "bag_modality": bag_modality,
+        "patients_without_tabular_modality": patients_without_tabular,
         "cohort_size": len(data.ids),
         # modality_contributions is a risk delta under THIS fusion method -- see its docstring for why a
         # mean-style fusion mixes rescaling into the delta, which is why a saved report needs to carry this.

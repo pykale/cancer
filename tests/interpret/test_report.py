@@ -19,6 +19,7 @@ from torch import nn
 
 from kalecancer.evaluate import HarrellC
 from kalecancer.interpret import modality_shapley, patient_report, save_reports
+from kalecancer.loaddata import MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
 from kalecancer.model import ABMIL, CoxHead, IntermediateFusion, MaskedMean
 
 
@@ -131,6 +132,41 @@ def test_top_patches_has_at_most_top_k_rows_sorted_by_attention(fitted):
     assert report.top_patches is not None
     assert len(report.top_patches) <= 3
     assert (report.top_patches["attention"].diff().dropna() <= 0).all()
+
+
+@pytest.fixture
+def fitted_with_optional_clinical(cohort_factory, pipeline_factory):
+    """Like ``fitted``, but ``clinical`` is not required, and 5 of the patients who do have ``wsi`` have no
+    clinical row at all -- the configuration FINDING 9 is about: ``MaskedMean`` can still predict such a patient
+    from ``wsi`` alone.
+    """
+    cohort = cohort_factory()
+    clinical = Tabular(cohort.clinical.drop(index=cohort.clinical.index[25:30]))
+    wsi = PatchFeatures(cohort.wsi_files, multiple_files="concatenate")
+    target = TimeToEvent(cohort.time, cohort.event)
+    data = MultimodalDataset({"clinical": clinical, "wsi": wsi}, target=target, required_modalities=["wsi"])
+    train, test = data.subset(data.ids[:22]), data.subset(data.ids[22:])
+    pipe = pipeline_factory(masked_mean_model(), optimizer=partial(torch.optim.AdamW, lr=0.0)).fit(train)
+    return pipe, train, test
+
+
+def test_a_requested_patient_without_the_optional_modality_gets_nan_feature_contributions(
+    fitted_with_optional_clinical,
+):
+    pipe, _train, test = fitted_with_optional_clinical
+    with_clinical = next(pid for pid in test.ids if test.present.loc[pid, "clinical"])
+    without_clinical = next(pid for pid in test.ids if not test.present.loc[pid, "clinical"])
+
+    has_report, lacks_report = patient_report(pipe, test, [with_clinical, without_clinical], n_feature_samples=5)
+
+    assert np.isfinite(has_report.feature_contributions.to_numpy()).all()
+    assert has_report.feature_contributions[["sex", "smoking"]].abs().max() == pytest.approx(0.0, abs=1e-6)
+
+    assert lacks_report.feature_contributions.isna().all()
+    # the documented value (NaN) and the documented reason (this patient_id named in metadata), not a silently
+    # dropped patient or an unreported count.
+    assert lacks_report.metadata["patients_without_tabular_modality"] == [without_clinical]
+    assert len(lacks_report.metadata["patients_without_tabular_modality"]) == 1
 
 
 def test_save_reports_round_trips_to_readable_json(fitted, tmp_path):
