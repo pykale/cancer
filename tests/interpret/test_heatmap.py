@@ -98,6 +98,39 @@ def test_a_frame_with_two_patients_is_refused() -> None:
         attention_heatmap(instances, patch_size=256, downsample=256)
 
 
+def test_a_frame_with_two_files_is_refused() -> None:
+    instances = pd.concat(
+        [
+            _instances([(0, 0)], [1.0]).assign(file="slide_a.h5"),
+            _instances([(256, 0)], [2.0]).assign(file="slide_b.h5"),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="slide_a.h5"):
+        attention_heatmap(instances, patch_size=256, downsample=256)
+
+
+def test_patch_entirely_outside_an_explicit_canvas_leaves_the_border_cell_nan() -> None:
+    # x=256 with patch_size=downsample=32 and canvas_shape=(256, 256): the patch's footprint, [256, 288), does
+    # not intersect the canvas's columns [0, 256) at all.
+    instances = _instances([(256, 0)], [0.9])
+
+    heatmap = attention_heatmap(instances, patch_size=32, downsample=32, canvas_shape=(256, 256), normalise=False)
+
+    assert heatmap.shape == (8, 8)
+    assert np.isnan(heatmap).all()
+
+
+def test_a_partially_overlapping_patch_still_paints_its_in_canvas_part() -> None:
+    # footprint x in [240, 272): only [240, 256) is inside the 256-wide canvas, so the skip must not reject it.
+    instances = _instances([(240, 0)], [0.9])
+
+    heatmap = attention_heatmap(instances, patch_size=32, downsample=32, canvas_shape=(256, 256), normalise=False)
+
+    assert heatmap[0, 7] == pytest.approx(0.9)
+    assert np.isnan(heatmap).sum() == heatmap.size - 1
+
+
 def test_save_heatmap_writes_a_readable_png_of_the_right_dimensions(tmp_path: Path) -> None:
     heatmap = np.array([[0.0, 0.5, np.nan], [1.0, np.nan, 0.25]])
     out_path = tmp_path / "heatmap.png"

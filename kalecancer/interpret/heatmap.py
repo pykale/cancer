@@ -59,7 +59,10 @@ def attention_heatmap(
 
     Args:
         instances: One patient's rows, e.g. from :func:`kalecancer.interpret.attention.attention`. Must not carry
-            more than one ``patient_id`` if that column is present.
+            more than one ``patient_id`` if that column is present, nor more than one ``file`` if that column is
+            present: a patient whose bag spans several ``.h5`` files (``PatchFeatures(multiple_files="concatenate")``)
+            has one coordinate space per file, so a caller with several slides filters to one ``file`` first --
+            otherwise their coordinates would be rasterised as though they shared an origin.
         patch_size: Patch width/height in level-0 pixels. No default: nothing in ``kalecancer.loaddata`` records it
             (see the module docstring), so it must come from whoever extracted the patches.
         downsample: Level-0 pixels per output cell.
@@ -81,9 +84,9 @@ def attention_heatmap(
         attention and no tissue are different things a viewer must be able to tell apart.
 
     Raises:
-        ValueError: If ``instances`` carries more than one ``patient_id``, if its coordinates/weights disagree in
-            length, if ``patch_size``/``downsample`` is not positive, or if ``aggregate`` is not one of ``"mean"``,
-            ``"max"``, ``"sum"``.
+        ValueError: If ``instances`` carries more than one ``patient_id`` or more than one ``file``, if its
+            coordinates/weights disagree in length, if ``patch_size``/``downsample`` is not positive, or if
+            ``aggregate`` is not one of ``"mean"``, ``"max"``, ``"sum"``.
     """
     if "patient_id" in instances.columns:
         patient_ids = sorted(instances["patient_id"].unique())
@@ -91,6 +94,14 @@ def attention_heatmap(
             raise ValueError(
                 f"attention_heatmap needs one patient's rows, found {len(patient_ids)}: {patient_ids}; filter to "
                 "one patient_id first -- merging two patients' patches into one heatmap would be a spatial lie"
+            )
+    if "file" in instances.columns:
+        files = sorted(instances["file"].unique())
+        if len(files) > 1:
+            raise ValueError(
+                f"attention_heatmap needs one slide's rows, found {len(files)} files: {files}; filter to one "
+                "file first -- each file has its own coordinate space, so merging them into one heatmap would be "
+                "a spatial lie"
             )
 
     coords = instances[[x_column, y_column]].to_numpy()
@@ -147,10 +158,19 @@ def _rasterise(
     height = -(-extent_y // downsample)  # ceil division, stdlib-only
     width = -(-extent_x // downsample)
 
-    gx0 = np.clip((x - origin_x) // downsample, 0, width - 1)
-    gy0 = np.clip((y - origin_y) // downsample, 0, height - 1)
-    gx1 = np.clip((x - origin_x + patch_size - 1) // downsample, 0, width - 1)
-    gy1 = np.clip((y - origin_y + patch_size - 1) // downsample, 0, height - 1)
+    # Unclipped grid indices, to tell "overlaps the canvas" from "clamps onto its edge" -- clipping these before
+    # checking which patches intersect would make a patch entirely past the border look like it touches column/row
+    # 0 or width/height - 1, painting it onto that edge instead of leaving it uncovered.
+    gx0_raw = (x - origin_x) // downsample
+    gy0_raw = (y - origin_y) // downsample
+    gx1_raw = (x - origin_x + patch_size - 1) // downsample
+    gy1_raw = (y - origin_y + patch_size - 1) // downsample
+    intersects = (gx1_raw >= 0) & (gx0_raw < width) & (gy1_raw >= 0) & (gy0_raw < height)
+
+    gx0 = np.clip(gx0_raw, 0, width - 1)
+    gy0 = np.clip(gy0_raw, 0, height - 1)
+    gx1 = np.clip(gx1_raw, 0, width - 1)
+    gy1 = np.clip(gy1_raw, 0, height - 1)
 
     sum_grid = np.zeros((height, width), dtype=np.float64)
     count_grid = np.zeros((height, width), dtype=np.int64)
@@ -161,6 +181,8 @@ def _rasterise(
     # variable-size blocks, not a single vectorised op. Rasterising one slide's few thousand patches this way
     # costs milliseconds, not a hot path.
     for i in range(weights.shape[0]):
+        if not intersects[i]:
+            continue
         block = (slice(gy0[i], gy1[i] + 1), slice(gx0[i], gx1[i] + 1))
         sum_grid[block] += weights[i]
         count_grid[block] += 1
