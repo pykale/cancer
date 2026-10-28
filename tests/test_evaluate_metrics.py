@@ -346,3 +346,10 @@ def test_log_rank_degenerate_cases_raise(survival):
     tied = pd.DataFrame({"log_hazard": np.ones(len(test), dtype=np.float32)}, index=test.index)
     with pytest.raises(ValueError, match="quantile cuts are not unique"):
         LogRank()(tied, test, context)
+
+
+def test_quantile_groups_raises_when_a_group_would_be_empty():
+    # Copilot's reproduction: the quantile cuts are unique, but the two tied 1s both land in the bin to the
+    # right of the edge between them, leaving group 2 with no members at all.
+    with pytest.raises(ValueError, match=r"group\(s\) \[2\] would be empty"):
+        _quantile_groups(np.array([0.0, 1.0, 1.0, 2.0]), 4)

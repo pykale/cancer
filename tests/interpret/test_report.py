@@ -13,6 +13,7 @@ import json
 from functools import partial
 
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 from torch import nn
@@ -20,7 +21,7 @@ from torch import nn
 from kalecancer.evaluate import HarrellC
 from kalecancer.interpret import modality_shapley, patient_report, save_reports
 from kalecancer.loaddata import MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
-from kalecancer.model import ABMIL, CoxHead, IntermediateFusion, MaskedMean
+from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, LateFusion, MaskedMean, Unimodal
 
 
 def masked_mean_model() -> IntermediateFusion:
@@ -181,3 +182,108 @@ def test_save_reports_round_trips_to_readable_json(fitted, tmp_path):
     assert loaded[0]["modality_contributions"].keys() == {"clinical", "wsi"}
     assert loaded[0]["risk"] == pytest.approx(reports[0].risk)
     assert loaded[0]["survival"] is None
+
+
+def test_a_patient_missing_a_coalition_modality_gets_nan_not_an_error(fitted_with_optional_clinical, tmp_path):
+    """Regression test for Copilot finding 7: a patient missing one of the coalition's modalities must come back
+    as a reported NaN gap in modality_contributions, through patient_report AND save_reports, not a crash that
+    aborts the whole report.
+    """
+    pipe, _train, test = fitted_with_optional_clinical
+    with_clinical = next(pid for pid in test.ids if test.present.loc[pid, "clinical"])
+    without_clinical = next(pid for pid in test.ids if not test.present.loc[pid, "clinical"])
+
+    has_report, lacks_report = patient_report(pipe, test, [with_clinical, without_clinical], n_feature_samples=5)
+
+    assert np.isfinite(has_report.modality_contributions.to_numpy()).all()
+    assert lacks_report.modality_contributions.isna().all()
+
+    path = tmp_path / "reports.json"
+    save_reports([has_report, lacks_report], path)
+    loaded = json.loads(path.read_text())
+    assert loaded[1]["patient_id"] == without_clinical
+    assert all(np.isnan(v) for v in loaded[1]["modality_contributions"].values())
+
+
+class MeanPool(nn.Module):
+    """Pools a bag by mean -- not an ``AttentionEncoder``, the configuration Copilot finding 8 is about."""
+
+    def __init__(self, in_dim: int):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = in_dim
+
+    def forward(self, bags: list[torch.Tensor]) -> torch.Tensor:
+        return torch.stack([bag.mean(dim=0) for bag in bags])
+
+
+def mean_pool_model() -> IntermediateFusion:
+    """Same shape as ``masked_mean_model``, but wsi's bag encoder mean-pools instead of attending."""
+    return IntermediateFusion(
+        encoders={"clinical": [nn.Linear(3, 4)], "wsi": [MeanPool(16), nn.Linear(16, 4)]},
+        fusion=MaskedMean(),
+        head=CoxHead(in_dim=4, ties="efron"),
+    )
+
+
+def test_a_non_attention_bag_encoder_does_not_abort_the_report(
+    cohort_factory, dataset_factory, split_factory, pipeline_factory, tmp_path
+):
+    cohort = cohort_factory()
+    train, test = split_factory(dataset_factory(cohort))
+    pipe = pipeline_factory(mean_pool_model()).fit(train)
+
+    reports = patient_report(pipe, test, test.ids[:3], n_feature_samples=5)
+
+    for report in reports:
+        assert report.top_patches is None
+        assert report.metadata["attention_unavailable_reason"] is not None
+        assert "wsi" in report.metadata["attention_unavailable_reason"]
+        # everything else in the report is still produced, not aborted by the unsupported bag encoder.
+        assert np.isfinite(report.risk)
+        assert np.isfinite(report.modality_contributions.to_numpy()).all()
+        assert np.isfinite(report.feature_contributions.to_numpy()).all()
+
+    path = tmp_path / "reports.json"
+    save_reports(reports, path)
+    loaded = json.loads(path.read_text())
+    assert all(row["top_patches"] is None for row in loaded)
+
+
+def test_late_fusion_raises_the_explicit_limitation_error(
+    cohort_factory, dataset_factory, split_factory, pipeline_factory
+):
+    cohort = cohort_factory()
+    data = dataset_factory(cohort)
+    rng = np.random.default_rng(0)
+    lab = Tabular(
+        pd.DataFrame(
+            {"a": rng.standard_normal(len(cohort.ids)), "b": rng.standard_normal(len(cohort.ids))},
+            index=pd.Index(cohort.ids, name="patient_id"),
+        )
+    )
+    three = MultimodalDataset(
+        {**data.modalities, "lab": lab},
+        target=data.target,
+        required_modalities=[*data.required_modalities, "lab"],
+    )
+    train, test = split_factory(three)
+    model = LateFusion(
+        branches={
+            "clinical_lab": IntermediateFusion(
+                encoders={"clinical": [nn.Linear(3, 4)], "lab": [nn.Linear(2, 4)]},
+                fusion=Concat(),
+                head=CoxHead(in_dim=8, ties="efron"),
+            ),
+            "wsi": Unimodal(
+                "wsi",
+                [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
+                CoxHead(in_dim=4, ties="efron"),
+            ),
+        },
+        fusion=MaskedMean(),
+    )
+    pipe = pipeline_factory(model).fit(train)
+
+    with pytest.raises(ValueError, match="LateFusion"):
+        patient_report(pipe, test, list(test.ids[:2]))

@@ -19,6 +19,13 @@ This only works with a fusion method that can still define a prediction when one
 everyone, nobody is defined and every prediction would be NaN. Both functions check this against the fitted
 model's actual fusion method up front and raise, rather than silently returning a cohort of NaNs that looks like
 a result.
+
+Nor does it work with ``LateFusion`` yet: its outer fusion combines BRANCH predictions, each branch with its own
+requirements (e.g. a ``Concat`` branch needing several modalities at once), not raw per-modality presence one
+for one the way ``IntermediateFusion``/``EarlyFusion``'s fusion method does. Treating branch-structured
+presence as if it were modality-structured -- which is what reusing the same up-front check would do -- can
+call a coalition "defined" when every branch would actually fail to predict for it. Rather than that silent
+mismatch, ``LateFusion`` is rejected explicitly, the same way ``Concat`` is: see :func:`_require_ablatable`.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ import torch
 from kalecancer.evaluate.metrics import Metric
 from kalecancer.loaddata.dataset import MultimodalDataset
 from kalecancer.loaddata.modalities import Modality
+from kalecancer.model import LateFusion
 from kalecancer.model.fusion import FusionMethod
 from kalecancer.pipeline.pipeline import Pipeline
 
@@ -77,14 +85,34 @@ def _resolve_modalities(pipeline: Pipeline, modalities: Sequence[str] | None) ->
     return list(modalities)
 
 
-def _require_ablatable(fusion: FusionMethod, model_modalities: Sequence[str], names: Sequence[str]) -> None:
+def _require_ablatable(
+    fusion: FusionMethod, model_modalities: Sequence[str], names: Sequence[str], model: object | None = None
+) -> None:
     """Raise unless ``fusion`` can still define a patient missing just one of ``names``, the rest present.
 
     Checked directly against ``fusion.defined`` on a synthetic probe (one row per name in ``names``, every
     modality present except that row's own), rather than against any particular class: a fusion method written
     the same way as ``Concat`` (it needs every input) is caught the same way, without this module needing to
     know its name.
+
+    ``model``, when given, is also checked against ``LateFusion`` specifically: ``LateFusion``'s own ``fusion``
+    combines BRANCH predictions (each branch's own ``_defined_for``, which can need several modalities at once,
+    e.g. a ``Concat`` branch), not raw per-modality presence. Applying it directly to ``data.present`` the way
+    :func:`_defined_mask` does -- correct for ``IntermediateFusion``/``EarlyFusion``, whose fusion method really
+    does combine modalities one-for-one -- can call a coalition "defined" when every one of its branches would
+    actually fail, and a genuinely branch-aware check would need to re-derive each branch's own requirements
+    here, which this module does not yet do. ``model`` defaults to ``None`` only so a caller elsewhere in this
+    package that does not pass it keeps its current behaviour rather than breaking; :func:`leave_one_out_ablation`
+    and :func:`modality_shapley` -- the two functions this module actually supports LateFusion through -- always
+    pass it.
     """
+    if isinstance(model, LateFusion):
+        raise ValueError(
+            "leave_one_out_ablation and modality_shapley do not support LateFusion yet: its outer fusion "
+            "combines branch predictions, not raw modality presence, so a coalition this module considers "
+            "'defined' from modality-level presence alone may not be one any branch can actually predict for. "
+            "Score each branch as its own model instead."
+        )
     columns = {name: j for j, name in enumerate(model_modalities)}
     probe = torch.ones(len(names), len(model_modalities), dtype=torch.bool)
     for row, name in enumerate(names):
@@ -240,13 +268,14 @@ def leave_one_out_ablation(
 
     Raises:
         ValueError: If the fitted model has no fusion method, if its fusion method cannot tolerate even one
-            modality absent (e.g. ``Concat``; see the module docstring), if ``modalities`` names one the model
-            does not read, or if ``metric`` needs ``survival_times`` and none was given.
+            modality absent (e.g. ``Concat``; see the module docstring), if the fitted model is a ``LateFusion``
+            (not supported yet; see :func:`_require_ablatable`), if ``modalities`` names one the model does not
+            read, or if ``metric`` needs ``survival_times`` and none was given.
     """
     names = _resolve_modalities(pipeline, modalities)
     model_modalities = _model_modalities(pipeline)
     fusion = _fusion_of(pipeline)
-    _require_ablatable(fusion, model_modalities, names)
+    _require_ablatable(fusion, model_modalities, names, pipeline.model_)
     sign = 1.0 if metric.higher_is_better else -1.0
 
     coalitions = [frozenset(), *(frozenset({name}) for name in names)]
@@ -283,32 +312,49 @@ def modality_shapley(
     ``frozenset``, then combined with the exact Shapley weighting ``|S|! (k - |S| - 1)! / k!`` over subsets
     ``S`` of the other modalities -- the same weighting the pre-refactor version used.
 
-    THE EMPTY COALITION: with every modality absent, ``fusion.defined`` is ``False`` for everyone (by the same
-    mechanism :func:`_require_ablatable` checks up front), so there is no score ``pipeline.evaluate`` can
-    produce for it -- unlike the pre-refactor version, where an absent modality could still contribute a
-    placeholder value and the empty coalition's prediction was merely *likely* non-finite, here it is
-    architecturally guaranteed to be undefined.
+    THE EMPTY COALITION ("v(empty)", every selected modality absent) is measured directly when it still means
+    something, and only extrapolated when it cannot mean anything at all -- these are different situations:
 
-    A first attempt defined ``v(empty) := 0`` in ``metric``'s own (sign-corrected) units, as an arbitrary but
-    metric-agnostic convention. That turned out to be a bad choice, not just an ugly one: it shifts every
-    modality's value by the same amount, ``(v(empty)_true - 0) / k``, where ``v(empty)_true`` is whatever a
-    truly uninformative prediction scores on this metric -- 0.5 for a concordance-style metric's chance level,
-    for instance, not 0 -- which hid an uninformative modality's value behind that shift rather than reporting
-    it near zero.
+    - ``modalities`` is a PROPER SUBSET of what the model reads (e.g. ``modalities=['clinical']`` on a model
+      that also reads ``wsi``): with every selected modality absent, the unselected ones -- ``wsi`` here -- are
+      still present, exactly as they are for every other coalition this function scores. That is a real,
+      scorable background, not an edge case, so ``v(empty)`` is a genuine ``pipeline.evaluate`` call like any
+      other coalition's, included in :func:`_comparable_ids`'s cohort the same way. This is the fix for a
+      single selected modality on a multi-modality model in particular: with ``k = 1``, the "every other
+      coalition" set this function scores is just ``v({that modality})``, and without a scorable background
+      ``v(empty)`` there would be nothing to form the one Shapley value from at all.
+    - ``modalities`` is ``None`` or covers every modality the model reads: there is no unselected modality left
+      to fall back on, so ``fusion.defined`` is ``False`` for everyone (by the same mechanism
+      :func:`_require_ablatable` checks up front) and there is no score ``pipeline.evaluate`` can produce --
+      unlike the pre-refactor version, where an absent modality could still contribute a placeholder value and
+      the empty coalition's prediction was merely *likely* non-finite, here it is architecturally guaranteed to
+      be undefined.
 
-    ``v(empty)`` is instead defined by linear extrapolation from the full coalition and each modality's
-    leave-one-out drop, assuming no interaction between modalities' marginal contributions::
+      A first attempt defined ``v(empty) := 0`` in ``metric``'s own (sign-corrected) units, as an arbitrary but
+      metric-agnostic convention. That turned out to be a bad choice, not just an ugly one: it shifts every
+      modality's value by the same amount, ``(v(empty)_true - 0) / k``, where ``v(empty)_true`` is whatever a
+      truly uninformative prediction scores on this metric -- 0.5 for a concordance-style metric's chance
+      level, for instance, not 0 -- which hid an uninformative modality's value behind that shift rather than
+      reporting it near zero.
 
-        v(empty) := v(full) - sum_i (v(full) - v(full minus modality i))
-                  = v(full) - sum_i leave_one_out_drop(i)
+      ``v(empty)`` is instead defined by linear extrapolation from the full coalition and each modality's
+      leave-one-out drop, assuming no interaction between modalities' marginal contributions::
 
-    This needs no extra ``pipeline.evaluate`` calls: every ``v(full minus modality i)`` is already one of the
-    ``2**k - 1`` coalitions this function scores anyway. It also has a clean consequence for the efficiency
-    property (Shapley values sum to ``v(full) - v(empty)``): substituting the definition above gives
-    ``sum(shapley values) = sum_i leave_one_out_drop(i)`` -- the Shapley values sum to exactly what
-    :func:`leave_one_out_ablation` would report, totalled over modalities. What Shapley adds over that cheaper
-    function is splitting credit fairly when modalities interact (are redundant with, or complement, each
-    other); it does not change the total credit assigned when interactions are, on net, absent.
+          v(empty) := v(full) - sum_i (v(full) - v(full minus modality i))
+                    = v(full) - sum_i leave_one_out_drop(i)
+
+      This needs no extra ``pipeline.evaluate`` calls: every ``v(full minus modality i)`` is already one of the
+      ``2**k - 1`` coalitions this function scores anyway.
+
+    Either way, the standard Shapley efficiency property holds exactly -- it is a property of the weighting
+    formula, true for whatever value ``v(empty)`` turns out to be, measured or extrapolated:
+    ``sum(shapley values) = v(full) - v(empty)``. Only what that total COMES OUT TO differs: with a scorable
+    background it is the real gap between "every selected modality present" and "every selected modality
+    absent, background present"; without one (the extrapolated case) it reduces to
+    ``sum_i leave_one_out_drop(i)`` -- exactly what :func:`leave_one_out_ablation` would report, totalled over
+    modalities. What Shapley adds over that cheaper function is splitting credit fairly when modalities
+    interact (are redundant with, or complement, each other); in the extrapolated case it does not change the
+    total credit assigned when interactions are, on net, absent.
 
     Args:
         pipeline: A fitted ``Pipeline``.
@@ -339,12 +385,20 @@ def modality_shapley(
         )
     model_modalities = _model_modalities(pipeline)
     fusion = _fusion_of(pipeline)
-    _require_ablatable(fusion, model_modalities, names)
+    _require_ablatable(fusion, model_modalities, names, pipeline.model_)
     sign = 1.0 if metric.higher_is_better else -1.0
 
     present_subsets = [frozenset(s) for size in range(1, k + 1) for s in itertools.combinations(names, size)]
     ablated_sets = [frozenset(names) - present for present in present_subsets]
-    comparable_ids = _comparable_ids(data, fusion, model_modalities, ablated_sets)
+
+    full = frozenset(names)
+    # The "background" coalition: every selected modality absent. Scorable whenever an unselected modality (one
+    # the model reads but modalities= did not name) stays present -- then it is a real coalition like any other,
+    # not the architecturally-undefined case _require_ablatable guards against (that check is about every
+    # MODEL modality, not just the selected ones).
+    background_scorable = bool(_defined_mask(data, fusion, model_modalities, full).any())
+    comparability_sets = [*ablated_sets, full] if background_scorable else ablated_sets
+    comparable_ids = _comparable_ids(data, fusion, model_modalities, comparability_sets)
     base = data.subset(comparable_ids)
 
     scores: dict[frozenset[str], float] = {}
@@ -352,9 +406,14 @@ def modality_shapley(
         view = _coalition_view(base, ablated)
         scores[present] = sign * _evaluate(pipeline, view, metric, allow_seen=allow_seen, survival_times=survival_times)
 
-    full = frozenset(names)
-    loo_drops = (scores[full] - scores[full - {name}] for name in names)
-    scores[frozenset()] = scores[full] - sum(loo_drops)
+    if background_scorable:
+        view = _coalition_view(base, full)
+        scores[frozenset()] = sign * _evaluate(
+            pipeline, view, metric, allow_seen=allow_seen, survival_times=survival_times
+        )
+    else:
+        loo_drops = (scores[full] - scores[full - {name}] for name in names)
+        scores[frozenset()] = scores[full] - sum(loo_drops)
 
     shapley = {}
     for name in names:

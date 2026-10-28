@@ -269,9 +269,16 @@ class IntegratedBrier(Metric):
 def _quantile_groups(values: np.ndarray, n_groups: int) -> np.ndarray:
     """Assign each value to one of ``n_groups`` equal-sized quantile groups: 0 the lowest, ``n_groups - 1`` highest.
 
+    Unique cuts are not enough to guarantee every group gets a member: e.g. ``[0, 1, 1, 2]`` with ``n_groups=4``
+    gives distinct edges but codes ``[0, 1, 1, 3]`` -- group 2 is empty, because the two tied ``1``s both land in
+    the same bin rather than splitting across the one edge between them. Checked here, after assigning codes,
+    rather than left for a caller to discover when it tries to estimate something (survival, a group mean) over
+    an empty group.
+
     Raises:
-        ValueError: If ``n_groups < 2``, or the quantile cuts are not unique -- the values are too heavily tied to
-            form ``n_groups`` distinct groups.
+        ValueError: If ``n_groups < 2``, if the quantile cuts are not unique, or if a cut leaves one of the
+            ``n_groups`` groups with no members -- both mean the values are too heavily tied to form that many
+            distinct, non-empty groups.
     """
     if n_groups < 2:
         raise ValueError(f"n_groups must be at least 2, got {n_groups}")
@@ -281,7 +288,14 @@ def _quantile_groups(values: np.ndarray, n_groups: int) -> np.ndarray:
             f"cannot form {n_groups} risk groups: quantile cuts are not unique among {values.size} values "
             f"({np.unique(values).size} distinct) -- they are too heavily tied"
         )
-    return np.clip(np.digitize(values, edges[1:-1], right=True), 0, n_groups - 1)
+    codes = np.clip(np.digitize(values, edges[1:-1], right=True), 0, n_groups - 1)
+    empty = np.flatnonzero(np.bincount(codes, minlength=n_groups) == 0)
+    if empty.size:
+        raise ValueError(
+            f"cannot form {n_groups} risk groups: group(s) {empty.tolist()} would be empty among {values.size} "
+            f"values ({np.unique(values).size} distinct) -- they are too heavily tied"
+        )
+    return codes
 
 
 def _log_rank_statistic(time: np.ndarray, event: np.ndarray, group: np.ndarray, n_groups: int) -> float:

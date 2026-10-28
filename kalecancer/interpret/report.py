@@ -41,6 +41,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -57,6 +58,7 @@ from kalecancer.interpret.modality import (
 )
 from kalecancer.loaddata.dataset import MultimodalDataset
 from kalecancer.loaddata.modalities import BagModality
+from kalecancer.model.encode.base_encoders import AttentionEncoder
 from kalecancer.model.fusion import FusionMethod
 from kalecancer.pipeline.pipeline import Pipeline
 
@@ -218,6 +220,23 @@ def _find_bag_modality(pipeline: Pipeline, data: MultimodalDataset) -> str | Non
     return bags[0] if len(bags) == 1 else None
 
 
+def _can_attend(pipeline: Pipeline, modality: str) -> bool:
+    """Whether ``modality``'s encoder list has exactly one ``AttentionEncoder`` -- what :func:`attention` needs.
+
+    Checked here, against the fitted encoder list itself (:meth:`Pipeline.model_.encoders_for`, the same lookup
+    ``run_encoders`` uses), before ever calling :func:`attention` -- a mean-pooling (or any other non-attention)
+    bag encoder is a known, nameable gap, not an exception to catch. ``attention`` itself raises for anything
+    other than exactly one match; this mirrors that exact condition rather than a looser "has some attention
+    encoder" guess, so the two can never disagree about what counts as attention-capable.
+    """
+    # Pipeline.model_ is typed as plain nn.Module (see kalecancer.interpret.modality._model_modalities for the
+    # same pre-existing limitation), so .encoders_for resolves through nn.Module's own loosely-typed
+    # __getattr__ rather than a real method signature; it is a genuine EncoderList at runtime regardless.
+    encoders = cast(Any, pipeline.model_).encoders_for(modality)
+    hits = [encoder for encoder in encoders if isinstance(encoder, AttentionEncoder)]
+    return len(hits) == 1
+
+
 def _top_patches(
     pipeline: Pipeline, requested: MultimodalDataset, bag_modality: str | None, top_k: int
 ) -> dict[str, pd.DataFrame | None]:
@@ -274,13 +293,18 @@ class PatientReport:
             a row) or zero (which would claim "measured, found no effect" about something never measured); see
             ``metadata["patients_without_tabular_modality"]`` for who this affected.
         top_patches: The ``top_k`` most-attended patches for this patient's bag modality. ``None`` when this
-            patient individually has no bag (their own ``present`` bit is ``False``) or the model has no single,
-            unambiguous bag-pooling modality (see ``metadata["bag_modality"]``).
+            patient individually has no bag (their own ``present`` bit is ``False``), the model has no single,
+            unambiguous bag-pooling modality, or that modality's encoder cannot produce attention weights at all
+            (e.g. it pools by mean rather than attention) -- ``metadata["attention_unavailable_reason"]`` names
+            which of the last two it is, and is ``None`` exactly when attention was available at all, so a
+            patient-level ``None`` alongside a ``None`` reason means the first case (this one patient's own bag
+            is missing).
         metadata: What was computed and how -- ``seed``, ``n_feature_samples``, ``modalities``,
             ``tabular_modality``, ``bag_modality``, ``cohort_size``, ``fusion`` (the fusion method
-            ``modality_contributions`` was computed under -- the context needed to read it; see that field), and
+            ``modality_contributions`` was computed under -- the context needed to read it; see that field),
             ``patients_without_tabular_modality`` (which requested patients' ``feature_contributions`` are
-            ``NaN`` for lacking the Tabular modality entirely; see that field).
+            ``NaN`` for lacking the Tabular modality entirely; see that field), and
+            ``attention_unavailable_reason`` (see ``top_patches``).
     """
 
     patient_id: str
@@ -336,8 +360,10 @@ def patient_report(
     Raises:
         ValueError: If ``pipeline`` does not predict a ``log_hazard``, if any ``patient_ids`` entry is not in
             ``data``, if those patients were used to fit ``pipeline`` and ``allow_seen`` is not set, if the
-            fitted model's fusion method cannot tolerate a missing modality (see ``modality_shapley``), or if
-            ``data`` does not have exactly one ``Tabular`` modality.
+            fitted model's fusion method cannot tolerate a missing modality (see ``modality_shapley``), if the
+            fitted model is a ``LateFusion`` (not supported yet; see
+            :func:`kalecancer.interpret.modality._require_ablatable`), or if ``data`` does not have exactly one
+            ``Tabular`` modality.
     """
     _require_survival_model(pipeline)
     _require_known_patients(data, patient_ids)
@@ -345,10 +371,19 @@ def patient_report(
 
     model_modalities = _model_modalities(pipeline)
     fusion = _fusion_of(pipeline)
-    _require_ablatable(fusion, model_modalities, model_modalities)
+    _require_ablatable(fusion, model_modalities, model_modalities, pipeline.model_)
     tabular_name, tabular_source = _resolve_tabular_modality(data, None)
     features = _feature_names(tabular_source.transform_input(data.present_ids(tabular_name)), None)
     bag_modality = _find_bag_modality(pipeline, data)
+    if bag_modality is None:
+        attention_unavailable_reason: str | None = "no single, unambiguous bag-pooling modality found on the model"
+    elif not _can_attend(pipeline, bag_modality):
+        attention_unavailable_reason = (
+            f"modality {bag_modality!r}'s encoder cannot produce attention weights (needs exactly one "
+            "AttentionEncoder; e.g. a mean-pooling encoder has none)"
+        )
+    else:
+        attention_unavailable_reason = None
 
     full_prediction = pipeline.predict(data, survival_times=survival_times)
     population = full_prediction["log_hazard"]
@@ -358,7 +393,9 @@ def patient_report(
     feature_contributions = _feature_risk_contributions(
         pipeline, data, requested, tabular_name, features, n_feature_samples, seed
     )
-    top_patches = _top_patches(pipeline, requested, bag_modality, top_k)
+    top_patches = _top_patches(
+        pipeline, requested, bag_modality if attention_unavailable_reason is None else None, top_k
+    )
 
     survival_columns = {float(m[1]): c for c in full_prediction.columns if (m := _SURVIVAL_COLUMN.fullmatch(str(c)))}
     times_sorted = sorted(survival_columns)
@@ -372,6 +409,7 @@ def patient_report(
         "modalities": model_modalities,
         "tabular_modality": tabular_name,
         "bag_modality": bag_modality,
+        "attention_unavailable_reason": attention_unavailable_reason,
         "patients_without_tabular_modality": patients_without_tabular,
         "cohort_size": len(data.ids),
         # modality_contributions is a risk delta under THIS fusion method -- see its docstring for why a

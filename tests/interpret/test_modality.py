@@ -22,7 +22,7 @@ from torch import nn
 from kalecancer.evaluate import HarrellC
 from kalecancer.interpret import leave_one_out_ablation, modality_shapley
 from kalecancer.loaddata import MultimodalDataset, Tabular
-from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, MaskedMean
+from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, LateFusion, MaskedMean, Unimodal
 from kalecancer.pipeline import Pipeline
 
 
@@ -188,3 +188,69 @@ def test_the_evaluated_cohort_is_identical_across_coalitions(
     # only patients with BOTH modalities are defined under every coalition (baseline, ablate-clinical,
     # ablate-wsi) scored here, so exactly those lacking wsi are excluded from the comparison.
     assert ablation.attrs["n_excluded"] == n_lacking_wsi
+
+
+def test_modality_shapley_with_a_single_selected_modality_satisfies_efficiency(fitted):
+    pipe, _train, test = fitted
+
+    # modalities=["clinical"] on this two-modality model: the "background" coalition (clinical absent, wsi --
+    # the unselected modality -- still present) is a real, scorable coalition, not the architecturally-empty
+    # one, so this must not crash looking up a score it never computed.
+    single = modality_shapley(pipe, test, HarrellC(), modalities=["clinical"])
+    assert set(single.index) == {"clinical"}
+    assert np.isfinite(single["clinical"])
+
+    # for k=1, the Shapley value reduces to exactly one term: v(full) - v(empty). That is the same quantity
+    # leave_one_out_ablation reports for "clinical" against the same real background, so the documented
+    # efficiency statement (sum(shapley) == v(full) - v(empty)) holds as this equality.
+    ablation = leave_one_out_ablation(pipe, test, HarrellC(), modalities=["clinical"])
+    assert single["clinical"] == pytest.approx(ablation["clinical"])
+
+
+def late_fusion_model() -> LateFusion:
+    """A ``Concat`` clinical+lab branch alongside a unimodal wsi branch -- the configuration FINDING 5 is about:
+    the outer ``MaskedMean`` fusion combines branch PREDICTIONS, not raw modality presence, so a modality-level
+    presence check cannot tell whether the clinical_lab branch (which needs BOTH clinical and lab) can actually
+    predict for a given coalition.
+    """
+    return LateFusion(
+        branches={
+            "clinical_lab": IntermediateFusion(
+                encoders={"clinical": [nn.Linear(3, 4)], "lab": [nn.Linear(2, 4)]},
+                fusion=Concat(),
+                head=CoxHead(in_dim=8, ties="efron"),
+            ),
+            "wsi": Unimodal(
+                "wsi",
+                [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
+                CoxHead(in_dim=4, ties="efron"),
+            ),
+        },
+        fusion=MaskedMean(),
+    )
+
+
+def test_late_fusion_is_rejected_naming_the_limitation(
+    cohort_factory, dataset_factory, split_factory, pipeline_factory
+):
+    cohort = cohort_factory()
+    data = dataset_factory(cohort)
+    rng = np.random.default_rng(0)
+    lab = Tabular(
+        pd.DataFrame(
+            {"a": rng.standard_normal(len(cohort.ids)), "b": rng.standard_normal(len(cohort.ids))},
+            index=pd.Index(cohort.ids, name="patient_id"),
+        )
+    )
+    three = MultimodalDataset(
+        {**data.modalities, "lab": lab},
+        target=data.target,
+        required_modalities=[*data.required_modalities, "lab"],
+    )
+    train, test = split_factory(three)
+    pipe = pipeline_factory(late_fusion_model()).fit(train)
+
+    with pytest.raises(ValueError, match="LateFusion"):
+        leave_one_out_ablation(pipe, test, HarrellC())
+    with pytest.raises(ValueError, match="LateFusion"):
+        modality_shapley(pipe, test, HarrellC())
