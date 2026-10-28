@@ -62,7 +62,7 @@ Heavy libraries are kept out of the core install and grouped into extras, so tha
 Run the synthetic example from a clone of the repository. It generates its own cohort, trains an intermediate-fusion Cox model and runs on a CPU in under a minute:
 
 ```bash
-uv run python examples/synthetic/synthetic_survival.py
+uv run python examples/synthetic/survival.py
 ```
 
 The [quickstart](docs/quickstart.md) lists the other [examples](examples/), including fused multimodal models on real data, and how they differ.

@@ -8,65 +8,40 @@ with a Cox head.
 
 Runs on a CPU in under a minute and downloads nothing.
 
-Run with: uv run python examples/synthetic/synthetic_survival.py
+Run with: uv run python examples/synthetic/survival.py
 """
 
+import pandas as pd
 import tempfile
+import torch
 from functools import partial
 from pathlib import Path
-
-import h5py
-import numpy as np
-import pandas as pd
-import torch
-from sklearn.preprocessing import StandardScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
 from kalecancer.evaluate import EvalContext, HarrellC, bootstrap_ci
 from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent, train_test_split, Tabular
 from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion
 from kalecancer.pipeline import Pipeline
+from synthetic_data_generation import PATCH_DIM, make_cohort
 
-# Synthetic cohort: a clinical table, one h5 file of patch features per patient in a temporary folder, and censored
-# survival times.
-
-N_PATIENTS = 300
-PATCH_DIM = 32
-
-
-def make_cohort(folder: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Write one h5 file of patch features per patient into ``folder``; return the clinical table and outcomes."""
-    rng = np.random.default_rng(0)
-    ids = pd.Index([f"patient_{k:03d}" for k in range(N_PATIENTS)], name="patient_id")
-    clinical = pd.DataFrame({"age": rng.normal(60, 10, N_PATIENTS), "stage": rng.integers(1, 5, N_PATIENTS)}, index=ids)
-
-    aggressive_fraction = rng.uniform(0, 0.5, N_PATIENTS)
-    for patient, fraction in zip(ids, aggressive_fraction, strict=True):
-        n_patches = int(rng.integers(20, 200))
-        features = rng.normal(size=(n_patches, PATCH_DIM)).astype(np.float32)
-        features[: int(fraction * n_patches), 0] += 3.0  # aggressive patches stand out in one feature
-        with h5py.File(folder / f"{patient}.h5", "w") as f:
-            f["features"] = features
-            f["coords"] = rng.integers(0, 50_000, size=(n_patches, 2))
-
-    risk = 0.09 * (clinical["age"] - 60) + 1.2 * (clinical["stage"] - 2.5) + 12.0 * aggressive_fraction
-    event_time = rng.exponential(2000 * np.exp(-risk))
-    censoring_time = rng.uniform(200, 3000, N_PATIENTS)
-    outcome = pd.DataFrame(
-        {"time": np.minimum(event_time, censoring_time), "event": event_time <= censoring_time}, index=ids
-    )
-    return clinical, outcome
-
+# Synthetic cohort: a clinical table with some missing values, one h5 file of patch features per patient in a
+# temporary folder, and censored survival times. See `synthetic_data_generation.py`.
 
 workdir = tempfile.TemporaryDirectory()
 folder = Path(workdir.name)
-clinical, outcome = make_cohort(folder)
+make_cohort(folder, n_patients=300, random_state=0, task="survival")
+table = pd.read_csv(folder / "clinical.csv", index_col="patient_id")
+clinical, outcome = table.drop(columns=["time", "event"]), table[["time", "event"]]
 
 # 1. Data: modalities and a target, all indexed by patient id, and which modalities every patient must have.
 
 data = MultimodalDataset(
     modalities={
         "clinical": Tabular(clinical),
-        "slides": PatchFeatures.from_glob(f"{folder}/*.h5", id_pattern=r"(patient_\d{3})\.h5$"),
+        "slides": PatchFeatures.from_glob(f"{folder}/patches/*.h5", id_pattern=r"(patient_\d{3})\.h5$"),
     },
     target=TimeToEvent(time=outcome["time"], event=outcome["event"]),
     required_modalities=["clinical", "slides"],
@@ -80,7 +55,7 @@ train, test = train_test_split(data, test_size=0.25, stratify=True, random_state
 torch.manual_seed(0)
 model = IntermediateFusion(
     encoders={
-        "clinical": [torch.nn.Linear(2, 8)],
+        "clinical": [torch.nn.Linear(3, 8)],
         "slides": [
             ABMIL(in_dim=PATCH_DIM, hidden_dim=16, attention_dim=8, dropout=0.0),
             torch.nn.Linear(16, 8),
@@ -94,9 +69,15 @@ model = IntermediateFusion(
 # used to transform the test data. For a validation split with early stopping, see
 # `examples/hancock/survival_intermediate.py`.
 
+clinical_transform = ColumnTransformer(
+    [
+        ("numeric", make_pipeline(SimpleImputer(), StandardScaler()), ["age", "stage"]),
+        ("categorical", OrdinalEncoder(encoded_missing_value=-1), ["gender"]),
+    ]
+)
 pipeline = Pipeline(
     model=model,
-    transforms={"clinical": StandardScaler()},
+    transforms={"clinical": clinical_transform},
     optimizer=partial(torch.optim.AdamW, lr=1e-3),
     batch_size=32,
     drop_last=True,
