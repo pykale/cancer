@@ -151,6 +151,57 @@ def fitted_with_optional_clinical(cohort_factory, pipeline_factory):
     return pipe, train, test
 
 
+def test_a_singleton_request_lacking_the_optional_modality_completes_with_nan_contributions(
+    fitted_with_optional_clinical,
+):
+    """Regression test for Copilot finding C1: ``patient_ids`` containing ONLY a patient who lacks the optional
+    clinical modality narrows ``requested`` down to nobody present for it. A fitted ``StandardScaler`` has no
+    defined output on zero rows and must not be asked to run on this narrowed view at all; the documented
+    result is NaN, not a crash.
+    """
+    pipe, _train, test = fitted_with_optional_clinical
+    without_clinical = next(pid for pid in test.ids if not test.present.loc[pid, "clinical"])
+
+    [report] = patient_report(pipe, test, [without_clinical], n_feature_samples=5)
+
+    assert report.feature_contributions.isna().all()
+    assert report.metadata["patients_without_tabular_modality"] == [without_clinical]
+
+
+def test_a_singleton_request_lacking_the_optional_modality_saves_and_round_trips(
+    fitted_with_optional_clinical, tmp_path
+):
+    """Same singleton case as above, through save_reports: the narrowed view must not crash building the
+    report in the first place, and the NaN contributions must still serialise and read back correctly.
+    """
+    pipe, _train, test = fitted_with_optional_clinical
+    without_clinical = next(pid for pid in test.ids if not test.present.loc[pid, "clinical"])
+
+    [report] = patient_report(pipe, test, [without_clinical], n_feature_samples=5)
+    path = tmp_path / "singleton.json"
+    save_reports([report], path)
+    loaded = json.loads(path.read_text())
+
+    assert loaded[0]["patient_id"] == without_clinical
+    assert all(np.isnan(v) for v in loaded[0]["feature_contributions"].values())
+
+
+def test_attention_narrows_to_zero_clinical_rows_but_still_produces_top_patches(fitted_with_optional_clinical):
+    """``_top_patches`` narrows separately from the coalition prediction, to the patients who have the bag
+    modality (``wsi``) -- here that narrowed subset is the same single patient, who also lacks ``clinical``.
+    ``attention()`` applies every fitted transform to that subset, not just wsi's own encoder, so this must not
+    crash scaling zero clinical rows either.
+    """
+    pipe, _train, test = fitted_with_optional_clinical
+    without_clinical = next(pid for pid in test.ids if not test.present.loc[pid, "clinical"])
+    assert test.present.loc[without_clinical, "wsi"]  # has the bag modality, so _top_patches does not short-circuit
+
+    [report] = patient_report(pipe, test, [without_clinical], top_k=3)
+
+    assert report.top_patches is not None
+    assert len(report.top_patches) <= 3
+
+
 def test_a_requested_patient_without_the_optional_modality_gets_nan_feature_contributions(
     fitted_with_optional_clinical,
 ):
@@ -168,6 +219,48 @@ def test_a_requested_patient_without_the_optional_modality_gets_nan_feature_cont
     # dropped patient or an unreported count.
     assert lacks_report.metadata["patients_without_tabular_modality"] == [without_clinical]
     assert len(lacks_report.metadata["patients_without_tabular_modality"]) == 1
+
+
+def test_a_mixed_request_still_gets_real_attention_for_the_patient_who_has_clinical(
+    fitted_with_optional_clinical,
+):
+    """No regression from over-skipping: when the narrowed attention subset DOES include a patient with
+    ``clinical`` present, ``_without_zero_row_transforms`` must leave that modality's real transform alone, not
+    skip it just because another patient in the same request lacks it.
+    """
+    pipe, _train, test = fitted_with_optional_clinical
+    with_clinical = next(pid for pid in test.ids if test.present.loc[pid, "clinical"])
+    without_clinical = next(pid for pid in test.ids if not test.present.loc[pid, "clinical"])
+
+    has_report, lacks_report = patient_report(pipe, test, [with_clinical, without_clinical], top_k=3)
+
+    assert has_report.top_patches is not None
+    assert len(has_report.top_patches) <= 3
+    assert lacks_report.top_patches is not None
+    assert len(lacks_report.top_patches) <= 3
+
+
+def test_a_mixed_request_still_gets_real_feature_and_modality_contributions_for_the_patient_who_has_clinical(
+    fitted_with_optional_clinical,
+):
+    """ITEM D2: the same "no regression from over-skipping" guarantee as the attention test above, for
+    feature_contributions and modality_contributions specifically. In this two-patient fixture neither
+    coalition's survivors subset nor the bag-modality subset ever ends up with nobody present for clinical --
+    ``with_clinical`` is always among the survivors whenever anyone is -- so _without_zero_row_transforms's
+    "skip" branch is never actually exercised here; this test passes before and after that fix, by construction,
+    and is kept anyway as the explicit, by-name coverage ITEM D2 asked for. The genuine regression coverage for
+    over-skipping is the singleton-request tests above, where the requested patient IS the only one present.
+    """
+    pipe, _train, test = fitted_with_optional_clinical
+    with_clinical = next(pid for pid in test.ids if test.present.loc[pid, "clinical"])
+    without_clinical = next(pid for pid in test.ids if not test.present.loc[pid, "clinical"])
+
+    has_report, lacks_report = patient_report(pipe, test, [with_clinical, without_clinical], n_feature_samples=5)
+
+    assert np.isfinite(has_report.feature_contributions.to_numpy()).all()
+    assert np.isfinite(has_report.modality_contributions.to_numpy()).all()
+    assert lacks_report.feature_contributions.isna().all()
+    assert lacks_report.modality_contributions.isna().all()
 
 
 def test_save_reports_round_trips_to_readable_json(fitted, tmp_path):
@@ -248,6 +341,71 @@ def test_a_non_attention_bag_encoder_does_not_abort_the_report(
     save_reports(reports, path)
     loaded = json.loads(path.read_text())
     assert all(row["top_patches"] is None for row in loaded)
+
+
+def _tabicl_config() -> dict:
+    """A tiny, untrained TabICL config -- small enough to build and run on CPU in a test, no download needed."""
+    return dict(
+        max_classes=10,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=4,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=2,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        dropout=0.0,
+    )
+
+
+@pytest.fixture
+def fitted_with_tabicl(cohort_factory, dataset_factory, split_factory, pipeline_factory, tmp_path_factory, monkeypatch):
+    """``clinical`` is encoded by a ``TabICLEncoder`` on a tiny, untrained checkpoint -- the configuration
+    FINDING D1 is about. ``MaskedMean`` (not ``Concat``) so the model clears ``_require_ablatable`` and
+    ``patient_report`` reaches the TabICL check instead of failing on fusion ablatability first.
+    """
+    pytest.importorskip("tabicl")
+    from tabicl._model.tabicl import TabICL
+
+    import kalecancer.model.encode.tabicl as tabicl_module
+    from kalecancer.model import TabICLEncoder
+
+    config = _tabicl_config()
+    torch.manual_seed(0)
+    tiny = TabICL(**config)
+    path = tmp_path_factory.mktemp("tabicl") / "tiny.ckpt"
+    torch.save({"config": config, "state_dict": tiny.state_dict()}, path)
+    monkeypatch.setattr(tabicl_module, "hf_hub_download", lambda *args, **kwargs: str(path))
+
+    clinical_encoder = TabICLEncoder(
+        checkpoint="tiny.ckpt", output="row", trainable=[], context_folds=2, random_state=0
+    )
+    width = config["embed_dim"] * config["row_num_cls"]
+    model = IntermediateFusion(
+        encoders={
+            "clinical": [clinical_encoder, nn.Linear(width, 2)],
+            "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 2)],
+        },
+        fusion=MaskedMean(),
+        head=CoxHead(in_dim=2, ties="efron"),
+    )
+    cohort = cohort_factory(n_patients=40, n_with_wsi=30, seed=0)
+    train, test = split_factory(dataset_factory(cohort), n_train=22)
+    pipe = pipeline_factory(model).fit(train)
+    return pipe, train, test
+
+
+def test_a_tabicl_encoded_modality_raises_the_explicit_limitation_through_patient_report(fitted_with_tabicl):
+    """FINDING D1: the same TabICLEncoder limitation attribution.py's own functions reject must surface here
+    too, through patient_report's own call, rather than failing deeper in with TabICLEncoder.forward's raw
+    "rows differ from the context rows" error.
+    """
+    pipe, _train, test = fitted_with_tabicl
+
+    with pytest.raises(ValueError, match="TabICLEncoder"):
+        patient_report(pipe, test, [test.ids[0]])
 
 
 def test_late_fusion_raises_the_explicit_limitation_error(

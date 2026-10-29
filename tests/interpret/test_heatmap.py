@@ -131,6 +131,28 @@ def test_a_partially_overlapping_patch_still_paints_its_in_canvas_part() -> None
     assert np.isnan(heatmap).sum() == heatmap.size - 1
 
 
+def test_a_patch_outside_a_canvas_not_a_multiple_of_downsample_is_excluded() -> None:
+    # canvas_shape=(250, 250) is NOT a multiple of downsample=32: width = ceil(250/32) = 8, i.e. 256 level-0
+    # pixels -- 6 wider than the real canvas. A patch at (250, 0) is outside the real 250-wide canvas even
+    # though its grid column (7) is still < width (8), so a grid-space intersection test would wrongly paint it.
+    instances = _instances([(250, 0)], [0.9])
+
+    heatmap = attention_heatmap(instances, patch_size=32, downsample=32, canvas_shape=(250, 250), normalise=False)
+
+    assert heatmap.shape == (8, 8)
+    assert np.isnan(heatmap).all()
+
+
+def test_a_patch_just_inside_that_same_canvas_is_still_painted() -> None:
+    # footprint x in [249, 281): [249, 250) is inside the 250-wide canvas, so the fix above must not over-reject.
+    instances = _instances([(249, 0)], [0.9])
+
+    heatmap = attention_heatmap(instances, patch_size=32, downsample=32, canvas_shape=(250, 250), normalise=False)
+
+    assert heatmap[0, 7] == pytest.approx(0.9)
+    assert np.isnan(heatmap).sum() == heatmap.size - 1
+
+
 def test_save_heatmap_writes_a_readable_png_of_the_right_dimensions(tmp_path: Path) -> None:
     heatmap = np.array([[0.0, 0.5, np.nan], [1.0, np.nan, 0.25]])
     out_path = tmp_path / "heatmap.png"

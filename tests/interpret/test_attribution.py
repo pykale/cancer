@@ -115,6 +115,132 @@ def test_a_patient_without_the_optional_tabular_modality_is_scored_but_not_pertu
     assert importance["baseline"].iloc[0] == pytest.approx(baseline_direct)
 
 
+def _tabicl_config() -> dict:
+    """A tiny, untrained TabICL config -- small enough to build and run on CPU in a test, no download needed."""
+    return dict(
+        max_classes=10,
+        embed_dim=8,
+        col_num_blocks=1,
+        col_nhead=2,
+        col_num_inds=4,
+        row_num_blocks=1,
+        row_nhead=2,
+        row_num_cls=2,
+        icl_num_blocks=1,
+        icl_nhead=2,
+        dropout=0.0,
+    )
+
+
+@pytest.fixture
+def tabicl_model(tmp_path_factory, monkeypatch):
+    """``clinical`` is encoded by a ``TabICLEncoder`` on a tiny, untrained checkpoint -- the configuration
+    FINDING D1 is about. No network access and no pretrained weights needed: the same tiny-checkpoint pattern
+    ``tests/test_tabicl.py`` uses, built fresh here since that file's fixtures are module-scoped and not meant
+    to be imported across test files.
+    """
+    pytest.importorskip("tabicl")
+    from tabicl._model.tabicl import TabICL
+
+    import kalecancer.model.encode.tabicl as tabicl_module
+    from kalecancer.model import TabICLEncoder
+
+    config = _tabicl_config()
+    torch.manual_seed(0)
+    tiny = TabICL(**config)
+    path = tmp_path_factory.mktemp("tabicl") / "tiny.ckpt"
+    torch.save({"config": config, "state_dict": tiny.state_dict()}, path)
+    monkeypatch.setattr(tabicl_module, "hf_hub_download", lambda *args, **kwargs: str(path))
+
+    clinical_encoder = TabICLEncoder(
+        checkpoint="tiny.ckpt", output="row", trainable=[], context_folds=2, random_state=0
+    )
+    return IntermediateFusion(
+        encoders={
+            "clinical": [clinical_encoder, nn.Linear(config["embed_dim"] * config["row_num_cls"], 1)],
+            "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 1)],
+        },
+        fusion=Concat(),
+        head=CoxHead(in_dim=2, ties="efron"),
+    )
+
+
+@pytest.fixture
+def fitted_with_tabicl(cohort_factory, dataset_factory, split_factory, pipeline_factory, tabicl_model):
+    cohort = cohort_factory(n_patients=40, n_with_wsi=30, seed=0)
+    train, test = split_factory(dataset_factory(cohort), n_train=22)
+    pipe = pipeline_factory(tabicl_model).fit(train)
+    return pipe, train, test
+
+
+def test_a_tabicl_encoded_modality_raises_the_explicit_limitation_naming_tabicl(fitted_with_tabicl):
+    """FINDING D1: perturbing a TabICLEncoder-encoded modality would hit TabICLEncoder.forward's id/value
+    mismatch check (for a context row) or silently rely on it never firing (for an unseen one) -- neither is a
+    real attribution. Both functions must name the limitation up front instead of failing deeper in, or
+    (for an unseen patient) silently computing something never verified against a genuine counterfactual.
+    """
+    pipe, _train, test = fitted_with_tabicl
+
+    with pytest.raises(ValueError, match="TabICLEncoder"):
+        permutation_importance(pipe, test, HarrellC(), n_repeats=2)
+    with pytest.raises(ValueError, match="TabICLEncoder"):
+        feature_shapley(pipe, test, HarrellC(), n_samples=2)
+
+
+def test_an_ordinary_tabular_encoder_is_unaffected_by_the_tabicl_check(fitted):
+    """Same call shape as the TabICL test above, but on `fitted`'s ordinary nn.Linear clinical encoder: the
+    TabICLEncoder-specific check must not raise for a model that has no TabICLEncoder at all.
+    """
+    pipe, _train, test = fitted
+
+    importance = permutation_importance(pipe, test, HarrellC(), n_repeats=2)
+    assert np.isfinite(importance[["mean", "std", "baseline"]].to_numpy()).all()
+    shapley = feature_shapley(pipe, test, HarrellC(), n_samples=2)
+    assert np.isfinite(shapley.to_numpy()).all()
+
+
+def integer_columns_model() -> IntermediateFusion:
+    """Reads a ``clinical`` Tabular modality with pandas' default integer columns, the configuration FINDING A2
+    is about.
+    """
+    return IntermediateFusion(
+        encoders={
+            "clinical": [nn.Linear(2, 2)],
+            "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 2)],
+        },
+        fusion=Concat(),
+        head=CoxHead(in_dim=4, ties="efron"),
+    )
+
+
+@pytest.fixture
+def fitted_with_integer_columns(cohort_factory, pipeline_factory):
+    """``clinical``'s frame has pandas' default integer columns (``0``, ``1``), not named ones -- already
+    numeric, so no transform is needed or given.
+    """
+    cohort = cohort_factory()
+    age = cohort.clinical["age"].to_numpy()
+    clinical = Tabular(pd.DataFrame({0: age, 1: (age > 60).astype(float)}, index=cohort.clinical.index))
+    wsi = PatchFeatures(cohort.wsi_files, multiple_files="concatenate")
+    target = TimeToEvent(cohort.time, cohort.event)
+    data = MultimodalDataset({"clinical": clinical, "wsi": wsi}, target=target, required_modalities=["clinical", "wsi"])
+    train, test = data.subset(data.ids[:22]), data.subset(data.ids[22:])
+    pipe = pipeline_factory(integer_columns_model(), transforms={}).fit(train)
+    return pipe, train, test
+
+
+def test_default_integer_columns_work_for_both_attribution_functions(fitted_with_integer_columns):
+    pipe, _train, test = fitted_with_integer_columns
+
+    importance = permutation_importance(pipe, test, HarrellC(), n_repeats=2)
+    assert list(importance.index) == [0, 1]
+    assert np.isfinite(importance[["mean", "std", "baseline"]].to_numpy()).all()
+
+    shapley = feature_shapley(pipe, test, HarrellC(), n_samples=2)
+    assert list(shapley.index) == [0, 1]
+    assert np.isfinite(shapley.to_numpy()).all()
+
+
 @pytest.fixture
 def fitted(cohort_factory, dataset_factory, split_factory, pipeline_factory):
     # Bigger than the shared `cohort` fixture's default 40/30: age's signal, isolated from the (here irrelevant)

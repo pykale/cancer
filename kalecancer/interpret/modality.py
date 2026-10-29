@@ -128,6 +128,28 @@ def _require_ablatable(
         )
 
 
+class _AlwaysEmpty:
+    """A picklable ``with_transform`` replacement that always returns the same empty modality.
+
+    ``with_transforms`` derives the ``ids`` it asks to transform from the modality's own ``.ids`` (empty, for an
+    ablated modality -- see :func:`_absent`), so the result is always this same ``empty`` modality regardless
+    of what is asked for. A local closure captured ``empty`` the same way and behaved identically, but a local
+    function is not picklable, so an ablated modality (and so the whole ``MultimodalDataset`` holding it) could
+    never cross a process boundary -- a ``DataLoader`` with ``num_workers > 0`` and the ``spawn`` start method
+    (the default on Windows and macOS) sends each worker process a pickled copy of the dataset. A module-level
+    class holding ``empty`` as a plain attribute pickles the same way any other object does, closure or not;
+    pickling two objects that reference each other (``empty.with_transform`` is this, and ``self.empty`` is
+    ``empty``) is also fine -- pickle tracks objects it has already seen and restores the same shared structure
+    rather than looping forever.
+    """
+
+    def __init__(self, empty: Modality) -> None:
+        self.empty = empty
+
+    def __call__(self, fitted_transforms: Any, ids: Sequence[str]) -> Modality:
+        return self.empty
+
+
 def _absent(modality: Modality) -> Modality:
     """A shallow copy of ``modality`` whose ``.ids`` covers nobody -- how ablation marks it absent.
 
@@ -143,13 +165,9 @@ def _absent(modality: Modality) -> Modality:
     empty = copy.copy(modality)
     empty.ids = modality.ids[:0]
 
-    def _with_transform(fitted_transforms: Any, ids: Sequence[str]) -> Modality:
-        """``with_transforms`` derives ``ids`` from ``.ids`` (empty here), so this is always empty too."""
-        return empty
-
     # setattr, not plain assignment: this overrides with_transform on this one instance, which mypy's
     # method-assign check (rightly, in general) refuses for a plain attribute set.
-    setattr(empty, "with_transform", _with_transform)  # noqa: B010
+    setattr(empty, "with_transform", _AlwaysEmpty(empty))  # noqa: B010
     return empty
 
 
@@ -323,6 +341,14 @@ def modality_shapley(
       single selected modality on a multi-modality model in particular: with ``k = 1``, the "every other
       coalition" set this function scores is just ``v({that modality})``, and without a scorable background
       ``v(empty)`` there would be nothing to form the one Shapley value from at all.
+    - ``modalities`` is a proper subset, but NO evaluated patient has the unselected modalities present either
+      (e.g. ``modalities=['clinical']`` where every patient who lacks ``clinical`` also lacks ``wsi``): the
+      background is not scorable, same as the next case. For ``k >= 2`` this still falls back to the
+      extrapolation below. For ``k == 1`` it cannot: the extrapolation reduces to
+      ``v(empty) := v(full) - (v(full) - v(empty))``, i.e. it asks for the very value it would produce, with no
+      second modality's drop to supply independent information. This is genuinely undefined, not merely
+      uncomputed, and raises ``ValueError`` naming it rather than extrapolating a number or raising a bare
+      ``KeyError``.
     - ``modalities`` is ``None`` or covers every modality the model reads: there is no unselected modality left
       to fall back on, so ``fusion.defined`` is ``False`` for everyone (by the same mechanism
       :func:`_require_ablatable` checks up front) and there is no score ``pipeline.evaluate`` can produce --
@@ -372,8 +398,9 @@ def modality_shapley(
         empty coalition.
 
     Raises:
-        ValueError: Under the conditions of :func:`leave_one_out_ablation`, or if ``len(modalities) >
-            max_modalities``.
+        ValueError: Under the conditions of :func:`leave_one_out_ablation`, if ``len(modalities) >
+            max_modalities``, or if exactly one modality is selected and no evaluated patient has a scorable
+            background for it (see THE EMPTY COALITION above).
     """
     names = _resolve_modalities(pipeline, modalities)
     k = len(names)
@@ -397,6 +424,21 @@ def modality_shapley(
     # not the architecturally-undefined case _require_ablatable guards against (that check is about every
     # MODEL modality, not just the selected ones).
     background_scorable = bool(_defined_mask(data, fusion, model_modalities, full).any())
+    if not background_scorable and k == 1:
+        # The extrapolation (v(empty) := v(full) - sum_i leave_one_out_drop(i)) needs independent information
+        # from at least two modalities to be worth anything; with k == 1 it reduces to v(empty) :=
+        # v(full) - (v(full) - v(empty)) = v(empty) -- asking for the very value it would produce, not deriving
+        # it. There is no coalition left to read that value from (reading scores[frozenset()] here, before it
+        # is ever assigned, is exactly the KeyError this guards against), so it is genuinely undefined rather
+        # than merely uncomputed.
+        raise ValueError(
+            f"modality_shapley: no evaluated patient has a scorable background for {sorted(names)} alone -- "
+            "every patient who lacks it also lacks every other modality the model reads, so the empty "
+            "coalition has no defined score to measure, and with only one selected modality there is no "
+            "second one's leave-one-out drop to extrapolate it from either. Pass more modalities, raise "
+            "max_modalities and widen the selection, or restrict data to patients who have an unselected "
+            "modality."
+        )
     comparability_sets = [*ablated_sets, full] if background_scorable else ablated_sets
     comparable_ids = _comparable_ids(data, fusion, model_modalities, comparability_sets)
     base = data.subset(comparable_ids)

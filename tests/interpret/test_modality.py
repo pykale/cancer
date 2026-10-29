@@ -11,6 +11,7 @@ exact rather than merely probable.
 
 from __future__ import annotations
 
+import pickle
 from functools import partial
 
 import numpy as np
@@ -21,6 +22,7 @@ from torch import nn
 
 from kalecancer.evaluate import HarrellC
 from kalecancer.interpret import leave_one_out_ablation, modality_shapley
+from kalecancer.interpret.modality import _absent
 from kalecancer.loaddata import MultimodalDataset, Tabular
 from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, LateFusion, MaskedMean, Unimodal
 from kalecancer.pipeline import Pipeline
@@ -254,3 +256,59 @@ def test_late_fusion_is_rejected_naming_the_limitation(
         leave_one_out_ablation(pipe, test, HarrellC())
     with pytest.raises(ValueError, match="LateFusion"):
         modality_shapley(pipe, test, HarrellC())
+
+
+def test_an_ablated_modality_pickles_and_unpickles_to_an_equivalent_empty_modality():
+    """Regression test for FINDING B1: a local closure cannot cross a pickle round-trip, which a DataLoader
+    worker process always needs (num_workers > 0, the 'spawn' start method -- the default on Windows and
+    macOS). Unconditional, unlike the DataLoader test below, since it needs no multiprocessing to run at all.
+    """
+    clinical = Tabular(pd.DataFrame({"age": [1.0, 2.0]}, index=["p1", "p2"]))
+
+    empty = _absent(clinical)
+    restored = pickle.loads(pickle.dumps(empty))
+
+    assert list(restored.ids) == []
+    # with_transforms derives the ids it asks to transform from .ids (empty here), so this is always empty too.
+    assert restored.with_transform(fitted_transforms=None, ids=[]) is restored
+
+
+def test_ablation_completes_with_dataloader_worker_processes(
+    cohort_factory, dataset_factory, split_factory, pipeline_factory
+):
+    """leave_one_out_ablation scores a ``_coalition_view`` holding an ablated (empty) modality through
+    ``pipeline.evaluate``, which loads it through a real ``DataLoader`` -- with ``num_workers > 0`` that means a
+    worker process unpickling it. A multiprocessing-unrelated failure (e.g. the pickling bug itself regressing)
+    must still fail this test; only genuine inability to spawn worker processes at all is skipped.
+    """
+    cohort = cohort_factory(n_patients=150, n_with_wsi=120, seed=0)
+    train, test = split_factory(dataset_factory(cohort), n_train=90)
+    pipe = pipeline_factory(masked_mean_model(), optimizer=partial(torch.optim.AdamW, lr=0.0), num_workers=2)
+    try:
+        pipe = pipe.fit(train)
+    except (RuntimeError, OSError, EOFError, TimeoutError) as error:
+        pytest.skip(f"test environment cannot spawn DataLoader worker processes: {error}")
+
+    result = leave_one_out_ablation(pipe, test, HarrellC())
+
+    assert not result.empty
+    assert np.isfinite(result.to_numpy()).all()
+
+
+def test_singleton_selection_without_a_scorable_background_raises(
+    cohort_factory, dataset_factory, split_factory, pipeline_factory
+):
+    """Regression test for FINDING B2: modalities=['clinical'] where every evaluated patient also lacks wsi, so
+    there is no scorable background to measure v(empty) from, and (k == 1) nothing to extrapolate it from
+    either -- this must raise a ValueError naming the problem, not a bare KeyError(frozenset()).
+    """
+    cohort = cohort_factory()
+    # required=("clinical",) lets patients without wsi (the last 10 of 40, per make_cohort) into the dataset;
+    # putting all of them in the test split (and none in train) means every evaluated patient lacks wsi.
+    data = dataset_factory(cohort, required=("clinical",))
+    train, test = data.subset(data.ids[:30]), data.subset(data.ids[30:])
+    assert (~test.present["wsi"]).all()
+    pipe = pipeline_factory(masked_mean_model(), optimizer=partial(torch.optim.AdamW, lr=0.0)).fit(train)
+
+    with pytest.raises(ValueError, match="no evaluated patient has a scorable background"):
+        modality_shapley(pipe, test, HarrellC(), modalities=["clinical"])

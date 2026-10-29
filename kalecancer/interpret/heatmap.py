@@ -165,7 +165,16 @@ def _rasterise(
     gy0_raw = (y - origin_y) // downsample
     gx1_raw = (x - origin_x + patch_size - 1) // downsample
     gy1_raw = (y - origin_y + patch_size - 1) // downsample
-    intersects = (gx1_raw >= 0) & (gx0_raw < width) & (gy1_raw >= 0) & (gy0_raw < height)
+
+    # Intersection is tested in LEVEL-0 pixels against the real canvas extent (extent_x/extent_y), not against
+    # width/height: those are ceil(extent / downsample) and so round UP past the real edge whenever the extent
+    # is not a multiple of downsample (e.g. extent_x=250, downsample=32 -> width=8, i.e. 256 level-0 pixels, 6
+    # wider than the real canvas). A patch whose footprint ends exactly at the real edge (or just past it) could
+    # fail this test in level-0 space while still passing a grid-space one against that rounded-up width,
+    # painting a cell past where the canvas actually ends.
+    rel_x0 = x - origin_x
+    rel_y0 = y - origin_y
+    intersects = (rel_x0 + patch_size > 0) & (rel_x0 < extent_x) & (rel_y0 + patch_size > 0) & (rel_y0 < extent_y)
 
     gx0 = np.clip(gx0_raw, 0, width - 1)
     gy0 = np.clip(gy0_raw, 0, height - 1)

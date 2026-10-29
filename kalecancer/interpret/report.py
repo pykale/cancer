@@ -48,8 +48,14 @@ import pandas as pd
 
 from kalecancer.evaluate.metrics import _SURVIVAL_COLUMN
 from kalecancer.interpret.attention import attention
-from kalecancer.interpret.attribution import _feature_names, _perturbed_view, _resolve_tabular_modality
+from kalecancer.interpret.attribution import (
+    _feature_names,
+    _perturbed_view,
+    _require_no_tabicl,
+    _resolve_tabular_modality,
+)
 from kalecancer.interpret.modality import (
+    _absent,
     _coalition_view,
     _defined_mask,
     _fusion_of,
@@ -109,6 +115,32 @@ def _percentile_rank(value: float, population: pd.Series) -> float:
     return 100.0 * (below + 0.5 * tied) / len(defined)
 
 
+def _without_zero_row_transforms(view: MultimodalDataset, pipeline: Pipeline) -> MultimodalDataset:
+    """Skip a fitted transform for any modality with no present row in ``view``, by swapping in an empty copy.
+
+    Every narrowed view this module builds -- a single patient's own coalition, or the handful who happen to
+    have a bag modality -- can end up with nobody present for some OTHER modality that is not itself being
+    ablated or deliberately excluded, simply because the view is small. A fitted transform (e.g. clinical's
+    ``StandardScaler``) has no defined output on zero rows: it is not that it returns something wrong, it
+    raises, because scaling an empty frame is not a meaningful operation to begin with. The honest result for
+    that modality, in that view, is the same ``NaN`` this module already documents for "nothing to measure" --
+    reached generically, by reusing :func:`kalecancer.interpret.modality._absent`, the exact mechanism ablation
+    already uses to make a modality's ``with_transform`` skip straight to an empty result -- not a scaler
+    coerced into producing a result for an operation that has none.
+
+    Checked against ``pipeline.transforms_`` specifically (every modality with a fitted transform), not every
+    modality the model reads: a modality with no transform at all (e.g. a bag modality, which never accepts
+    one) has nothing here to skip, and is left alone.
+    """
+    affected = [name for name in pipeline.transforms_ if name in view.modalities and not view.present[name].any()]
+    if not affected:
+        return view
+    modalities = {name: _absent(source) if name in affected else source for name, source in view.modalities.items()}
+    required = [name for name in view.required_modalities if name not in affected]
+    new_view = MultimodalDataset(modalities, view.target, required)
+    return new_view.subset(view.ids)
+
+
 def _modality_risk_contributions(
     pipeline: Pipeline, requested: MultimodalDataset, fusion: FusionMethod, names: Sequence[str]
 ) -> pd.DataFrame:
@@ -127,6 +159,11 @@ def _modality_risk_contributions(
     patients that coalition still defines (:func:`kalecancer.interpret.modality._defined_mask`) and leaving the
     rest ``NaN`` for it -- rather than handing ``_coalition_view`` a patient it would have to drop entirely,
     which raises -- keeps that one coalition's missing information from crashing the whole computation.
+
+    That narrowed, per-coalition set of survivors can itself end up with nobody present for some OTHER,
+    non-ablated modality that happens to have a fitted transform (e.g. everyone this coalition still defines
+    happens to lack ``clinical``) -- :func:`_without_zero_row_transforms` catches that before
+    ``pipeline.predict`` ever asks that transform to run on zero rows.
     """
     k = len(names)
     present_subsets = [frozenset(s) for size in range(1, k + 1) for s in itertools.combinations(names, size)]
@@ -136,11 +173,11 @@ def _modality_risk_contributions(
     for present, ablated in zip(present_subsets, ablated_sets, strict=True):
         defined = _defined_mask(requested, fusion, names, ablated)
         survivors = [pid for pid in requested.ids if defined.loc[pid]]
-        predicted = (
-            pipeline.predict(_coalition_view(requested.subset(survivors), ablated))["log_hazard"]
-            if survivors
-            else pd.Series(dtype=float)
-        )
+        if survivors:
+            narrowed = _without_zero_row_transforms(requested.subset(survivors), pipeline)
+            predicted = pipeline.predict(_coalition_view(narrowed, ablated))["log_hazard"]
+        else:
+            predicted = pd.Series(dtype=float)
         scores[present] = predicted.reindex(requested.ids)
 
     full = frozenset(names)
@@ -240,10 +277,18 @@ def _can_attend(pipeline: Pipeline, modality: str) -> bool:
 def _top_patches(
     pipeline: Pipeline, requested: MultimodalDataset, bag_modality: str | None, top_k: int
 ) -> dict[str, pd.DataFrame | None]:
-    """``top_k`` most-attended instances per patient with ``bag_modality``, ``None`` for a patient without it."""
+    """``top_k`` most-attended instances per patient with ``bag_modality``, ``None`` for a patient without it.
+
+    ``attention`` runs the WHOLE model's fitted transforms over this narrowed subset (the patients who have
+    ``bag_modality``), not just ``bag_modality``'s own encoder -- so a subset that happens to have nobody
+    present for some OTHER, transformed modality (e.g. everyone here lacks ``clinical``) would otherwise raise
+    scaling zero rows, even though attention has nothing to do with that modality at all. See
+    :func:`_without_zero_row_transforms`.
+    """
     if bag_modality is None or not requested.present[bag_modality].any():
         return dict.fromkeys(requested.ids)
-    weights = attention(pipeline, requested.subset(requested.present_ids(bag_modality)), bag_modality)
+    narrowed = _without_zero_row_transforms(requested.subset(requested.present_ids(bag_modality)), pipeline)
+    weights = attention(pipeline, narrowed, bag_modality)
     result: dict[str, pd.DataFrame | None] = dict.fromkeys(requested.ids)
     for pid, rows in weights.groupby("patient_id"):
         top = rows.sort_values("attention", ascending=False).head(top_k).drop(columns="patient_id")
@@ -362,8 +407,9 @@ def patient_report(
             ``data``, if those patients were used to fit ``pipeline`` and ``allow_seen`` is not set, if the
             fitted model's fusion method cannot tolerate a missing modality (see ``modality_shapley``), if the
             fitted model is a ``LateFusion`` (not supported yet; see
-            :func:`kalecancer.interpret.modality._require_ablatable`), or if ``data`` does not have exactly one
-            ``Tabular`` modality.
+            :func:`kalecancer.interpret.modality._require_ablatable`), if ``data`` does not have exactly one
+            ``Tabular`` modality, or if that modality's fitted encoder is a ``TabICLEncoder`` (see
+            :func:`kalecancer.interpret.attribution._require_no_tabicl`).
     """
     _require_survival_model(pipeline)
     _require_known_patients(data, patient_ids)
@@ -373,6 +419,7 @@ def patient_report(
     fusion = _fusion_of(pipeline)
     _require_ablatable(fusion, model_modalities, model_modalities, pipeline.model_)
     tabular_name, tabular_source = _resolve_tabular_modality(data, None)
+    _require_no_tabicl(pipeline, tabular_name)
     features = _feature_names(tabular_source.transform_input(data.present_ids(tabular_name)), None)
     bag_modality = _find_bag_modality(pipeline, data)
     if bag_modality is None:

@@ -181,3 +181,24 @@ def test_labels_length_mismatch_raises():
 
     with pytest.raises(ValueError, match=r"labels must have n_groups=2 entries"):
         risk_groups(prediction, n_groups=2, labels=["only_one"])
+
+
+def test_kaplan_meier_with_tuple_labels_keeps_the_whole_tuple_per_row():
+    """``DataFrame.insert`` treats a tuple value as one row value per element, not one scalar broadcast to every
+    row; a 2-element tuple label landing in the ``group`` column of a differently-sized curve either raises a
+    length mismatch or (worse) silently splits across rows whose counts happen to match the tuple's length.
+    """
+    ids = _ids(8)
+    log_hazard = np.array([-2.0, -1.9, -1.8, -1.7, 1.7, 1.8, 1.9, 2.0])
+    prediction = pd.DataFrame({"log_hazard": log_hazard}, index=ids)
+    time = np.array([1.0, 2.0, 2.0, 4.0, 1.0, 3.0, 5.0, 7.0])
+    event = np.array([False, True, False, True, False, True, True, True])
+    target = pd.DataFrame({"time": time, "event": event}, index=ids)
+
+    low, high = ("risk", "low"), ("risk", "high")
+
+    table = kaplan_meier(prediction, target, n_groups=2, labels=[low, high])
+
+    # group0's curve has 4 rows (time=0, 1, 2, 4) and group1's has 5 (time=0, 1, 3, 5, 7) -- see
+    # test_known_cohort_produces_hand_checkable_km_steps for the hand-worked derivation.
+    assert table["group"].tolist() == [low] * 4 + [high] * 5

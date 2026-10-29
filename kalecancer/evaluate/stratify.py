@@ -155,7 +155,10 @@ def kaplan_meier(
     for name in group.cat.categories:
         mask = (group == name).to_numpy()
         curve = _kaplan_meier_curve(time_arr[mask], event_arr[mask])
-        curve.insert(0, "group", name)
+        # DataFrame.insert treats a tuple `value` as one row value per element, not one scalar broadcast to every
+        # row -- wrong (or a length-mismatch error) for a tuple label, e.g. labels=[("a", 1), ("b", 2)]. A list
+        # repeating the whole label object is unambiguous regardless of what that object is.
+        curve.insert(0, "group", [name] * len(curve))
         frames.append(curve)
     table = pd.concat(frames, ignore_index=True)
     table.attrs["n_excluded"] = group.attrs.get("n_excluded", 0)

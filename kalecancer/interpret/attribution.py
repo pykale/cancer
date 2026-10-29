@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -48,8 +49,76 @@ def _resolve_tabular_modality(data: MultimodalDataset, modality: str | None) -> 
     return name, source
 
 
+def _tabicl_encoder_class() -> type | None:
+    """``TabICLEncoder``, or ``None`` if the optional ``tabicl`` extra is not installed.
+
+    Imported lazily, and only here: a top-level import would force every caller of this module -- including one
+    that never touches a TabICLEncoder -- to have the optional ``tabicl`` extra installed, the same reason
+    ``kalecancer.model``'s own ``__getattr__`` defers it.
+    """
+    try:
+        from kalecancer.model.encode.tabicl import TabICLEncoder
+    except ImportError:
+        return None
+    return TabICLEncoder
+
+
+def _require_no_tabicl(pipeline: Pipeline, name: str) -> None:
+    """Raise if ``name``'s fitted encoder is a ``TabICLEncoder``: it cannot score a perturbed row.
+
+    ``TabICLEncoder.forward`` (``kalecancer/model/encode/tabicl.py``) recognises a context (training) row by its
+    patient id and raises if that row's values differ from what it saw at fit time -- exactly what every
+    perturbed row :func:`_perturbed_view` builds does, by construction, since it keeps the patient's own id.
+    Giving the perturbed row a FRESH id instead would dodge that check, but it would also drop the row out of
+    its own context-fold exclusion (see the class docstring): the encoder would then embed it against the WHOLE
+    context, including its own true label, leaking the patient's own outcome into its own prediction through the
+    rest of the context -- a worse bug than the crash it would fix. A genuine counterfactual query -- scored
+    with the fold exclusion kept but the value check skipped -- is not something ``forward`` exposes as a public
+    path; it would need the encoder's own ``_embed``, ``context_fold`` and ``_position`` reimplemented here. This
+    module does neither: it names the limitation up front instead, the same way
+    :mod:`kalecancer.interpret.modality` rejects ``Concat``/``LateFusion`` for ablation rather than silently
+    producing a wrong answer.
+
+    Checked against the ACTUAL fitted encoder for ``name`` (:meth:`Pipeline.model_.encoders_for`), not the
+    modality's type, so an ordinary tabular encoder (e.g. ``nn.Linear``) on the same kind of modality is
+    unaffected; and only once the optional ``tabicl`` package is confirmed installed
+    (:func:`_tabicl_encoder_class`) -- without it, no ``TabICLEncoder`` could have been built in the first place.
+
+    This raises unconditionally, not only when the request would actually perturb a context row with
+    ``allow_seen=True``: the crash is reachable only then (an un-seen patient is never a context id, so its
+    perturbed row is never compared against one), but telling the two apart here would mean checking every
+    perturbed patient against the encoder's own ``context_ids`` and re-deriving when that is and is not safe --
+    exactly the kind of bespoke, encoder-specific reasoning :func:`_perturbed_view` is written not to need. The
+    narrower, already-correct case (attributing a TabICL model on data that is never seen) is blocked too, as the
+    price of a check this simple.
+    """
+    tabicl_encoder = _tabicl_encoder_class()
+    if tabicl_encoder is None:
+        return
+    try:
+        encoders = cast(Any, pipeline.model_).encoders_for(name)
+    except KeyError:
+        return
+    if any(isinstance(encoder, tabicl_encoder) for encoder in encoders):
+        raise ValueError(
+            f"{name!r} is encoded by a TabICLEncoder, which permutation_importance, feature_shapley, and "
+            "patient_report cannot perturb: TabICLEncoder.forward recognises a training row by its patient id "
+            "and raises if the row's values differ from what it saw at fit time, which every perturbed row here "
+            "does by construction. Giving the perturbed row a fresh id would dodge that check, but it would "
+            "also drop the row out of its own context-fold exclusion, letting the rest of the context see the "
+            "patient's own label when scoring it -- a leak worse than the crash it would avoid. There is no "
+            "supported way to query a TabICLEncoder with changed values while keeping that exclusion."
+        )
+
+
 def _feature_names(frame: pd.DataFrame, feature_names: Sequence[str] | None) -> list[str]:
-    """``feature_names`` if given (every one must be a column of ``frame``), else every column of ``frame``."""
+    """``feature_names`` if given (every one must be a column of ``frame``), else every column of ``frame``.
+
+    Typed ``str`` to match every existing caller (including ``kalecancer.interpret.report``, outside this
+    module's scope to retype), but at runtime this returns whatever ``frame.columns`` holds -- a table with
+    pandas' default columns has plain integers, not strings -- and everything downstream (``_perturbed_view``'s
+    column indexing in particular) works the same regardless of the label's actual type.
+    """
     if feature_names is None:
         return list(frame.columns)
     missing = [c for c in feature_names if c not in frame.columns]
@@ -95,6 +164,15 @@ def _perturbed_view(
     ``data``, with ``name``'s raw frame (``frame``, already restricted to ``data.ids``) replaced column by column
     by ``replacements``; columns not in ``replacements`` keep ``frame``'s true values.
 
+    Assigned by column indexing on a copy of ``frame``, not ``frame.assign(**replacements)``: ``assign`` unpacks
+    ``replacements`` as keyword arguments, which only ever works for ``str`` column labels, while ``Tabular``'s
+    frame (and ``_feature_names``, see its own note) accepts any label pandas allows -- a table with pandas'
+    default integer columns would raise ``TypeError: keywords must be strings`` on the very first perturbation.
+    (The type hint above stays ``str`` for the same reason ``_feature_names``'s does; the dict this actually
+    receives can have non-``str`` keys too.) ``frame.copy()`` keeps exactly ``frame``'s own index (nothing
+    widens it), so the leakage guard below is unaffected: it is a copy of the VALUES, never of which rows/ids
+    are present.
+
     ``MultimodalDataset.subset`` only narrows ``.ids`` -- it never shrinks the modality or target objects
     underneath -- so rebuilding a dataset from ``data.modalities``/``data.target`` can silently widen who gets
     evaluated back to everyone those raw objects happen to cover (e.g. training patients ``data`` itself
@@ -104,7 +182,10 @@ def _perturbed_view(
     thing, kept even though it is currently redundant, because it costs nothing and the alternative is a perturbed
     view that silently scores the wrong patients.
     """
-    perturbed = Tabular(frame.assign(**replacements))
+    perturbed_frame = frame.copy()
+    for column, values in replacements.items():
+        perturbed_frame[column] = values
+    perturbed = Tabular(perturbed_frame)
     view = MultimodalDataset({**data.modalities, name: perturbed}, data.target, data.required_modalities)
     return view.subset(data.ids)
 
@@ -156,10 +237,12 @@ def permutation_importance(
         perturbed, since there is no value of theirs to shuffle.
 
     Raises:
-        ValueError: Under the conditions of :func:`_resolve_tabular_modality` and :func:`_feature_names`, or if
-            ``metric`` needs ``survival_times`` and none was given.
+        ValueError: Under the conditions of :func:`_resolve_tabular_modality` and :func:`_feature_names`, if
+            ``metric`` needs ``survival_times`` and none was given, or if ``name``'s fitted encoder is a
+            ``TabICLEncoder`` (see :func:`_require_no_tabicl`).
     """
     name, source = _resolve_tabular_modality(data, modality)
+    _require_no_tabicl(pipeline, name)
     present_ids = data.present_ids(name)
     frame = source.transform_input(present_ids)
     features = _feature_names(frame, feature_names)
@@ -237,10 +320,12 @@ def feature_shapley(
         perturbed.
 
     Raises:
-        ValueError: Under the conditions of :func:`_resolve_tabular_modality` and :func:`_feature_names`, or if
-            ``metric`` needs ``survival_times`` and none was given.
+        ValueError: Under the conditions of :func:`_resolve_tabular_modality` and :func:`_feature_names`, if
+            ``metric`` needs ``survival_times`` and none was given, or if ``name``'s fitted encoder is a
+            ``TabICLEncoder`` (see :func:`_require_no_tabicl`).
     """
     name, source = _resolve_tabular_modality(data, modality)
+    _require_no_tabicl(pipeline, name)
     present_ids = data.present_ids(name)
     frame = source.transform_input(present_ids)
     features = _feature_names(frame, feature_names)
