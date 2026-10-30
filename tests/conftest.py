@@ -1,10 +1,18 @@
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import h5py
 import numpy as np
 import pandas as pd
 import pytest
+import torch
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OrdinalEncoder, StandardScaler
+
+from kalecancer.loaddata import BaseTarget, Classification, MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
+from kalecancer.pipeline import Pipeline
+from kalecancer.prepdata import ColumnGroup, TableTransform
 
 
 @dataclass
@@ -87,3 +95,84 @@ def make_cohort(root: Path, n_patients: int = 40, n_with_wsi: int = 30, dim: int
 @pytest.fixture
 def cohort(tmp_path: Path) -> Cohort:
     return make_cohort(tmp_path)
+
+
+@pytest.fixture
+def cohort_factory(tmp_path: Path):
+    """A factory for a ``Cohort`` of a custom size/seed, for tests that need one other than ``cohort``'s default."""
+
+    def factory(**kwargs) -> Cohort:
+        return make_cohort(tmp_path, **kwargs)
+
+    return factory
+
+
+def _clinical_transform() -> TableTransform:
+    return TableTransform(
+        groups={
+            "numeric": ColumnGroup(["age"], [StandardScaler()]),
+            "categorical": ColumnGroup(
+                ["sex", "smoking"],
+                [
+                    SimpleImputer(strategy="constant", fill_value="missing"),
+                    OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1),
+                ],
+            ),
+        },
+        drop=[],
+    )
+
+
+@pytest.fixture
+def dataset_factory():
+    """A factory for a ``MultimodalDataset`` of a ``Cohort``'s clinical and wsi modalities."""
+
+    def factory(cohort: Cohort, required=("clinical", "wsi"), task="survival", event=None) -> MultimodalDataset:
+        target: BaseTarget | None
+        if task == "survival":
+            target = TimeToEvent(cohort.time, cohort.event if event is None else event)
+        elif task == "classification":
+            target = Classification(cohort.labels, classes=["low", "high"])
+        else:
+            target = None
+        modalities = {
+            "clinical": Tabular(cohort.clinical),
+            "wsi": PatchFeatures(cohort.wsi_files, multiple_files="concatenate"),
+        }
+        return MultimodalDataset(modalities, target=target, required_modalities=list(required))
+
+    return factory
+
+
+@pytest.fixture
+def split_factory():
+    """A factory splitting a dataset's ids into a leading training set and a trailing test set."""
+
+    def factory(data: MultimodalDataset, n_train: int = 22) -> tuple[MultimodalDataset, MultimodalDataset]:
+        return data.subset(data.ids[:n_train]), data.subset(data.ids[n_train:])
+
+    return factory
+
+
+@pytest.fixture
+def pipeline_factory():
+    """A factory for a ``Pipeline`` with this test suite's standard training settings, built around a model."""
+
+    def factory(model, **overrides) -> Pipeline:
+        arguments = {
+            "model": model,
+            "transforms": {"clinical": _clinical_transform()},
+            "optimizer": partial(torch.optim.AdamW, lr=1e-2),
+            "batch_size": 8,
+            "drop_last": True,
+            "max_epochs": 2,
+            "validation": None,
+            "early_stopping": None,
+            "accelerator": "cpu",
+            "precision": "32-true",
+            "random_state": 0,
+        }
+        arguments.update(overrides)
+        return Pipeline(**arguments)
+
+    return factory
