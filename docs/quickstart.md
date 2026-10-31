@@ -11,10 +11,10 @@ Each example is a standalone script. Start with the synthetic one, then read a H
 
 ## Synthetic
 
-[examples/synthetic/synthetic_survival.py](../examples/synthetic/synthetic_survival.py) is the smallest end-to-end
+[examples/synthetic/synthetic.py](../examples/synthetic/survival.py) is the smallest end-to-end
 run. It generates a cohort of a clinical table, patch features and censored survival times, and trains an
 intermediate-fusion Cox model. It runs on CPU in under a minute and downloads nothing. The notebook
-[synthetic_survival.ipynb](../examples/synthetic/synthetic_survival.ipynb) is the same example.
+[survival.ipynb](../examples/synthetic/survival.ipynb) is the same example.
 
 ## HANCOCK
 

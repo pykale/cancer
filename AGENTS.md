@@ -12,7 +12,7 @@ Python 3.11 or 3.12, managed with [uv](https://docs.astral.sh/uv/) against the c
 | Test | `uv run pytest` |
 | Test with coverage | `uv run pytest --cov=kalecancer --cov-report=term-missing` |
 | Format, lint, type-check | `uv run pre-commit run --all-files` |
-| Smallest end-to-end run | `uv run python examples/synthetic/synthetic_survival.py` |
+| Smallest end-to-end run | `uv run python examples/synthetic/synthetic.py` |
 
 ## Layout
 
@@ -42,7 +42,7 @@ These documents hold the rules the code relies on. Read the relevant one before 
 - **Behaviour users rely on** (patient ids, splitting, leakage guards, target semantics): see
   [docs/architecture.md](docs/architecture.md). Don't change it without recording the decision in
   [docs/adr/](docs/adr/).
-- **Tests and examples:** see CONTRIBUTING.md. Keep `examples/synthetic/synthetic_survival.py` learning, because its
+- **Tests and examples:** see CONTRIBUTING.md. Keep `examples/synthetic/survival.py` learning, because its
   test requires a Harrell's C above 0.7.
 
 ## Environment

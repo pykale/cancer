@@ -382,13 +382,14 @@ class Pipeline(BaseEstimator):
             generator = torch.Generator()
             if self.random_state is not None:
                 generator.manual_seed(self.random_state)
+        torch_data = data.as_torch()
         return DataLoader(
-            data,
+            torch_data,
             batch_size=self.batch_size,
             shuffle=shuffle,
             generator=generator,
             drop_last=shuffle and self.drop_last,
-            collate_fn=data.collate,
+            collate_fn=torch_data.collate,
             num_workers=self.num_workers,
         )
 
@@ -597,7 +598,7 @@ def _dry_run(model: nn.Module, train: MultimodalDataset) -> None:
     An encoder that cannot take its input then fails before the first optimizer step, and the fusion method is
     checked against the real widths. Validation patients are never used.
     """
-    sample = train.subset(_dry_run_ids(train, model.modalities))
+    sample = train.subset(_dry_run_ids(train, model.modalities)).as_torch()
     batch = sample.collate([sample[k] for k in range(len(sample))])
     was_training = model.training
     model.eval()
