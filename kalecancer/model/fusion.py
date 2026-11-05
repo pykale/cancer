@@ -18,11 +18,12 @@ from typing import ClassVar, Literal
 
 import pandas as pd
 import torch
-from kale.embed.multimodal_fusion import FusionMethod as CoreFusionMethod
-from kale.embed.multimodal_fusion import MajorityVote as CoreMajorityVote
-from kale.embed.multimodal_fusion import MaskedMean as CoreMaskedMean
-from kale.embed.multimodal_fusion import NamedInputConcat as CoreNamedInputConcat
-from kale.embed.multimodal_fusion import masked_mean, stack_present
+from kale.embed.multimodal_fusion import FusionMethod as _KaleFusionMethod
+from kale.embed.multimodal_fusion import MajorityVote as _KaleMajorityVote
+from kale.embed.multimodal_fusion import MaskedMean as _KaleMaskedMean
+from kale.embed.multimodal_fusion import NamedInputConcat as _KaleNamedInputConcat
+from kale.embed.multimodal_fusion import masked_mean as _kale_masked_mean
+from kale.embed.multimodal_fusion import stack_present as _kale_stack_present
 from torch import Tensor
 
 from kalecancer.loaddata.targets import BaseTarget, Classification, TimeToEvent
@@ -95,7 +96,7 @@ def _stack_defined(values: Mapping[str, Tensor], defined: Mapping[str, Tensor]) 
         Values shaped ``(n_inputs, n, d)`` and boolean masks shaped ``(n_inputs, n)``.
     """
     # preserve the helper used by existing custom fusion methods
-    return stack_present(values, defined)
+    return _kale_stack_present(values, defined)
 
 
 def _masked_mean(stacked: Tensor, mask: Tensor) -> Tensor:
@@ -109,10 +110,10 @@ def _masked_mean(stacked: Tensor, mask: Tensor) -> Tensor:
         Means shaped ``(n, d)`` with the input dtype and device; zero for rows with no inputs.
         Absent entries have zero gradient. Half-precision inputs accumulate in float32.
     """
-    return masked_mean(stacked, mask)
+    return _kale_masked_mean(stacked, mask)
 
 
-class FusionMethod(CoreFusionMethod):
+class FusionMethod(_KaleFusionMethod):
     """Combines named ``(n, d)`` inputs, which a patient may lack, into one ``(n, d')`` tensor.
 
     Subclasses set ``stages`` and implement ``defined`` and ``forward``. To add rules, override
@@ -201,8 +202,8 @@ class Concat(FusionMethod):
     stages = frozenset({"early", "intermediate"})
 
     # borrow stateless operations without introducing a second FusionMethod inheritance path
-    defined = CoreNamedInputConcat.defined
-    forward = CoreNamedInputConcat.forward
+    defined = _KaleNamedInputConcat.defined
+    forward = _KaleNamedInputConcat.forward
 
 
 class MaskedMean(FusionMethod):
@@ -214,7 +215,7 @@ class MaskedMean(FusionMethod):
 
     stages = frozenset({"early", "intermediate", "late"})
 
-    defined = CoreMaskedMean.defined
+    defined = _KaleMaskedMean.defined
 
     def check(self, context: FusionContext) -> None:
         """Also needs inputs of one width and, in late fusion, heads of one kind.
@@ -238,7 +239,7 @@ class MaskedMean(FusionMethod):
                 "reorder patients"
             )
 
-    forward = CoreMaskedMean.forward
+    forward = _KaleMaskedMean.forward
 
 
 class MajorityVote(FusionMethod):
@@ -263,7 +264,7 @@ class MajorityVote(FusionMethod):
             raise ValueError(f"tie_break must be 'mean_probability' or 'error', got {tie_break!r}")
         self.tie_break = tie_break
 
-    defined = CoreMajorityVote.defined
+    defined = _KaleMajorityVote.defined
 
     def check(self, context: FusionContext) -> None:
         """Also needs classification heads with one output width."""
@@ -276,4 +277,4 @@ class MajorityVote(FusionMethod):
         """One vote-score column per class."""
         return [f"vote_score[{c}]" for c in target.classes]
 
-    forward = CoreMajorityVote.forward
+    forward = _KaleMajorityVote.forward
