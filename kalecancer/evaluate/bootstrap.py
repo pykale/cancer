@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from kale.evaluate.bootstrap import bootstrap_ci as _kale_bootstrap_ci
 
 from kalecancer.evaluate.metrics import EvalContext, Metric
 
@@ -97,45 +98,41 @@ def bootstrap_ci(
         raise ValueError(f"n_resamples must be positive, got {n_resamples}")
     baseline_context = context if baseline_context is None else baseline_context
     # Raises on misuse (mismatched ids, missing columns) before any resampling can mistake it for an undefined value.
-    estimate = _score(metric, prediction, baseline, target, context, baseline_context)
+    _score(metric, prediction, baseline, target, context, baseline_context)
 
     # Positions in the target's row order; resampled rows get new ids 0..n-1, since metrics require unique ids.
     prediction = prediction.loc[target.index]
     baseline = None if baseline is None else baseline.loc[target.index]
-    n = len(target)
-    rng = np.random.default_rng(random_state)
-    values = []
-    for _ in range(n_resamples):
-        rows = rng.integers(0, n, size=n)
-        try:
-            values.append(
-                _score(
-                    metric,
-                    _resample(prediction, rows),
-                    None if baseline is None else _resample(baseline, rows),
-                    _resample(target, rows),
-                    context,
-                    baseline_context,
-                )
-            )
-        except ValueError:
-            # Metrics raise ValueError when they are undefined, e.g. a resample without an event or a positive.
-            continue
-    n_undefined = n_resamples - len(values)
-    if not values:
-        raise ValueError(f"{metric!r} is undefined on every one of {n_resamples} resamples")
+
+    def score_rows(rows: np.ndarray) -> float:
+        return _score(
+            metric,
+            _resample(prediction, rows),
+            None if baseline is None else _resample(baseline, rows),
+            _resample(target, rows),
+            context,
+            baseline_context,
+        )
+
+    result = _kale_bootstrap_ci(
+        score_rows,
+        np.arange(len(target)),
+        n_resamples=n_resamples,
+        confidence=confidence,
+        seed=random_state,
+        undefined_errors=(ValueError,),
+    )
+    n_undefined = n_resamples - result["n_used"]
     if n_undefined:
         warnings.warn(
             f"{metric!r} is undefined on {n_undefined} of {n_resamples} resamples; the interval is computed from "
             "the others, which can make it too narrow",
             stacklevel=2,
         )
-    tail = 100 * (1 - confidence) / 2
-    lower, upper = np.percentile(values, [tail, 100 - tail])
     return BootstrapCI(
-        estimate=float(estimate),
-        lower=float(lower),
-        upper=float(upper),
+        estimate=result["point"],
+        lower=result["low"],
+        upper=result["high"],
         confidence=confidence,
         n_resamples=n_resamples,
         n_undefined=n_undefined,

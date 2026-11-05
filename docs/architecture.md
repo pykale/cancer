@@ -312,7 +312,12 @@ training target and the class order.
 | Target | Metrics |
 | --- | --- |
 | Time-to-event | `HarrellC`, `UnoC(tau)`, `TimeDependentAUC(time)` and `IntegratedBrier` (on the `survival[<time>]` columns), from TorchSurv |
-| Classification | `AUROC(positive_class)`, `BalancedAccuracy`, from scikit-learn |
+| Classification | `AUROC(positive_class)` uses PyKale's binary ROC AUC after patient and class alignment; `BalancedAccuracy` uses scikit-learn after predicting the highest-scoring class |
+
+`bootstrap_ci` uses PyKale's paired percentile bootstrap on patient row positions. KaleCancer keeps the patient-id
+alignment, training `EvalContext`, `BootstrapCI` result and warning when some resamples are undefined.
+`cross_validate` stays in KaleCancer because it clones and fits its `Pipeline`, checks for patient leakage, and
+collects prediction frames. Survival metrics stay here because they use TorchSurv and the training censoring context.
 
 `cross_validate(estimator, data, cv, metrics)` fits a clone of the pipeline on each fold, predicts the held-out
 patients and returns per-fold scores, fit reports and out-of-fold predictions. Scores are **not pooled** across folds,

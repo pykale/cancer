@@ -15,7 +15,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+from kale.evaluate.classification_metrics import roc_auc as _kale_roc_auc
+from sklearn.metrics import balanced_accuracy_score
 
 with warnings.catch_warnings():
     # torchsurv applies torch.jit.script when imported, which recent torch deprecates; users cannot act on it
@@ -312,7 +313,7 @@ class AUROC(Metric):
         positive = labels == self.positive_class
         if positive.all() or not positive.any():
             raise ValueError(f"{self!r} is undefined: the target needs both {self.positive_class!r} and other labels")
-        return float(roc_auc_score(positive, scores[:, classes.index(self.positive_class)]))
+        return _kale_roc_auc(positive, scores[:, classes.index(self.positive_class)])
 
 
 class BalancedAccuracy(Metric):
