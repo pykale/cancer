@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import logging
+import warnings
+
 import h5py
 import numpy as np
 import pandas as pd
@@ -33,11 +36,12 @@ def wsi(cohort, multiple_files="concatenate"):
     return PatchFeatures.from_glob(cohort.wsi_pattern, id_pattern=cohort.id_pattern, multiple_files=multiple_files)
 
 
-def dataset(cohort, required=("clinical", "wsi"), target=None):
+def dataset(cohort, required=("clinical", "wsi"), target=None, **kwargs):
     return MultimodalDataset(
         modalities={"clinical": Tabular(cohort.clinical), "wsi": wsi(cohort)},
         target=survival(cohort) if target is None else target,
         required_modalities=list(required),
+        **kwargs,
     )
 
 
@@ -196,7 +200,6 @@ def test_id_pattern_must_match_every_file(cohort):
     with pytest.raises(ValueError, match="does not match id_pattern"):
         PatchFeatures.from_glob(cohort.wsi_pattern, id_pattern=r"XX_(\d{3})\.h5$")
 
-
 def test_missing_h5_key_raises(cohort):
     source = PatchFeatures(cohort.wsi_files, features_key="feats", multiple_files="concatenate")
     with pytest.raises(KeyError, match="no dataset 'feats'"):
@@ -277,10 +280,9 @@ def test_viewing_a_modality_takes_patient_ids_only(cohort):
     with pytest.raises(TypeError, match="must be str"):
         table[[1]]
 
-
-def test_datasets_take_modality_instances_only(cohort):
-    with pytest.raises(TypeError, match=r"\['clinical'\] are not Modality instances\. Wrap a DataFrame in Tabular"):
-        MultimodalDataset({"clinical": cohort.clinical}, target=None, required_modalities=[])
+        def test_datasets_take_modality_instances_only(cohort):
+         with pytest.raises(TypeError, match=r"\['clinical'\] are not Modality instances\. Wrap a DataFrame in Tabular"):
+            MultimodalDataset({"clinical": cohort.clinical}, target=None, required_modalities=[])
 
 
 def test_modality_subclasses_must_implement_load_and_bags_their_instances():
@@ -299,6 +301,7 @@ def test_modality_subclasses_must_implement_load_and_bags_their_instances():
         NoInstances()
 
 
+
 def test_a_new_fixed_shape_modality_needs_only_ids_a_view_and_load():
     class Constant(FixedShapeModality):
         def __init__(self, ids):
@@ -311,15 +314,19 @@ def test_a_new_fixed_shape_modality_needs_only_ids_a_view_and_load():
             return torch.full((2, 3), float(id))
 
     data = MultimodalDataset({"grid": Constant(["001", "002"])}, target=None, required_modalities=[])
+
+    # Viewing returns a one-row DataFrame.
+    assert data["001"]["grid"].shape == (1, 1)
     assert data["002"]["grid"]["value"].tolist() == [2.0]
     assert data["002"]["target"] is None
+
+    # Loading returns the fixed-shape tensor.
+    assert data.modalities["grid"].tensors("001").shape == (2, 3)
+
     torch_data = data.as_torch()
     batch = torch_data.collate([torch_data[i] for i in range(len(torch_data))])
     assert batch["inputs"]["grid"].shape == (2, 2, 3)
     assert batch["inputs"]["grid"][1, 0, 0].item() == 2.0
-
-
-# ---------------------------------------------------------------- dataset
 
 
 def test_required_modalities_define_inclusion_and_summary(cohort):
@@ -331,6 +338,7 @@ def test_required_modalities_define_inclusion_and_summary(cohort):
     assert summary["events"] == int(cohort.event.loc[data.ids].sum())
 
 
+
 def test_patients_without_a_modality_can_be_kept(cohort):
     data = dataset(cohort, required=["clinical"])
     assert len(data) == 40
@@ -338,11 +346,53 @@ def test_patients_without_a_modality_can_be_kept(cohort):
     assert not data.present.loc["040", "wsi"]
 
 
+
 def test_patients_without_target_are_excluded(cohort):
     target = TimeToEvent(cohort.time.iloc[:20], cohort.event.iloc[:20])
-    data = dataset(cohort, required=["clinical"], target=target)
+
+    with pytest.warns(UserWarning, match="no matching target"):
+        data = dataset(cohort, required=["clinical"], target=target)
+
     assert len(data) == 20
     assert data.summary()["count"]["excluded: no target"] == 20
+
+def test_missing_target_warning_can_be_disabled(cohort):
+    target = TimeToEvent(cohort.time.iloc[:20], cohort.event.iloc[:20])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        data = dataset(cohort, required=["clinical"], target=target, warn=False)
+
+    assert not any("no matching target" in str(w.message) for w in caught)
+    assert len(data) == 20
+    assert data.summary()["count"]["excluded: no target"] == 20
+
+
+def test_complete_target_coverage_does_not_warn(cohort):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        data = dataset(cohort, required=["clinical"])
+
+    assert not any("no matching target" in str(w.message) for w in caught)
+    assert len(data) == 40
+def test_unlabelled_dataset_does_not_warn_about_missing_targets(cohort):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        data = MultimodalDataset(
+            modalities={"clinical": Tabular(cohort.clinical)},
+            target=None,
+            required_modalities=[],
+        )
+
+    assert not any("no matching target" in str(w.message) for w in caught)
+    assert len(data) == 40
+
+
+def test_verbose_logs_dataset_summary(cohort, caplog):
+    with caplog.at_level(logging.INFO, logger="kalecancer.loaddata.dataset"):
+        data = dataset(cohort, verbose=True)
+
+    assert len(data) == 30
+    assert "30 included and 10 excluded patients" in caplog.text
 
 
 def test_unknown_required_modality_raises(cohort):
@@ -352,6 +402,7 @@ def test_unknown_required_modality_raises(cohort):
 
 def test_subset_raises_on_excluded_ids_with_reason(cohort):
     data = dataset(cohort)
+
     with pytest.raises(KeyError, match="missing required modality 'wsi'"):
         data.subset(["001", "040"])
     with pytest.raises(KeyError, match="not in any modality or target"):
@@ -413,8 +464,6 @@ def test_as_torch_feeds_a_dataloader_every_patient_once(cohort, num_workers):
         multiprocessing_context="spawn" if num_workers else None,
     )
     assert sorted(pid for batch in loader for pid in batch["ids"]) == list(data.ids)
-
-
 def test_viewing_a_dataset_gives_each_modalitys_view_and_the_target(cohort):
     data = dataset(cohort, required=["clinical"])
     view = data[["040", "001"]]
@@ -445,8 +494,6 @@ def test_viewing_a_dataset_takes_included_patient_ids(cohort):
         data[["001", "999"]]
     with pytest.raises(TypeError, match=r"MultimodalDataset is indexed by .*index with \.ids\[i\]"):
         data[0]
-
-
 def test_train_test_split_is_stratified_and_disjoint(cohort):
     data = dataset(cohort, required=["clinical"])
     train, test = train_test_split(data, test_size=0.25, stratify=True, random_state=0)
