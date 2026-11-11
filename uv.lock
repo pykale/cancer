@@ -1118,7 +1118,7 @@ requires-dist = [
     { name = "certifi", specifier = ">=2026.7.22" },
     { name = "h5py", specifier = ">=3.10" },
     { name = "huggingface-hub", specifier = ">=0.24" },
-    { name = "jsonargparse", extras = ["signatures"], specifier = ">=4.49" },
+    { name = "jsonargparse", extras = ["signatures"], specifier = "==4.52.0" },
     { name = "lightning", specifier = ">=2.6,<2.7" },
     { name = "monai", marker = "extra == 'imaging'" },
     { name = "nibabel", marker = "extra == 'imaging'" },

@@ -2,7 +2,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "synthetic" / "synthetic_survival.py"
+EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "synthetic" / "survival.py"
 
 
 def test_synthetic_survival_example_runs_and_learns():

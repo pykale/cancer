@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+from sksurv.compare import compare_survival
 from sksurv.metrics import (
     concordance_index_censored,
     concordance_index_ipcw,
@@ -15,12 +16,15 @@ from sksurv.util import Surv
 from kalecancer.evaluate import (
     AUROC,
     BalancedAccuracy,
+    CalibrationError,
     EvalContext,
     HarrellC,
     IntegratedBrier,
+    LogRank,
     TimeDependentAUC,
     UnoC,
 )
+from kalecancer.evaluate.metrics import _quantile_groups
 from kalecancer.model import BreslowBaseline
 
 
@@ -70,8 +74,16 @@ def test_arguments_are_stored_under_their_names():
     assert UnoC(tau=5.0).tau == 5.0
     assert TimeDependentAUC(time=5.0).time == 5.0
     assert AUROC(positive_class="deceased").positive_class == "deceased"
+    assert LogRank(n_groups=3).n_groups == 3
+    assert CalibrationError(n_bins=10).n_bins == 10
     assert repr(UnoC(5.0)) == "UnoC(tau=5.0)"
-    assert all(m.higher_is_better for m in (HarrellC(), UnoC(1.0), TimeDependentAUC(1.0), AUROC(1), BalancedAccuracy()))
+    assert repr(LogRank(3)) == "LogRank(n_groups=3)"
+    assert repr(CalibrationError(10)) == "CalibrationError(n_bins=10)"
+    assert all(
+        m.higher_is_better
+        for m in (HarrellC(), UnoC(1.0), TimeDependentAUC(1.0), AUROC(1), BalancedAccuracy(), LogRank())
+    )
+    assert not CalibrationError().higher_is_better
 
 
 def test_harrell_c_matches_sksurv(survival):
@@ -301,3 +313,43 @@ def test_integrated_brier_guards(survival):
     undefined.iloc[:2, 1] = np.nan
     with pytest.raises(ValueError, match="2 of 150 predictions are NaN"):
         IntegratedBrier()(undefined, test, context)
+
+
+def test_log_rank_separates_strongly_from_weakly_grouped_risk(survival):
+    _, test, _, context = survival
+    strong = pd.DataFrame({"log_hazard": -test["time"].to_numpy()}, index=test.index)
+    weak = pd.DataFrame(
+        {"log_hazard": np.random.default_rng(4).permutation(len(test)).astype(np.float32)}, index=test.index
+    )
+    strong_statistic = LogRank()(strong, test, context)
+    weak_statistic = LogRank()(weak, test, context)
+    assert strong_statistic > 50
+    assert weak_statistic < 5
+    assert strong_statistic > weak_statistic
+
+
+@pytest.mark.parametrize("n_groups", [2, 3, 4])
+def test_log_rank_matches_sksurv_compare_survival(survival, n_groups):
+    _, test, prediction, context = survival
+    group = _quantile_groups(prediction["log_hazard"].to_numpy(dtype=np.float64), n_groups)
+    expected, _ = compare_survival(_surv(test), group)
+    assert LogRank(n_groups)(prediction, test, context) == pytest.approx(expected, abs=1e-6)
+
+
+def test_log_rank_degenerate_cases_raise(survival):
+    _, test, prediction, context = survival
+    no_events = test.copy()
+    no_events["event"] = False
+    with pytest.raises(ValueError, match="no observed event"):
+        LogRank()(prediction, no_events, context)
+
+    tied = pd.DataFrame({"log_hazard": np.ones(len(test), dtype=np.float32)}, index=test.index)
+    with pytest.raises(ValueError, match="quantile cuts are not unique"):
+        LogRank()(tied, test, context)
+
+
+def test_quantile_groups_raises_when_a_group_would_be_empty():
+    # Copilot's reproduction: the quantile cuts are unique, but the two tied 1s both land in the bin to the
+    # right of the edge between them, leaving group 2 with no members at all.
+    with pytest.raises(ValueError, match=r"group\(s\) \[2\] would be empty"):
+        _quantile_groups(np.array([0.0, 1.0, 1.0, 2.0]), 4)

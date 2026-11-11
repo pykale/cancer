@@ -1,6 +1,7 @@
 # ADR 0001: Modality refactor
 
-- **Note:** §8 partly superseded by [ADR 0002](0002-encoder-interface.md)
+- **Note:** §8 partly superseded by [ADR 0002](0002-encoder-interface.md). §5 superseded, and §2 now describes
+  `tensors`, by [ADR 0004](0004-patient-data-access.md)
 - **Date:** 2026-10-07
 - **Scope:** Redifine the data loading to decrease coupling and increase extensibility
 

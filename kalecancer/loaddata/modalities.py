@@ -7,6 +7,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Iterator, Sequence
 from functools import cached_property
+from pathlib import Path
 from typing import Any, Literal, Self
 
 import h5py
@@ -17,29 +18,34 @@ from scipy import sparse
 from sklearn.base import TransformerMixin
 from torch import Tensor
 
-from kalecancer.loaddata.identifiers import _as_ids
+from kalecancer.loaddata.identifiers import _as_ids, _requested_ids
 
 
 class Modality(ABC):
     """Per-patient data, keyed by patient id.
 
-    Subclass ``FixedShapeModality`` or ``BagModality`` and implement ``_load``.
+    Subclass ``FixedShapeModality`` or ``BagModality`` and implement ``_view`` and ``_load``.
     """
 
     ids: pd.Index
 
-    def __getitem__(self, ids: Iterable[str] | str) -> Tensor | list[Tensor]:
-        """One patient's item for a single id, or a batch for several ids, in the order given."""
-        if isinstance(ids, str):
-            if ids not in self.ids:
-                raise KeyError(f"{type(self).__name__}: unknown id {ids!r}")
-            return self._load(ids)
+    def __getitem__(self, ids: Iterable[str] | str) -> Any:
+        """Checks provided `ids` and then returns the modality of the given id(s) in a convenient format."""
+        return self._view(_requested_ids(ids, self.ids, type(self).__name__))
 
-        requested = _as_ids(ids, type(self).__name__)
-        if len(requested) == 0:
-            raise ValueError(f"{type(self).__name__}: no ids requested")
-        if missing := [pid for pid in requested if pid not in self.ids]:
-            raise KeyError(f"{type(self).__name__}: {len(missing)} unknown ids, e.g. {missing[:5]}")
+    @abstractmethod
+    def _view(self, ids: pd.Index) -> Any:
+        """Returns the modality of the given id(s) in a convenient format.
+
+        ``ids`` is already checked by ``__getitem__``: a non-empty Index of known ids, in the order requested.
+        Return a `pd.DataFrame` indexed by patient id, even for one id, unless another format is standard for the modality, e.g. free text. If the raw data is too large to hold in memory, such as image volumes, return `pd.DataFrame` pointing to its files instead.
+        """
+
+    def tensors(self, ids: Iterable[str] | str) -> Tensor | list[Tensor]:
+        """One patient's item for a single id, or a batch for several ids, in the order given."""
+        requested = _requested_ids(ids, self.ids, type(self).__name__)
+        if isinstance(ids, str):
+            return self._load(ids)
         return self.collate([self._load(pid) for pid in requested])
 
     def __len__(self) -> int:
@@ -51,7 +57,7 @@ class Modality(ABC):
     def with_transform(self, fitted_transforms: Any, ids: Sequence[str]) -> Self:
         """A new modality holding the data of ``ids`` after ``fitted_transforms``.
 
-        Modalities that accept transforms override this. By default it raises ``TypeError``.
+        Modalities that accept transforms override this. By default, it raises ``TypeError``.
         """
         raise TypeError(
             f"{self.__class__.__name__} has no implemented with_transform() method, so cannot accept any transformations"
@@ -65,36 +71,39 @@ class Modality(ABC):
     def _load(self, id: str) -> Tensor:
         """Return the data as a tensor for the given id.
 
-        Used by ``Modality.__getitem__``.
+        Used by ``Modality.tensors()``.
         """
 
+    @staticmethod
     @abstractmethod
-    def collate(self, items: list[Tensor]) -> Tensor | list[Tensor]:
+    def collate(items: list[Tensor]) -> Tensor | list[Tensor]:
         """Combine items returned by ``_load``, one per patient and in order, into a batch.
 
-        Used by ``Modality.__getitem__`` when several ids are passed, and by ``MultimodalDataset.collate`` to batch
+        Used by ``Modality.tensors()`` when several ids are passed, and by ``MultimodalDataset.collate`` to batch
         each modality's items.
         """
 
 
-class FixedShapeModality(Modality):
+class FixedShapeModality(Modality, ABC):
     """Every patient's item has the same shape, e.g. one vector per patient."""
 
-    def collate(self, items: list[Tensor]) -> Tensor:
+    @staticmethod
+    def collate(items: list[Tensor]) -> Tensor:
         """Stack the items into one ``(n, *item_shape)`` tensor."""
         return torch.stack(items)
 
 
-class BagModality(Modality):
+class BagModality(Modality, ABC):
     """Each patient's item is an ``(N_i, d)`` bag of instances, where N_i varies between patients."""
 
-    def collate(self, items: list[Tensor]) -> list[Tensor]:
+    @staticmethod
+    def collate(items: list[Tensor]) -> list[Tensor]:
         """Keep the bags as a list, since their sizes differ."""
         return items
 
     @abstractmethod
     def instances(self, id: str) -> pd.DataFrame:
-        """One row per instance of ``_load(id)``, in the same order, describing each one (e.g. file, x, y).
+        """One row per instance of ``tensors(id)``, in the same order, describing each one (e.g. file, x, y).
 
         Used by the interpret module, never by fit or predict.
         """
@@ -113,6 +122,10 @@ class Tabular(FixedShapeModality):
         self._frame.index = _as_ids(self._frame.index, f"{self.__class__.__name__}")
         self.ids = self._frame.index.sort_values()
         self._position = {pid: k for k, pid in enumerate(self._frame.index)}
+
+    def _view(self, ids: pd.Index) -> pd.DataFrame:
+        """The rows of ``ids``, in the order given, as a DataFrame even for one id."""
+        return self._frame.loc[ids]
 
     @property
     def frame(self) -> pd.DataFrame:
@@ -157,7 +170,8 @@ class PatchFeatures(BagModality):
     """Pre-extracted patch features: one h5 file (or several) per patient, read lazily per patient.
 
     Args:
-        files: Paths indexed by patient id. A repeated id means that patient has several files.
+        files: Paths indexed by patient id. A repeated id means that patient has several files. Each file must be
+        listed once,as a repeated file would put a patch in a bag twice, or give two patients the same inputs.
         features_key: Dataset holding the (N, D) features in each file.
         coords_key: Dataset holding the (N, 2) patch coordinates, row-aligned with the features.
         multiple_files: What to do when a patient has several files. ``"error"`` raises;
@@ -178,6 +192,19 @@ class PatchFeatures(BagModality):
         self.coords_key = coords_key
         self.multiple_files = multiple_files
         self.ids = _as_ids(pd.Index(files.index).unique(), f"{self.__class__.__name__}").sort_values()
+
+        # file <-> id mapping should always be 1-to-1
+        owners: dict[Path, list[str]] = {}
+        for pid, path in files.items():
+            # use resolve() for absolute paths
+            owners.setdefault(Path(path).resolve(), []).append(pid)
+        repeated = sorted((path, pids) for path, pids in owners.items() if len(pids) > 1)
+        if repeated:
+            path, pids = repeated[0]
+            raise ValueError(
+                f"{len(repeated)} files are listed more than once (e.g. {path} for {pids}); "
+                "each file must be listed once, for one patient"
+            )
         self._paths = {pid: sorted(str(p) for p in paths) for pid, paths in files.groupby(level=0)}
         several = sorted(pid for pid, paths in self._paths.items() if len(paths) > 1)
         if several and multiple_files == "error":
@@ -209,6 +236,63 @@ class PatchFeatures(BagModality):
                 raise ValueError(f"{path} does not match id_pattern {id_pattern!r}")
             ids.append(match.group(1))
         return cls(pd.Series(paths, index=pd.Index(ids, name="id")), features_key, coords_key, multiple_files)
+
+    def _view(self, ids: pd.Index) -> pd.DataFrame:
+        """Patches of the given patient(s), indexed by (id, patch), with file, x, y and feature_0..feature_{D-1}."""
+        ids = list(ids)
+
+        # Pass 1: shapes only (reads HDF5 headers, not data).
+        plan = []  # (id, path, n_rows)
+        n_features = None
+        coord_dtypes = []
+        for pid in ids:
+            for path in self._paths[pid]:
+                with h5py.File(path, "r") as f:
+                    rows, d = self._dataset(f, path, self.features_key).shape
+                    coord_dataset = self._dataset(f, path, self.coords_key)
+                    n_coords = coord_dataset.shape[0]
+                    coord_dtypes.append(coord_dataset.dtype)
+                if n_coords != rows:
+                    raise ValueError(f"{path}: {n_coords} coordinates for {rows} feature rows")
+                if n_features is None:
+                    n_features = d
+                elif d != n_features:
+                    raise ValueError(f"{path}: {d} features, expected {n_features}")
+                plan.append((pid, path, rows))
+        total = sum(rows for _, _, rows in plan)
+        # for mypy check only: _requested_ids() guarantees a non-empty selection
+        assert n_features is not None
+
+        # Pass 2: read straight into preallocated buffers.
+        features = np.empty((total, n_features), dtype=np.float32)
+        xy = np.empty((total, 2), dtype=np.result_type(*coord_dtypes))
+        patch = np.empty(total, dtype=np.int64)
+        id_codes = np.empty(total, dtype=np.int32)
+        files = np.repeat(np.array([path for _, path, _ in plan], dtype=object), [rows for _, _, rows in plan])
+
+        id_position = {pid: k for k, pid in enumerate(ids)}
+        start = 0
+        next_patch = dict.fromkeys(ids, 0)
+        for pid, path, rows in plan:
+            stop = start + rows
+            with h5py.File(path, "r") as f:
+                f[self.features_key].read_direct(features, dest_sel=np.s_[start:stop])
+                f[self.coords_key].read_direct(xy, source_sel=np.s_[:, :2], dest_sel=np.s_[start:stop])
+            id_codes[start:stop] = id_position[pid]
+            patch[start:stop] = np.arange(next_patch[pid], next_patch[pid] + rows)
+            next_patch[pid] += rows
+            start = stop
+
+        index = pd.MultiIndex(
+            levels=[pd.Index(ids, name="id"), pd.RangeIndex(patch.max() + 1 if total else 0)],
+            codes=[id_codes, patch],
+            names=["id", "patch"],
+        )
+        df = pd.DataFrame(features, index=index, columns=[f"feature_{j}" for j in range(n_features)], copy=False)
+        df.insert(0, "y", xy[:, 1])
+        df.insert(0, "x", xy[:, 0])
+        df.insert(0, "file", files)
+        return df
 
     @staticmethod
     def _dataset(f: h5py.File, path: str, key: str) -> h5py.Dataset:
