@@ -76,7 +76,7 @@ def test_vote_ties_have_fixed_scores_and_error_policy():
     result = MajorityVote(tie_break="mean_probability")(values, present)
     torch.testing.assert_close(result, torch.tensor([[0.52, 0.48], [0.5, 0.5]]))
     assert result.argmax(dim=1).tolist() == [0, 0]
-    with pytest.raises(ValueError, match="2 patients have tied votes"):
+    with pytest.raises(ValueError, match="2 rows have tied votes"):
         MajorityVote(tie_break="error")(values, present)
 
 
