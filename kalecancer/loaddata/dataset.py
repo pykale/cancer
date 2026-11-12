@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import logging
+import warnings
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
@@ -17,6 +19,9 @@ from kalecancer.loaddata.modalities import Modality
 from kalecancer.loaddata.targets import BaseTarget
 
 
+logger = logging.getLogger(__name__)
+
+
 class MultimodalDataset:
     """Modalities and a target joined by patient id.
 
@@ -25,6 +30,8 @@ class MultimodalDataset:
         target: The target, or ``None`` for unlabelled data.
         required_modalities: Modalities every included patient must have. Patients also need the target
             (when given) and at least one modality. ``summary()`` reports who was excluded and why.
+        warn: Whether to emit a warning when patients are excluded because they have no target.
+        verbose: Whether to log dataset inclusion and exclusion counts at info level.
     """
 
     def __init__(
@@ -32,6 +39,8 @@ class MultimodalDataset:
         modalities: Mapping[str, Modality],
         target: BaseTarget | None,
         required_modalities: Sequence[str],
+        warn: bool = True,
+        verbose: bool = False,
     ):
         if not modalities:
             raise ValueError("MultimodalDataset needs at least one modality")
@@ -61,6 +70,25 @@ class MultimodalDataset:
         self._excluded = {pid: reason for pid in candidates if (reason := self._exclusion_reason(pid))}
         self._set_ids(candidates - self._excluded.keys())
 
+        exclusion_counts = Counter(self._excluded.values())
+        no_target_count = exclusion_counts["no target"]
+
+        if warn and no_target_count:
+            warnings.warn(
+                f"{no_target_count} patient(s) were excluded because they have no matching target.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        if verbose:
+            logger.info(
+                "MultimodalDataset created with %d included and %d excluded patients. "
+                "Exclusion counts: %s",
+                len(self.ids),
+                len(self._excluded),
+                dict(sorted(exclusion_counts.items())),
+            )
+
     def _exclusion_reason(self, pid: str) -> str | None:
         if self._target_ids is not None and pid not in self._target_ids:
             return "no target"
@@ -70,7 +98,6 @@ class MultimodalDataset:
         if not any(pid in ids for ids in self._modality_ids.values()):
             return "no modality"
         return None
-
     def _set_ids(self, ids: Iterable[str]) -> None:
         self.ids = _as_ids(ids, "MultimodalDataset").sort_values()
         self._id_set = set(self.ids)
@@ -170,7 +197,6 @@ class MultimodalTorchDataset(Dataset):
             if pid in self.data._modality_ids[name]
         }
         return {"id": pid, "inputs": inputs}
-
     def collate(self, samples: list[dict]) -> dict:
         """Collate samples into a batch, for ``DataLoader(torch_data, collate_fn=torch_data.collate)``.
 
