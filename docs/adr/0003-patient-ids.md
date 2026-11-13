@@ -15,8 +15,7 @@ Modalities and targets exposed a `pd.Index` of dtype `object`. `MultimodalDatase
 ## Options
 
 - **`list[str]`:** simple, but mutable, so it can fall out of step with the dataset's id set and `present`.
-- **`tuple[str, ...]`:** immutable, and `==` returns a single bool. However, `df.loc[ids]` reads a tuple as a (row,
-  column) key. It raises a confusing `KeyError`, or, with a single id, silently returns a Series.
+- **`tuple[str, ...]`:** immutable, and `==` returns a single bool. However, `df.loc[ids]` reads a tuple as a (row, column) key. It raises a confusing `KeyError`, or, with a single id, silently returns a Series.
 - **`pd.Index` (chosen):** immutable, and hashed, and it works directly with `.loc`, `reindex`, `isin` and set operations. Like the rest of the API (`Tabular` frames, `Target` Series, `present`, predictions), it is pandas.
 - **A custom `Ids` class:** a new public type for little gain.
 
