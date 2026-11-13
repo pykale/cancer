@@ -7,7 +7,7 @@
 -----------------------------------------
 
 <!-- Keep badges to just ONE line, i.e. only the most important badges! -->
-[![Built on PyKale](https://img.shields.io/badge/built%20on-PyKale-5699C6)](https://github.com/pykale/pykale) [![CI](https://github.com/pykale/cancer/actions/workflows/ci.yml/badge.svg)](https://github.com/pykale/cancer/actions/workflows/ci.yml) [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org)
+[![Built on PyKale](https://img.shields.io/badge/built%20on-PyKale-5699C6)](https://github.com/pykale/pykale) [![CI](https://github.com/pykale/cancer/actions/workflows/ci.yml/badge.svg)](https://github.com/pykale/cancer/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/pykale/cancer/branch/main/graph/badge.svg)](https://codecov.io/gh/pykale/cancer) [![CodeQL](https://github.com/pykale/cancer/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/pykale/cancer/actions/workflows/codeql-analysis.yml) [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org) [![PyPI version](https://img.shields.io/pypi/v/kalecancer?color=blue)](https://pypi.org/project/kalecancer/)
 
 [Getting Started](#how-to-use) | [Documentation](docs/) | [Examples](examples/) | [Contributing](#step-2-building-and-contributing) | [Architecture](docs/architecture.md)
 
