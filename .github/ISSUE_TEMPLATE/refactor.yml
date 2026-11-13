@@ -47,3 +47,15 @@ body:
         - "Not sure"
     validations:
       required: true
+
+  - type: checkboxes
+    id: mogonet
+    attributes:
+      label: Migrated code
+      description: >-
+        The MOGONET multiomics modules were migrated from PyKale without changing their outputs, APIs or contracts.
+        See [Code migrated from PyKale](https://github.com/pykale/cancer/blob/main/CONTRIBUTING.md#code-migrated-from-pykale).
+      options:
+        - label: >-
+            This refactor touches the migrated MOGONET code, and I will show its results are unchanged or record the
+            change in docs/adr/.

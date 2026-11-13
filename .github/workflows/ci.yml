@@ -41,17 +41,22 @@ jobs:
         installer: [uv, pip] # test uv and pip
         include:
           # uv installs the exact versions in uv.lock into .venv, which is put on PATH for the later steps.
+          # MOGONET also needs torch_scatter and torch_sparse built for the installed PyTorch, from the PyG wheel index.
           - installer: uv
             install: |
-              uv sync --frozen --extra tabular
+              uv sync --frozen --extra tabular --extra multiomics
               echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+              TORCH=$(.venv/bin/python -c "import torch; print(torch.__version__)")
+              uv pip install --only-binary :all: torch_scatter torch_sparse --find-links "https://data.pyg.org/whl/torch-${TORCH}.html"
 
           # pip resolves from the bounds in pyproject.toml
           # The dev tools are a dependency group (PEP 735), which needs pip >= 25.1.
           - installer: pip
             install: |
               python -m pip install --upgrade pip
-              python -m pip install -e ".[tabular]" --group dev
+              python -m pip install -e ".[tabular,multiomics]" --group dev
+              TORCH=$(python -c "import torch; print(torch.__version__)")
+              python -m pip install --only-binary :all: torch_scatter torch_sparse -f "https://data.pyg.org/whl/torch-${TORCH}.html"
     steps:
       - uses: actions/checkout@v4
 
@@ -69,7 +74,7 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install package, tabular extra and dev tools (${{ matrix.installer }})
+      - name: Install package, tabular and multiomics extras and dev tools (${{ matrix.installer }})
         run: ${{ matrix.install }}
 
       - name: Cache the TabICL checkpoint
