@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  # changelog.yml dispatches CI on the release pull request's changelog commit.
+  workflow_dispatch:
   push:
     branches: [main, migration/pykale-core]
   pull_request:
@@ -80,4 +82,11 @@ jobs:
         run: python -c "from huggingface_hub import hf_hub_download; hf_hub_download('jingang/TabICL', '$TABICL_CHECKPOINT')"
 
       - name: pytest
-        run: pytest --cov=kalecancer --cov-report=term-missing -rs
+        run: pytest --cov=kalecancer --cov-report=term-missing --cov-report=xml -rs
+
+      # As in PyKale. A failed upload, e.g. from a fork without the token, does not fail CI.
+      - name: Report coverage
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml

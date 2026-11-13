@@ -1,9 +1,6 @@
 # Contributing to KaleCancer
 
-Thanks for helping. KaleCancer follows PyKale's
-[contributing guidelines](https://github.com/pykale/pykale/blob/main/.github/CONTRIBUTING.md) and
-[Code of Conduct](https://github.com/pykale/pykale/blob/main/.github/CODE_OF_CONDUCT.md). This page covers what is
-specific to this repository.
+Thanks for helping. KaleCancer follows PyKale's [contributing guidelines](https://github.com/pykale/pykale/blob/main/.github/CONTRIBUTING.md) and [Code of Conduct](https://github.com/pykale/pykale/blob/main/.github/CODE_OF_CONDUCT.md). This page covers what is specific to this repository.
 
 ## Examples
 
@@ -18,8 +15,7 @@ uv sync --all-extras
 uv run pre-commit install
 ```
 
-Or with pip, which is more fragile because it resolves versions from the bounds in `pyproject.toml`. The dev tools
-are a dependency group, which needs pip 25.1 or later:
+Or with pip, which is more fragile because it resolves versions from the bounds in `pyproject.toml`. The dev tools are a dependency group, which needs pip 25.1 or later:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -41,9 +37,20 @@ uv run pytest --cov=kalecancer
 
 ### Tests
 
-Tests live in a flat `tests/` directory with one file per area, such as `test_loaddata.py`, `test_model_fusion.py`
-and `test_pipeline.py`. They build synthetic HDF5 cohorts with `make_cohort` from `tests/conftest.py` and never access
-the network. Add tests for new code to the matching file.
+Tests mirror the package layout, as in PyKale: code in `kalecancer/model/fusion.py` is tested in `tests/model/test_fusion.py`, and an example in `tests/examples/`. They build synthetic HDF5 cohorts with `make_cohort` from `tests/conftest.py` and never access the network. Add tests for new code to the matching file.
+
+## Releasing
+
+Releases follow PyKale's process, with the steps maintainers did by hand for PyKale 0.2.2 automated:
+
+1. Bump `__version__` in `kalecancer/__init__.py`, e.g. to `0.2.0` or `0.2.0rc1`, and open a pull request from a branch of this repository titled `Release 0.2.0`.
+2. `changelog.yml` collects the pull requests merged since the last tag, grouped by label, and commits the section to `.github/CHANGELOG.md` on the branch. Within each group the entries are sorted by pull request number, titles lose any `feat:`-style prefix and start with a capital letter, and earlier release pull requests are left out. It also posts the section as a comment and runs CI on the new commit.
+3. Review the section and edit it on the branch if needed. A rerun never overwrites an existing section.
+4. Approve the pull request. `release-on-approval.yml` waits for the checks, merges, creates the `v0.2.0` GitHub release with the changelog section as its notes, builds the package with `build-dist.yml` and publishes it: alpha, beta and release-candidate versions go to Test PyPI, the rest to PyPI.
+
+Only approvals from owners, members and collaborators, of the pull request's latest commit, start a release. If a check fails, fix it, push, and approve again.
+
+Publishing uses PyPI trusted publishing, so no PyPI token is stored. pypi.org and test.pypi.org each trust two workflows of `pykale/cancer`: `release-on-approval.yml` and `release.yml`, which publishes a release created by hand. The publishers use the environments `pypi` and `testpypi`. The repository needs the `new feature`, `bug`, `refactor`, `enhancement`, `dependencies`, `tests` and `documentation` labels that `.github/changelog-config.json` groups by. New issues and pull requests are added to the [KaleCancer project](https://github.com/orgs/pykale/projects/14), which needs the `ADD_TO_PROJECT_PAT` secret.
 
 ## Adding a component
 
@@ -56,32 +63,19 @@ Each kind of component has a guide in `docs/extending/`:
 | a fusion method | [fusion.md](docs/extending/fusion.md) | `kalecancer/model/fusion.py` |
 | a new endpoint: a target and its head | [endpoints.md](docs/extending/endpoints.md) | `kalecancer/loaddata/targets.py`, `kalecancer/model/heads.py` |
 
-Every component also follows the [Conventions](#conventions) below. Read [docs/architecture.md](docs/architecture.md)
-to see how the parts fit together, and [docs/adr/](docs/adr/) for the reasoning behind the current design.
+Every component also follows the [Conventions](#conventions) below. Read [docs/architecture.md](docs/architecture.md) to see how the parts fit together, and [docs/adr/](docs/adr/) for the reasoning behind the current design.
 
-A change to the architecture gets an entry in [docs/adr/](docs/adr/) recording the options considered and the choice
-made.
+A change to the architecture gets an entry in [docs/adr/](docs/adr/) recording the options considered and the choice made.
 
 ## Conventions
 
-- **The library supplies mechanisms, not experiments.** Nothing in `kalecancer/` may name a dataset, an endpoint
-  column, a file pattern or a published split. Those are the dataset's decisions, and belong in `examples/`.
-- **There is one estimator, `Pipeline`.** Don't add a pipeline or trainer for a particular modality, fusion method
-  or endpoint.
+- **The library supplies mechanisms, not experiments.** Nothing in `kalecancer/` may name a dataset, an endpoint column, a file pattern or a published split. Those are the dataset's decisions, and belong in `examples/`.
+- **There is one estimator, `Pipeline`.** Don't add a pipeline or trainer for a particular modality, fusion method or endpoint.
 - **Reuse before writing.** Use scikit-learn, Lightning, TorchSurv or PyKale where they already cover what you need.
-- **scikit-survival is GPL-licensed.** Use it only as a reference implementation in tests, and never import it from
-  `kalecancer/`. If you think importing it would be hugely beneficial, open an issue to discuss it first.
-- **`tabicl` is pinned to an exact version**, because `TabICLEncoder` relies on its private internals. Bump it only if
-  `tests/test_tabicl.py` passes with the pretrained checkpoint cached, so that the comparison with upstream runs
-  rather than being skipped.
-- **Imports:** export public classes from their subpackage's `__init__.py`. Users import from
-  `kalecancer.<subpackage>`, not from the package root.
+- **scikit-survival is GPL-licensed.** Use it only as a reference implementation in tests, and never import it from `kalecancer/`. If you think importing it would be hugely beneficial, open an issue to discuss it first.
+- **`tabicl` is pinned to an exact version**, because `TabICLEncoder` relies on its private internals. Bump it only if `tests/model/encode/test_tabicl.py` passes with the pretrained checkpoint cached, so that the comparison with upstream runs rather than being skipped.
+- **Imports:** export public classes from their subpackage's `__init__.py`. Users import from `kalecancer.<subpackage>`, not from the package root.
 - **Configure through constructor arguments**, not globals or environment variables
-- **Modules create their weights in `__init__`.** `Pipeline.fit` trains a copy of the model as built and never resets
-  its weights, so don't rely on `reset_parameters()` being called, and don't add a `random_state` argument for the
-  weights as the user seeds them before building the model using `torch.manual_seed()`.
-- **Seed only your own random choices.** Training randomness (shuffling, dropout, sampling) is seeded by
-  `Pipeline(random_state=...)`. If a component makes a random choice of its own, such as assigning folds in `fit`,
-  give it a `random_state` argument, as `TabICLEncoder` does.
-- **Style:** Google-style docstrings, type hints, and a line length of 120. ruff-format decides formatting, so don't
-  format by hand. Comments explain why, not what.
+- **Modules create their weights in `__init__`.** `Pipeline.fit` trains a copy of the model as built and never resets its weights, so don't rely on `reset_parameters()` being called, and don't add a `random_state` argument for the weights as the user seeds them before building the model using `torch.manual_seed()`.
+- **Seed only your own random choices.** Training randomness (shuffling, dropout, sampling) is seeded by `Pipeline(random_state=...)`. If a component makes a random choice of its own, such as assigning folds in `fit`, give it a `random_state` argument, as `TabICLEncoder` does.
+- **Style:** Google-style docstrings, type hints, and a line length of 120. ruff-format decides formatting, so don't format by hand. Comments explain why, not what.

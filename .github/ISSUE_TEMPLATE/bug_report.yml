@@ -1,0 +1,114 @@
+# Adapted from PyKale's bug-report.md, as an issue form in the style of KaleCardiac's.
+name: "\U0001F41B Bug report"
+description: Something in KaleCancer does not work as documented
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve KaleCancer, part of the [PyKale](https://github.com/pykale/pykale) family.
+
+        **Do not include patient data.** No clinical tables, slide or patch features, omics profiles, patient IDs,
+        file paths from a clinical system or screenshots of records, not even "anonymised" ones, and not rows copied
+        from public cohorts such as HANCOCK or TCGA. Reproduce the problem on a synthetic cohort from `make_cohort()` in
+        `examples/synthetic/synthetic_data_generation.py`; if it only appears on your data, vary its arguments until it
+        shows.
+
+        If the problem is in PyKale itself (anything imported from `kale`), report it in
+        [pykale/pykale](https://github.com/pykale/pykale/issues) instead.
+
+  - type: textarea
+    id: bug
+    attributes:
+      label: "\U0001F41B Bug"
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where it happens
+      multiple: true
+      options:
+        - Loading data (MultimodalDataset, Tabular, PatchFeatures, targets)
+        - Table preparation (TableTransform)
+        - Encoders (MLP, ABMIL, TabICLEncoder)
+        - Fusion (Concat, MaskedMean, MajorityVote)
+        - Heads and losses (CoxHead, ClassificationHead)
+        - Models (Unimodal, EarlyFusion, IntermediateFusion, LateFusion)
+        - Pipeline (fit, predict, evaluate, encode, configs)
+        - Evaluation metrics, bootstrap or cross-validation
+        - Interpretation (attention, attribution)
+        - An example
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: endpoint
+    attributes:
+      label: Endpoint
+      options:
+        - Survival (TimeToEvent)
+        - Classification
+        - Not endpoint-specific
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: To reproduce
+      description: >-
+        The smallest code that shows the problem, building its cohort with `make_cohort()`. Make sure it does not
+        need any dependencies other than those KaleCancer requires. We much prefer a small snippet to a link to a
+        repository.
+      render: python
+    validations:
+      required: true
+
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Stack trace or error message
+      description: Paste the full output.
+      render: text
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: A clear and concise description of what you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: >-
+        The output of
+        `python -c "import kalecancer, kale, torch; print(kalecancer.__version__, kale.__version__, torch.__version__)"`,
+        your operating system and Python version, whether you installed with uv or pip and which extras, and your
+        CUDA version and GPU if you use one. PyTorch's
+        [environment collection script](https://raw.githubusercontent.com/pytorch/pytorch/main/torch/utils/collect_env.py)
+        gives most of this; check its contents before running it.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else about the problem.
+
+  - type: checkboxes
+    id: no-patient-data
+    attributes:
+      label: Data
+      options:
+        - label: This report contains no patient data, identifiers or paths from a clinical system.
+          required: true

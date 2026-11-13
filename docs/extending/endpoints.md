@@ -5,14 +5,11 @@
 > table below. The `Pipeline` also fills `EvalContext.classes` only for `Classification` targets. Expect to adapt an
 > endpoint written against this guide.
 
-An endpoint is what the model predicts, such as survival or a class label. It takes two classes: a target in
-`kalecancer/loaddata/targets.py` that holds the outcomes, and a head in `kalecancer/model/heads.py` that predicts them
-and owns the loss. The `Pipeline` and models stay as they are.
+An endpoint is what the model predicts, such as survival or a class label. It takes two classes: a target in `kalecancer/loaddata/targets.py` that holds the outcomes, and a head in `kalecancer/model/heads.py` that predicts them and owns the loss. The `Pipeline` and models stay as they are.
 
 ## 1. The target
 
-Subclass `BaseTarget`, check the outcomes in `__init__`, store them in `frame` (indexed by patient id), and implement
-three methods:
+Subclass `BaseTarget`, check the outcomes in `__init__`, store them in `frame` (indexed by patient id), and implement three methods:
 
 ```python
 class Continuous(BaseTarget):
@@ -40,20 +37,15 @@ class Continuous(BaseTarget):
         return {"patients": len(ids)}
 ```
 
-- **`frame`** holds the checked outcomes. Metrics score predictions against it, and `fit` keeps the training rows in
-  `train_target_`.
-- **`tensors(ids)`** returns the outcomes of `ids`, in that order, as the tensors the head's `loss` reads. Each batch
-  carries them as `batch["target"]`.
-- **`strata(ids)`** returns one discrete label per patient. Stratified splits and the validation carve use it, and a
-  `FittedEncoder` may read it as a label.
+- **`frame`** holds the checked outcomes. Metrics score predictions against it, and `fit` keeps the training rows in `train_target_`.
+- **`tensors(ids)`** returns the outcomes of `ids`, in that order, as the tensors the head's `loss` reads. Each batch carries them as `batch["target"]`.
+- **`strata(ids)`** returns one discrete label per patient. Stratified splits and the validation carve use it, and a `FittedEncoder` may read it as a label.
 - **`counts(ids)`** returns the summary counts that `data.summary()`, fit reports and cross-validation folds show.
-- **Reject missing outcomes** rather than guessing. `TimeToEvent` raises on a missing `event`, because an unknown
-  outcome isn't a censored one.
+- **Reject missing outcomes** rather than guessing. `TimeToEvent` raises on a missing `event`, because an unknown outcome isn't a censored one.
 
 ## 2. The head
 
-A head is an `nn.Module` that owns everything about the endpoint: its output, the prediction, the loss, the target
-check and the names of the prediction columns.
+A head is an `nn.Module` that owns everything about the endpoint: its output, the prediction, the loss, the target check and the names of the prediction columns.
 
 ```python
 class RegressionHead(nn.Module):
@@ -101,16 +93,12 @@ Compute the loss in float32, outside autocast, as the stock heads do, so that mi
 
 ## 3. Metrics
 
-An endpoint usually needs a metric too. Subclass `Metric` in `kalecancer/evaluate/metrics.py`. Set
-`higher_is_better`, and implement `__call__(prediction, target, context)`: it scores the prediction frame against the
-target's `frame`, matched by patient id. Use scikit-learn or TorchSurv for the computation where they have it.
+An endpoint usually needs a metric too. Subclass `Metric` in `kalecancer/evaluate/metrics.py`. Set `higher_is_better`, and implement `__call__(prediction, target, context)`: it scores the prediction frame against the target's `frame`, matched by patient id. Use scikit-learn or TorchSurv for the computation where they have it.
 
 ## Checklist
 
-- [ ] The target is exported from `kalecancer/loaddata/__init__.py`, the head from `kalecancer/model/__init__.py`, and
-  any metric from `kalecancer/evaluate/__init__.py`.
-- [ ] Tests in `tests/test_loaddata.py` cover the target's checks, `tensors`, `strata` and `counts`. Tests in
-  `tests/test_model_components.py` cover the head's loss against a reference value, and `check_target`.
+- [ ] The target is exported from `kalecancer/loaddata/__init__.py`, the head from `kalecancer/model/__init__.py`, and any metric from `kalecancer/evaluate/__init__.py`.
+- [ ] Tests in `tests/loaddata/test_loaddata.py` cover the target's checks, `tensors`, `strata` and `counts`. Tests in `tests/model/test_model_components.py` cover the head's loss against a reference value, and `check_target`.
 - [ ] A short `Pipeline.fit` and `evaluate` on synthetic data runs end to end.
 - [ ] The target and head tables in `docs/architecture.md` list them.
 - [ ] The [Conventions](../../CONTRIBUTING.md#conventions) are followed.

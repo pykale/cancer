@@ -9,6 +9,7 @@ dist/
 build/
 *.egg
 .coverage
+coverage.xml
 .pytest_cache/
 
 # Data and experiment outputs

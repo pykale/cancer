@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: A problem in PyKale itself
+    url: https://github.com/pykale/pykale/issues
+    about: Bugs and requests for anything imported from `kale` belong in the PyKale repository.
+  - name: PyKale documentation
+    url: https://pykale.readthedocs.io
+    about: The core library KaleCancer builds on, and its other applications.

@@ -1,0 +1,49 @@
+# Adapted from PyKale's documentation.md, as an issue form in the style of KaleCardiac's.
+name: "\U0001F4DA Documentation"
+description: Report missing, wrong or unclear KaleCancer documentation
+title: "[Docs] "
+labels: ["documentation"]
+body:
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      multiple: true
+      options:
+        - README or quickstart
+        - Architecture (docs/architecture.md)
+        - Extending guides (docs/extending/)
+        - Decision records (docs/adr/)
+        - CONTRIBUTING or AGENTS
+        - Docstrings
+        - An example or notebook
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: missing
+    attributes:
+      label: Is there documentation missing?
+      description: Let us know which modules have missing or incomplete documentation.
+
+  - type: textarea
+    id: wrong
+    attributes:
+      label: Is documentation wrong?
+      description: Let us know if you find a mistake, and what the code actually does.
+
+  - type: textarea
+    id: example
+    attributes:
+      label: Is there a feature that needs some example code?
+      description: Let us know if we're missing an example or notebook.
+
+  - type: dropdown
+    id: pull-request
+    attributes:
+      label: Think you know how to fix the docs?
+      description: If so, we'd love a pull request from you!
+      options:
+        - "Yes, I can open a pull request"
+        - "No"
