@@ -1,0 +1,49 @@
+# Adapted from PyKale's refactor.md, as an issue form in the style of KaleCardiac's.
+name: "\U0001F527 Refactor"
+description: Propose a refactor, speed-up or other improvement to KaleCancer's internals
+title: "[Refactor] "
+labels: ["refactor"]
+body:
+  - type: textarea
+    id: refactor
+    attributes:
+      label: What to refactor, and why
+      description: A clear and concise description of what you wish to refactor.
+    validations:
+      required: true
+
+  - type: textarea
+    id: modules
+    attributes:
+      label: Modules that will be modified
+      placeholder: e.g. kalecancer/model/fusion.py, kalecancer/pipeline/training.py
+    validations:
+      required: true
+
+  - type: textarea
+    id: structure
+    attributes:
+      label: Impact on code structure
+      description: >-
+        A change to the architecture needs an entry in
+        [docs/adr/](https://github.com/pykale/cancer/tree/main/docs/adr) recording the options considered and the
+        choice made.
+
+  - type: textarea
+    id: speed
+    attributes:
+      label: Impact on speed
+      description: Measurements, if you have them.
+
+  - type: dropdown
+    id: breaking
+    attributes:
+      label: Will this be a breaking change?
+      description: >-
+        Breaking means a public API, a configuration path, a saved pipeline or a result users rely on changes.
+      options:
+        - "No"
+        - "Yes"
+        - "Not sure"
+    validations:
+      required: true

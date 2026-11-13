@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  # changelog.yml dispatches CI on the release pull request's changelog commit.
+  workflow_dispatch:
   push:
     branches: [main, migration/pykale-core]
   pull_request:

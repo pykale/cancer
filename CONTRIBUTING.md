@@ -39,6 +39,19 @@ uv run pytest --cov=kalecancer
 
 Tests mirror the package layout, as in PyKale: code in `kalecancer/model/fusion.py` is tested in `tests/model/test_fusion.py`, and an example in `tests/examples/`. They build synthetic HDF5 cohorts with `make_cohort` from `tests/conftest.py` and never access the network. Add tests for new code to the matching file.
 
+## Releasing
+
+Releases follow PyKale's process, with the steps maintainers did by hand for PyKale 0.2.2 automated:
+
+1. Bump `__version__` in `kalecancer/__init__.py`, e.g. to `0.2.0` or `0.2.0rc1`, and open a pull request from a branch of this repository titled `Release 0.2.0`.
+2. `changelog.yml` collects the pull requests merged since the last tag, grouped by label, and commits the section to `.github/CHANGELOG.md` on the branch. Within each group the entries are sorted by pull request number, titles lose any `feat:`-style prefix and start with a capital letter, and earlier release pull requests are left out. It also posts the section as a comment and runs CI on the new commit.
+3. Review the section and edit it on the branch if needed. A rerun never overwrites an existing section.
+4. Approve the pull request. `release-on-approval.yml` waits for the checks, merges, creates the `v0.2.0` GitHub release with the changelog section as its notes, builds the package with `build-dist.yml` and publishes it: alpha, beta and release-candidate versions go to Test PyPI, the rest to PyPI.
+
+Only approvals from owners, members and collaborators, of the pull request's latest commit, start a release. If a check fails, fix it, push, and approve again.
+
+Publishing uses PyPI trusted publishing, so no PyPI token is stored. pypi.org and test.pypi.org each trust two workflows of `pykale/cancer`: `release-on-approval.yml` and `release.yml`, which publishes a release created by hand. The publishers use the environments `pypi` and `testpypi`. The repository needs the `new feature`, `bug`, `refactor`, `enhancement`, `dependencies`, `tests` and `documentation` labels that `.github/changelog-config.json` groups by. New issues and pull requests are added to the [KaleCancer project](https://github.com/orgs/pykale/projects/14), which needs the `ADD_TO_PROJECT_PAT` secret.
+
 ## Adding a component
 
 Each kind of component has a guide in `docs/extending/`:

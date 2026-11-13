@@ -1,0 +1,98 @@
+# Adapted from PyKale's feature-request.md, as an issue form in the style of KaleCardiac's.
+name: "\U0001F680 Feature request"
+description: Propose a new KaleCancer capability, or a change to an existing one
+title: "[Feature Request] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        KaleCancer supplies mechanisms, not experiments: anything that names a dataset, an endpoint column or a
+        published split belongs in `examples/`. Read the [Conventions](https://github.com/pykale/cancer/blob/main/CONTRIBUTING.md#conventions)
+        and the guide for the component in [docs/extending/](https://github.com/pykale/cancer/tree/main/docs/extending)
+        before proposing an API.
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: >-
+        Is your feature request related to a problem? What can you not do today, and in which workflow did you need
+        it? Link any relevant issues or pull requests.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Where it belongs
+      description: Which pipeline stage would hold it? If it names a dataset or an experiment, it belongs in an example.
+      options:
+        - loaddata (a modality, a target, splitting)
+        - prepdata (table transforms)
+        - model (an encoder, a fusion method, a head, a model)
+        - pipeline
+        - evaluate
+        - interpret
+        - an example
+        - documentation
+        - not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: modality
+    attributes:
+      label: Data it involves
+      multiple: true
+      options:
+        - Clinical tables
+        - Whole-slide images (patch features)
+        - Multiomics
+        - Radiology imaging (CT, MRI)
+        - A new kind of data
+        - Not data-specific
+
+  - type: textarea
+    id: pitch
+    attributes:
+      label: Pitch
+      description: >-
+        Describe the solution you'd like, and what the API would look like. A constructor argument beats a new class
+        where one will do, and a new endpoint is a target and a head, never a new pipeline.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you've considered
+      description: Other solutions, including existing scikit-learn, Lightning or TorchSurv features.
+
+  - type: textarea
+    id: pykale
+    attributes:
+      label: Overlap with PyKale
+      description: >-
+        Does PyKale already provide this? Would it be useful to other PyKale applications, such as KaleCardiac, so
+        that it belongs in PyKale core instead?
+
+  - type: dropdown
+    id: pull-request
+    attributes:
+      label: Are you willing to open a pull request?
+      description: We love contributions!
+      options:
+        - "Yes"
+        - "Maybe, with some guidance"
+        - "No"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: no-patient-data
+    attributes:
+      label: Data
+      options:
+        - label: This request contains no patient data, identifiers or paths from a clinical system.
+          required: true

@@ -1,0 +1,15 @@
+# Copied from PyKale (pykale/pykale), .github/dependabot.yml, and updated:
+# - KaleCancer pins its versions in uv.lock, so Python dependencies use the uv ecosystem rather than pip.
+# - GitHub Actions are updated too, including the commit-pinned action in changelog.yml.
+# https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
