@@ -5,7 +5,7 @@ from kalecancer.model.encode.base_encoders import AttentionEncoder, FittedEncode
 from kalecancer.model.encode.encoder_list import EncoderList
 from kalecancer.model.encode.encoders import ABMIL, MLP
 from kalecancer.model.fusion import Concat, FusionContext, FusionMethod, MajorityVote, MaskedMean
-from kalecancer.model.heads import ClassificationHead, CoxHead
+from kalecancer.model.heads import ClassificationHead, CoxHead, LinearClassifier
 from kalecancer.model.models import EarlyFusion, IntermediateFusion, LateFusion, ModelOutput, Unimodal
 
 __all__ = [
@@ -23,6 +23,7 @@ __all__ = [
     "FittedEncoder",
     "IntermediateFusion",
     "LateFusion",
+    "LinearClassifier",
     "MajorityVote",
     "MaskedMean",
     "ModelOutput",
