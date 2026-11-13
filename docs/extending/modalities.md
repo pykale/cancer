@@ -89,7 +89,7 @@ Give the modality's encoders input of the right shape: an `(n, *shape)` tensor f
 ## Checklist
 
 - [ ] The class lives in `kalecancer/loaddata/modalities.py` and is exported from `kalecancer/loaddata/__init__.py`.
-- [ ] Tests in `tests/test_loaddata.py` cover the view and `tensors`, for one id and several, unknown ids and, for a bag, that `instances` and the view have one row per loaded instance. Build the data synthetically in `tmp_path`.
+- [ ] Tests in `tests/loaddata/test_loaddata.py` cover the view and `tensors`, for one id and several, unknown ids and, for a bag, that `instances` and the view have one row per loaded instance. Build the data synthetically in `tmp_path`.
 - [ ] The modality table in `docs/architecture.md` lists it.
 
 See [ADR 0001](../adr/0001-modality-refactor.md) for why modalities are designed this way.

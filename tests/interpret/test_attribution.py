@@ -136,7 +136,7 @@ def _tabicl_config() -> dict:
 def tabicl_model(tmp_path_factory, monkeypatch):
     """``clinical`` is encoded by a ``TabICLEncoder`` on a tiny, untrained checkpoint -- the configuration
     FINDING D1 is about. No network access and no pretrained weights needed: the same tiny-checkpoint pattern
-    ``tests/test_tabicl.py`` uses, built fresh here since that file's fixtures are module-scoped and not meant
+    ``tests/model/encode/test_tabicl.py`` uses, built fresh here since that file's fixtures are module-scoped and not meant
     to be imported across test files.
     """
     pytest.importorskip("tabicl")

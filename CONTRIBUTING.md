@@ -37,7 +37,7 @@ uv run pytest --cov=kalecancer
 
 ### Tests
 
-Tests live in a flat `tests/` directory with one file per area, such as `test_loaddata.py`, `test_model_fusion.py` and `test_pipeline.py`. They build synthetic HDF5 cohorts with `make_cohort` from `tests/conftest.py` and never access the network. Add tests for new code to the matching file.
+Tests mirror the package layout, as in PyKale: code in `kalecancer/model/fusion.py` is tested in `tests/model/test_fusion.py`, and an example in `tests/examples/`. They build synthetic HDF5 cohorts with `make_cohort` from `tests/conftest.py` and never access the network. Add tests for new code to the matching file.
 
 ## Adding a component
 
@@ -60,7 +60,7 @@ A change to the architecture gets an entry in [docs/adr/](docs/adr/) recording t
 - **There is one estimator, `Pipeline`.** Don't add a pipeline or trainer for a particular modality, fusion method or endpoint.
 - **Reuse before writing.** Use scikit-learn, Lightning, TorchSurv or PyKale where they already cover what you need.
 - **scikit-survival is GPL-licensed.** Use it only as a reference implementation in tests, and never import it from `kalecancer/`. If you think importing it would be hugely beneficial, open an issue to discuss it first.
-- **`tabicl` is pinned to an exact version**, because `TabICLEncoder` relies on its private internals. Bump it only if `tests/test_tabicl.py` passes with the pretrained checkpoint cached, so that the comparison with upstream runs rather than being skipped.
+- **`tabicl` is pinned to an exact version**, because `TabICLEncoder` relies on its private internals. Bump it only if `tests/model/encode/test_tabicl.py` passes with the pretrained checkpoint cached, so that the comparison with upstream runs rather than being skipped.
 - **Imports:** export public classes from their subpackage's `__init__.py`. Users import from `kalecancer.<subpackage>`, not from the package root.
 - **Configure through constructor arguments**, not globals or environment variables
 - **Modules create their weights in `__init__`.** `Pipeline.fit` trains a copy of the model as built and never resets its weights, so don't rely on `reset_parameters()` being called, and don't add a `random_state` argument for the weights as the user seeds them before building the model using `torch.manual_seed()`.

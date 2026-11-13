@@ -98,7 +98,7 @@ An endpoint usually needs a metric too. Subclass `Metric` in `kalecancer/evaluat
 ## Checklist
 
 - [ ] The target is exported from `kalecancer/loaddata/__init__.py`, the head from `kalecancer/model/__init__.py`, and any metric from `kalecancer/evaluate/__init__.py`.
-- [ ] Tests in `tests/test_loaddata.py` cover the target's checks, `tensors`, `strata` and `counts`. Tests in `tests/test_model_components.py` cover the head's loss against a reference value, and `check_target`.
+- [ ] Tests in `tests/loaddata/test_loaddata.py` cover the target's checks, `tensors`, `strata` and `counts`. Tests in `tests/model/test_model_components.py` cover the head's loss against a reference value, and `check_target`.
 - [ ] A short `Pipeline.fit` and `evaluate` on synthetic data runs end to end.
 - [ ] The target and head tables in `docs/architecture.md` list them.
 - [ ] The [Conventions](../../CONTRIBUTING.md#conventions) are followed.

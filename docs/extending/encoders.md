@@ -89,7 +89,7 @@ In a YAML config it is `{class_path: kalecancer.model.Scale, init_args: {in_dim:
 ## Checklist
 
 - [ ] The encoder is in the right file and exported from `kalecancer/model/__init__.py`.
-- [ ] Tests in `tests/test_model_components.py` cover its output shape and its input error and, for a `FittedEncoder`, that a fresh instance loads a fitted one's `state_dict`. A short `Pipeline.fit` on the `cohort` fixture from `tests/conftest.py` covers the dry run.
+- [ ] Tests in `tests/model/test_model_components.py` cover its output shape and its input error and, for a `FittedEncoder`, that a fresh instance loads a fitted one's `state_dict`. A short `Pipeline.fit` on the `cohort` fixture from `tests/conftest.py` covers the dry run.
 - [ ] The encoder list in `docs/architecture.md` includes it.
 
 See [ADR 0002](../adr/0002-encoder-interface.md) for why encoders are designed this way.
