@@ -10,7 +10,7 @@ such as the changelog commit, starts. Such a run doesn't count against its workf
 workflow passed, e.g. the CI run changelog.yml dispatches. A workflow whose only runs wait for approval is reported
 as waiting, not failed, so the release waits until a maintainer approves and the runs pass.
 
-The release also requires a passing "CI" run.
+The release also requires a "CI" run that succeeded: a skipped or neutral CI run is not enough.
 
 Exit status: 0 when every check passed, 1 when a check failed, 3 while checks are running or waiting for approval.
 A one-line summary is printed in each case.
@@ -82,8 +82,13 @@ def summarise(runs: Iterable[dict], own_workflow: str) -> tuple[int, str]:
         pending.append(
             f"waiting for approval: {', '.join(waiting)} (approve and run them from the pull request's checks)"
         )
-    if states.get(REQUIRED_WORKFLOW) != "passed" and REQUIRED_WORKFLOW not in running + waiting:
-        pending.append(f"no {REQUIRED_WORKFLOW} run has passed yet")
+    # Skipped or neutral is enough for other workflows, but CI must actually have run and succeeded.
+    ci_succeeded = any(
+        run.get("status") == "completed" and run.get("conclusion") == "success"
+        for run in by_workflow.get(REQUIRED_WORKFLOW, [])
+    )
+    if not ci_succeeded and REQUIRED_WORKFLOW not in running + waiting:
+        pending.append(f"no {REQUIRED_WORKFLOW} run has succeeded yet")
     if pending:
         return EXIT_PENDING, "Waiting: " + "; ".join(pending) + "."
 

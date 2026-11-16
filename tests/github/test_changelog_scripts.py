@@ -714,13 +714,19 @@ def test_release_checks_report_failures_before_pending_runs():
 @pytest.mark.parametrize(
     "runs, waiting_for",
     [
-        ([], "no CI run has passed yet"),
-        ([run("codeql-analysis")], "no CI run has passed yet"),
+        ([], "no CI run has succeeded yet"),
+        ([run("codeql-analysis")], "no CI run has succeeded yet"),
         ([run("CI", status="in_progress")], "running: CI"),
+        ([run("CI", conclusion="skipped")], "no CI run has succeeded yet"),
+        ([run("CI", conclusion="neutral")], "no CI run has succeeded yet"),
+        ([run("CI", conclusion="skipped"), run("CI", conclusion="neutral")], "no CI run has succeeded yet"),
     ],
 )
 def test_release_checks_require_ci(runs, waiting_for):
-    """The release never goes ahead without a passing CI run, even when nothing else is pending."""
+    """The release never goes ahead without a CI run that succeeded, even when nothing else is pending.
+
+    A skipped or neutral CI run never ran the tests, so, as before this script, only "success" counts for CI.
+    """
     checks = load("release_checks")
     status, message = checks.summarise(runs, OWN)
     assert status == checks.EXIT_PENDING
