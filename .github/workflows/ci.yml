@@ -91,7 +91,7 @@ jobs:
 
       # As in PyKale. A failed upload, e.g. from a fork without the token, does not fail CI.
       - name: Report coverage
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
