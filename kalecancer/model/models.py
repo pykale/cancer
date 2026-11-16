@@ -4,15 +4,21 @@ Execution rule shared by every model: encoders run on the patients that have the
 scattered back into the batch with NaN for absent patients, fusion methods select defined rows (never multiply
 by a mask), and heads run on defined rows only. This keeps gradients finite when modalities are missing.
 
-Models never test for a particular fusion method: they describe the experiment in a ``FusionContext`` and let the
-method's ``check`` decide, and they ask the method's ``defined`` which patients it combines.
+``Unimodal``, ``EarlyFusion`` and ``IntermediateFusion`` end in one endpoint, which turns their embedding into a typed
+output. ``LateFusion`` combines the typed outputs of such models, and an optional endpoint of its own takes the fused
+output (ADR 0005 §4).
+
+Models never test for a particular fusion method, only for its interface (``TensorFusion`` or ``OutputFusion``). They
+ask the method's ``defined`` which patients it combines, and check themselves that it covers every patient they must
+predict for; the method's own rules run through its hooks (``output_type``, ``check_branches``, ``check_widths``).
 """
 
 from __future__ import annotations
 
+import dataclasses
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar, Literal
 
 import pandas as pd
 import torch
@@ -22,20 +28,11 @@ from kalecancer.loaddata.dataset import MultimodalDataset
 from kalecancer.loaddata.modalities import FixedShapeModality, Modality
 from kalecancer.loaddata.targets import BaseTarget
 from kalecancer.model.encode.encoder_list import EncoderList
-from kalecancer.model.fusion import FusionContext, FusionMethod, Stage
+from kalecancer.model.endpoints import BaseEndpoint
+from kalecancer.model.fusion import FusionMethod, OutputFusion, TensorFusion
+from kalecancer.model.outputs import BaseOutput
 
-
-@dataclass
-class ModelOutput:
-    """Raw head output (what the loss sees), prediction, and which patients have a prediction.
-
-    In a ``LateFusion`` model, ``branches`` holds each branch's own output. It is empty for other models.
-    """
-
-    output: Tensor
-    prediction: Tensor
-    defined: Tensor
-    branches: dict[str, ModelOutput] = field(default_factory=dict)
+Stage = Literal["early", "intermediate", "late"]
 
 
 def _scatter(rows: Tensor, mask: Tensor) -> Tensor:
@@ -60,24 +57,37 @@ def _fit_encoders(
     encoders: EncoderList, train: MultimodalDataset, ids: list[str], load: Callable[[list[str]], Any]
 ) -> None:
     """Fit ``encoders`` on the rows ``load(ids)``, loading them only if its first encoder is fitted."""
-    if encoders.needs_fit:
-        assert train.target is not None, "fitting an encoder needs a dataset with a target"
-        encoders.fit(load(ids), train.target, ids)
+    assert train.target is not None, "fitting an encoder needs a dataset with a target"
+    encoders.fit(load(ids), train.target, ids)
 
 
-def _check_modalities(data: MultimodalDataset, names: Sequence[str]) -> None:
-    """Raise if the dataset lacks a modality the model reads."""
-    missing = [name for name in names if name not in data.modalities]
-    if missing:
-        raise ValueError(f"the model uses modalities {missing} that the dataset lacks; it has {list(data.modalities)}")
+def _fusion_stages(fusion: FusionMethod) -> str:
+    """The stages ``fusion`` can be used in, from the interfaces it implements, for error messages."""
+    stages = (["early", "intermediate"] if isinstance(fusion, TensorFusion) else []) + (
+        ["late"] if isinstance(fusion, OutputFusion) else []
+    )
+    return " or ".join(stages)
 
 
-def _require_fusion_method(fusion: Any, argument: str) -> None:
-    """Raise if the model argument ``argument`` is not a ``FusionMethod``."""
+def _require_interface(fusion: Any, stage: Stage) -> None:
+    """Raise unless ``fusion`` has the interface ``stage`` needs: ``OutputFusion`` in late fusion, else ``TensorFusion``."""
     if not isinstance(fusion, FusionMethod):
         raise TypeError(
-            f"{argument} must be a FusionMethod, such as Concat, MaskedMean or MajorityVote, "
-            f"got {type(fusion).__name__}"
+            f"fusion must be a FusionMethod, such as Concat, MaskedMean or MajorityVote, got {type(fusion).__name__}"
+        )
+    kind = OutputFusion if stage == "late" else TensorFusion
+    if not isinstance(fusion, kind):
+        raise TypeError(
+            f"{type(fusion).__name__} is for {_fusion_stages(fusion)} fusion, not {stage} fusion: {stage} fusion takes "
+            f"a fusion method that subclasses {kind.__name__}"
+        )
+
+
+def _require_endpoint(endpoint: Any) -> None:
+    """Raise if ``endpoint`` is not a ``BaseEndpoint``."""
+    if not isinstance(endpoint, BaseEndpoint):
+        raise TypeError(
+            f"endpoint must be a BaseEndpoint, such as CoxEndpoint or ClassificationEndpoint, got {type(endpoint).__name__}"
         )
 
 
@@ -86,18 +96,40 @@ def _presence(present: Mapping[str, Tensor]) -> Tensor:
     return torch.stack(list(present.values()), dim=1)
 
 
+def _check_presence(fusion: FusionMethod, stage: Stage, present: pd.DataFrame, required: pd.Series) -> None:
+    """Raise unless ``fusion`` defines every ``required`` patient.
+
+    Args:
+        fusion: The model's fusion method, which says through ``defined`` which patients it combines.
+        stage: The model's stage, which names the inputs in the error message.
+        present: One row per patient and one bool column per input: modalities, or in late fusion branches.
+        required: The patients the model must predict for, indexed like ``present``.
+    """
+    lacking = required & ~fusion.defined_rows(present)
+    if lacking.any():
+        counts = {col: int((lacking & ~present[col]).sum()) for col in present.columns}
+        inputs, advice = (
+            ("branches", "each patient needs the modalities of at least one branch")
+            if stage == "late"
+            else (
+                "modalities",
+                "add the modalities to required_modalities, or use a fusion method that accepts patients who lack some",
+            )
+        )
+        raise ValueError(
+            f"{type(fusion).__name__} cannot combine {int(lacking.sum())} patients "
+            f"(how many of them lack each of the {inputs}: {counts}); {advice}"
+        )
+
+
 def _check_fusion(
-    fusion: FusionMethod,
-    stage: Stage,
-    data: MultimodalDataset,
-    widths: Mapping[str, int | None],
-    allow_undefined: bool,
+    fusion: FusionMethod, stage: Stage, data: MultimodalDataset, modalities: list[str], allow_undefined: bool
 ) -> None:
-    """Describe ``data`` to ``fusion`` in a ``FusionContext``, and let it raise if it cannot be fitted."""
-    present = data.present[list(widths)]
+    """Raise unless ``fusion`` combines every patient of ``data`` the model must predict for."""
+    present = data.present[modalities]
     # a LateFusion branch need not cover patients with none of its modalities: another branch predicts for them
     required = present.any(axis=1) if allow_undefined else pd.Series(True, index=present.index)
-    fusion.check(FusionContext(stage, present, required, widths))
+    _check_presence(fusion, stage, present, required)
 
 
 def _width(x: Any) -> int | None:
@@ -105,18 +137,114 @@ def _width(x: Any) -> int | None:
     return x.shape[1] if isinstance(x, Tensor) and x.ndim == 2 else None
 
 
-class _SingleHeadModel(nn.Module):
-    """Base for the models that end in one head: ``Unimodal``, ``EarlyFusion`` and ``IntermediateFusion``."""
+def _known(widths: Mapping[str, int | None]) -> dict[str, int]:
+    """The widths that are known."""
+    return {name: width for name, width in widths.items() if width is not None}
 
-    head: nn.Module
+
+def _endpoint_loss(endpoint: BaseEndpoint, output: BaseOutput, target: Mapping[str, Tensor]) -> Tensor | None:
+    """``endpoint``'s loss over the patients ``output`` defines; ``None`` when it defines none or there is no signal."""
+    defined = output.defined
+    if not bool(defined.any()):
+        return None
+    if not bool(defined.all()):
+        output, target = output.select(defined), {key: t[defined] for key, t in target.items()}
+    return endpoint.loss(output, target)
+
+
+class BaseModel(nn.Module, ABC):
+    """What ``Pipeline`` needs from a model: its modalities, its output type, and how to check, fit, run and train it.
+
+    ``Pipeline.fit`` calls, in order, ``check`` (when ``fit`` starts), ``fit`` (fitted encoders and endpoints, on the
+    training patients), ``dry_run`` (a few training patients, before training), then ``forward`` and ``loss`` on each
+    batch.
+    """
+
+    @property
+    @abstractmethod
+    def modalities(self) -> list[str]:
+        """The modalities this model reads."""
+
+    @property
+    @abstractmethod
+    def output_type(self) -> type[BaseOutput]:
+        """The type of output ``forward`` returns."""
+
+    @property
+    @abstractmethod
+    def decomposable_loss(self) -> bool:
+        """Whether the loss is a mean over patients, so accumulating gradients reproduces a larger batch."""
+
+    @abstractmethod
+    def check(self, data: MultimodalDataset) -> None:
+        """Raise if this dataset cannot be used with this model (modalities, target, missing modalities)."""
+
+    @abstractmethod
+    def fit(self, train: MultimodalDataset) -> None:
+        """Fit what is learned from the training patients before training: endpoints and fitted encoders."""
+
+    @abstractmethod
+    def dry_run(self, data: MultimodalDataset, batch: dict) -> None:
+        """Run the model and its loss once on ``batch``, a few of ``data``'s training patients.
+
+        ``Pipeline.fit`` calls this before training, in eval mode and without gradients, so an encoder that cannot
+        take its input, or a loss that cannot read the target, fails before the first optimizer step.
+        """
+
+    @abstractmethod
+    def forward(self, batch: dict) -> BaseOutput:
+        """The output for every patient in ``batch``, NaN where the model does not predict."""
+
+    @abstractmethod
+    def fit_state(self, output: BaseOutput, target: BaseTarget) -> dict[str, int]:
+        """Fit the endpoints' state on ``output``, the training patients' output, once training ends.
+
+        Returns:
+            The counts the endpoint of the model's own output reports, such as ``baseline_events``.
+        """
+
+    @abstractmethod
+    def loss(self, output: BaseOutput, target: Mapping[str, Tensor]) -> dict[str, Tensor] | None:
+        """The loss under ``"loss"``, plus any parts to report; ``None`` when the batch carries no signal."""
+
+    @abstractmethod
+    def encoders_for(self, modality: str) -> EncoderList:
+        """The encoder list for ``modality``."""
+
+
+class SingleEndpointModel(BaseModel):
+    """Base for the models that end in one endpoint: ``Unimodal``, ``EarlyFusion`` and ``IntermediateFusion``."""
+
+    endpoint: BaseEndpoint
+
+    def __init__(self, endpoint: BaseEndpoint):
+        super().__init__()
+        _require_endpoint(endpoint)
+        self.endpoint = endpoint
+
+    @property
+    def output_type(self) -> type[BaseOutput]:
+        """The endpoint's output type."""
+        return self.endpoint.output_type
 
     @property
     def decomposable_loss(self) -> bool:
-        """Whether the head's loss is a mean over patients, so accumulating gradients reproduces a larger batch."""
-        return bool(getattr(self.head, "decomposable_loss", False))
+        """Whether the endpoint's loss is a mean over patients."""
+        return self.endpoint.decomposable_loss
 
     def check(self, data: MultimodalDataset) -> None:
         """Raise if this dataset cannot be used with this model (modalities, target, missing modalities)."""
+        # check modalities
+        missing = [modality for modality in self.modalities if modality not in data.modalities]
+        if missing:
+            raise ValueError(
+                f"the model uses modalities {missing} that the dataset lacks; it has {list(data.modalities)}"
+            )
+
+        # check target
+        if data.target is not None:
+            self.endpoint.check_target(data.target)
+
         self._check(data, allow_undefined=False)
 
     def _check(self, data: MultimodalDataset, allow_undefined: bool) -> None:
@@ -132,58 +260,88 @@ class _SingleHeadModel(nn.Module):
         """Which patients in ``data`` this model predicts for."""
         raise NotImplementedError
 
+    def fit(self, train: MultimodalDataset) -> None:
+        """Bind the endpoint to the training target, then fit any ``FittedEncoder`` on the training patients."""
+        assert train.target is not None, "fit needs a dataset with a target"
+        self.endpoint.bind(train.target)
+        self._fit_encoders(train)
+
+    def _fit_encoders(self, train: MultimodalDataset) -> None:
+        raise NotImplementedError
+
     def dry_run(self, data: MultimodalDataset, batch: dict) -> None:
-        """Run the model once on ``batch``, a few of ``data``'s training patients.
+        """Run the model and its loss once on ``batch``.
 
-        It also checks the fusion method against the real widths of its inputs. ``Pipeline.fit`` calls this before
-        training, in eval mode and without gradients, so an encoder that cannot take its input fails before the first
-        optimizer step.
+        It also checks the fusion method against the real widths of its inputs.
         """
-        self._dry_run(data, batch, allow_undefined=False)
+        self.loss(self._dry_run(data, batch, allow_undefined=False), batch["target"])
 
-    def _dry_run(self, data: MultimodalDataset, batch: dict, allow_undefined: bool) -> None:
-        """``dry_run``; ``allow_undefined`` is ``True`` for a ``LateFusion`` branch, as in ``_check``."""
-        self(batch)
+    def fit_state(self, output: BaseOutput, target: BaseTarget) -> dict[str, int]:
+        """Fit the endpoint's state on the training patients' output."""
+        return self.endpoint.fit_state(output, target)
 
-    def _check_target(self, data: MultimodalDataset) -> None:
-        """Raise if the head cannot predict the dataset's target."""
-        if data.target is not None:
-            self.head.check_target(data.target)
+    def forward(self, batch: dict) -> BaseOutput:
+        """Embed the defined patients, run the endpoint's head on them, and build the output for the whole batch."""
+        rows, defined = self._embed(batch)
+        return self._finish(None if rows is None else self._head(rows), defined, batch["ids"])
 
-    def _finish(self, rows: Tensor | None, defined: Tensor) -> ModelOutput:
-        """Run the head on the rows of the defined patients and scatter its output back over the batch.
+    def _embed(self, batch: dict) -> tuple[Tensor | None, Tensor]:
+        """The embedding of the defined patients, ``None`` when no patient is defined, and which patients are."""
+        raise NotImplementedError
 
-        ``rows`` is ``None`` when no patient is defined. The other patients get NaN.
+    def _dry_run(self, data: MultimodalDataset, batch: dict, allow_undefined: bool) -> BaseOutput:
+        """``forward`` with the checks of ``dry_run``; ``allow_undefined`` is ``True`` for a ``LateFusion`` branch.
+
+        The fusion method is checked against the real widths of its inputs, and the head's output against the width
+        the endpoint declares (``out_dim``). The head cannot change width after this, so ``forward`` does not check it.
         """
-        if rows is None:
-            output = torch.full((defined.shape[0], self.head.out_dim), float("nan"), device=defined.device)
-        else:
-            try:
-                output = _scatter(self.head(rows), defined)
-            except Exception as error:
-                error.add_note(f"in head {type(self.head).__name__}, called on a tensor of shape {tuple(rows.shape)}")
-                raise
-        return ModelOutput(output=output, prediction=self.head.predict(output), defined=defined)
+        self._check_widths(batch)
+        rows, defined = self._embed(batch)
+        raw = None
+        if rows is not None:
+            raw = self._head(rows)
+            expected = self.endpoint.out_dim
+            if raw.ndim != 2 or raw.shape[1] != expected:
+                name = type(self.endpoint).__name__
+                raise ValueError(
+                    f"the head of {name} ({type(self.endpoint.head).__name__}) outputs a tensor of shape "
+                    f"{tuple(raw.shape)}, but {name} expects ({len(rows)}, {expected})"
+                )
+        return self._finish(raw, defined, batch["ids"])
 
-    def loss(self, output: ModelOutput, target: Mapping[str, Tensor]) -> dict[str, Tensor] | None:
-        """The head's loss over the defined patients, or ``None`` when none is defined or the batch has no signal."""
-        defined = output.defined
-        if not bool(defined.any()):
-            return None
-        if bool(defined.all()):
-            value = self.head.loss(output.output, target)
+    def _check_widths(self, batch: dict) -> None:
+        """Check the fusion method, if any, against the real widths of its inputs in ``batch``. Nothing by default."""
+
+    def _head(self, rows: Tensor) -> Tensor:
+        """The endpoint's head on the embedding of the defined patients, with a note naming it on error."""
+        try:
+            return self.endpoint(rows)
+        except Exception as error:
+            error.add_note(
+                f"in the head of {type(self.endpoint).__name__} ({type(self.endpoint.head).__name__}), "
+                f"called on a tensor of shape {tuple(rows.shape)}"
+            )
+            raise
+
+    def _finish(self, raw: Tensor | None, defined: Tensor, ids: list[str]) -> BaseOutput:
+        """Build the output for the whole batch from the head's output on the defined patients.
+
+        ``raw`` is ``None`` when no patient is defined. The other patients get NaN rows of the endpoint's ``out_dim``.
+        """
+        if raw is None:
+            full = torch.full((defined.shape[0], self.endpoint.out_dim), float("nan"), device=defined.device)
         else:
-            index = defined.nonzero().squeeze(1)
-            value = self.head.loss(output.output[index], {key: t[index] for key, t in target.items()})
+            full = _scatter(raw, defined)
+        return self.endpoint.to_output(full, list(ids), defined)
+
+    def loss(self, output: BaseOutput, target: Mapping[str, Tensor]) -> dict[str, Tensor] | None:
+        """The endpoint's loss over the defined patients, or ``None`` when none is defined or the batch has no signal."""
+        value = _endpoint_loss(self.endpoint, output, target)
         return None if value is None else {"loss": value}
 
-    def columns(self, target: BaseTarget) -> list[str]:
-        """Names of the prediction columns, as the head gives them."""
-        return self.head.columns(target)
 
-
-class Unimodal(_SingleHeadModel):
-    """One modality's list of encoders followed by a head.
+class Unimodal(SingleEndpointModel):
+    """One modality's list of encoders followed by an endpoint.
 
     On its own it needs every patient to have the modality. As a ``LateFusion`` branch, it predicts only for the
     patients who do.
@@ -191,14 +349,14 @@ class Unimodal(_SingleHeadModel):
     Args:
         modality: The name of the modality in the dataset.
         encoders: Encoders run in order on the modality. The last one must output an ``(n, d)`` embedding.
-        head: The head, e.g. ``CoxHead``. Its ``in_dim`` is the width of the embedding.
+        endpoint: The endpoint, e.g. ``CoxEndpoint(nn.Linear(d, 1, bias=False), ties="efron")``. Its head takes the
+            embedding.
     """
 
-    def __init__(self, modality: str, encoders: list[nn.Module], head: nn.Module):
-        super().__init__()
+    def __init__(self, modality: str, encoders: list[nn.Module], endpoint: BaseEndpoint):
+        super().__init__(endpoint)
         self.modality = modality
         self.encoders = EncoderList(encoders, modality)
-        self.head = head
 
     @property
     def modalities(self) -> list[str]:
@@ -206,12 +364,10 @@ class Unimodal(_SingleHeadModel):
         return [self.modality]
 
     def _check(self, data: MultimodalDataset, allow_undefined: bool) -> None:
-        """Raise if the dataset lacks the modality or its target does not suit the head.
+        """Raise if the dataset lacks the modality or its target does not suit the endpoint.
 
         Used on its own, it also raises if some patients lack the modality.
         """
-        _check_modalities(data, self.modalities)
-        self._check_target(data)
         missing = int((~data.present[self.modality]).sum())
         if missing and not allow_undefined:
             raise ValueError(f"{missing} patients lack {self.modality!r}; add it to required_modalities")
@@ -220,17 +376,17 @@ class Unimodal(_SingleHeadModel):
         """The patients who have the modality."""
         return data.present[self.modality]
 
-    def fit(self, train: MultimodalDataset) -> None:
+    def _fit_encoders(self, train: MultimodalDataset) -> None:
         """Fit the first encoder, if it is a ``FittedEncoder``, on the training patients who have the modality."""
         _fit_encoders(self.encoders, train, train.present_ids(self.modality), _loader(train.modalities[self.modality]))
 
-    def forward(self, batch: dict) -> ModelOutput:
-        """Encode the patients who have the modality and run the head on them."""
+    def _embed(self, batch: dict) -> tuple[Tensor | None, Tensor]:
+        """Encode the patients who have the modality."""
         present = batch["present"][self.modality]
         z = None
         if bool(present.any()):
             z = self.encoders(batch["inputs"][self.modality], _selected_ids(batch["ids"], present))
-        return self._finish(z, present)
+        return z, present
 
     def encoders_for(self, modality: str) -> EncoderList:
         """The encoder list, if ``modality`` is this model's modality."""
@@ -239,27 +395,26 @@ class Unimodal(_SingleHeadModel):
         return self.encoders
 
 
-class IntermediateFusion(_SingleHeadModel):
-    """Each modality's encoders, then a fusion method, then one head.
+class IntermediateFusion(SingleEndpointModel):
+    """Each modality's encoders, then a fusion method, then one endpoint.
 
     Args:
         encoders: A list of encoders for each modality, by modality name. Each list must end in an ``(n, d)``
             embedding.
         fusion: How the embeddings are combined, e.g. ``Concat`` or ``MaskedMean``.
-        head: The head, e.g. ``CoxHead``. Its ``in_dim`` is the width of the fused embedding: the sum of the
-            embedding widths for ``Concat``, or their shared width for ``MaskedMean``.
+        endpoint: The endpoint, e.g. ``CoxEndpoint(nn.Linear(d, 1, bias=False), ties="efron")``. Its head takes the fused
+            embedding: the sum of the embedding widths for ``Concat``, or their shared width for ``MaskedMean``.
     """
 
-    def __init__(self, encoders: dict[str, list[nn.Module]], fusion: FusionMethod, head: nn.Module):
-        super().__init__()
+    stage: ClassVar[Stage] = "intermediate"
+
+    def __init__(self, encoders: dict[str, list[nn.Module]], fusion: TensorFusion, endpoint: BaseEndpoint):
+        super().__init__(endpoint)
         if not encoders:
             raise ValueError("IntermediateFusion needs at least one modality in encoders")
-        _require_fusion_method(fusion, "fusion")
         self.encoders = nn.ModuleDict({name: EncoderList(listed, name) for name, listed in encoders.items()})
+        _require_interface(fusion, self.stage)
         self.fusion = fusion
-        self.head = head
-        # the embedding widths are unknown until the dry run, so only rules that need no width run here
-        fusion.check(FusionContext.without_data("intermediate", dict.fromkeys(self.encoders)))
 
     @property
     def modalities(self) -> list[str]:
@@ -269,38 +424,35 @@ class IntermediateFusion(_SingleHeadModel):
     def _check(self, data: MultimodalDataset, allow_undefined: bool) -> None:
         """Raise if the dataset does not suit this model.
 
-        It raises if the dataset lacks a modality, its target does not suit the head, or the fusion method cannot be
-        fitted on it.
+        It raises if the dataset lacks a modality, its target does not suit the endpoint, or the fusion method cannot
+        be fitted on it.
         """
-        _check_modalities(data, self.modalities)
-        self._check_target(data)
-        _check_fusion(self.fusion, "intermediate", data, dict.fromkeys(self.modalities), allow_undefined)
+        _check_fusion(self.fusion, self.stage, data, self.modalities, allow_undefined)
 
-    def _dry_run(self, data: MultimodalDataset, batch: dict, allow_undefined: bool) -> None:
-        """Run each encoder list, check the fusion method against the embedding widths, then run the whole model."""
-        widths: dict[str, int | None] = dict.fromkeys(self.modalities)
+    def _check_widths(self, batch: dict) -> None:
+        """Run each encoder list and check the fusion method against the embedding widths."""
+        widths: dict[str, int | None] = {}
         for name, encoder_list in self.encoders.items():
             present = batch["present"][name]
             if bool(present.any()):
                 widths[name] = _width(encoder_list(batch["inputs"][name], _selected_ids(batch["ids"], present)))
-        _check_fusion(self.fusion, "intermediate", data, widths, allow_undefined)
-        self(batch)
+        self.fusion.check_widths(_known(widths))
 
     def _defined_for(self, data: MultimodalDataset) -> pd.Series:
         """The patients the fusion method can combine."""
         return self.fusion.defined_rows(data.present[self.modalities])
 
-    def fit(self, train: MultimodalDataset) -> None:
+    def _fit_encoders(self, train: MultimodalDataset) -> None:
         """Fit each ``FittedEncoder`` on the training patients who have its modality."""
         for name, encoder_list in self.encoders.items():
             _fit_encoders(encoder_list, train, train.present_ids(name), _loader(train.modalities[name]))
 
-    def forward(self, batch: dict) -> ModelOutput:
-        """Encode each modality on the patients who have it, fuse the defined patients, and run the head."""
+    def _embed(self, batch: dict) -> tuple[Tensor | None, Tensor]:
+        """Encode each modality on the patients who have it, and fuse the defined patients."""
         present = {name: batch["present"][name] for name in self.encoders}
         defined = self.fusion.defined(_presence(present))
         if not bool(defined.any()):
-            return self._finish(None, defined)
+            return None, defined
         z = {}
         for name, encoder_list in self.encoders.items():
             if bool(present[name].any()):
@@ -308,7 +460,7 @@ class IntermediateFusion(_SingleHeadModel):
                 z[name] = _scatter(rows, present[name])
         index = defined.nonzero().squeeze(1)
         fused = self.fusion({name: v[index] for name, v in z.items()}, {name: m[index] for name, m in present.items()})
-        return self._finish(fused, defined)
+        return fused, defined
 
     def encoders_for(self, modality: str) -> EncoderList:
         """The encoder list for ``modality``."""
@@ -317,55 +469,56 @@ class IntermediateFusion(_SingleHeadModel):
         return self.encoders[modality]
 
 
-class EarlyFusion(_SingleHeadModel):
-    """Fuse raw vector modalities first, then one encoder list, then one head.
+class EarlyFusion(SingleEndpointModel):
+    """Fuse raw vector modalities first, then one encoder list, then one endpoint.
 
     Args:
         modalities: At least two modality names, all ``FixedShapeModality`` (e.g. ``Tabular``), in the order they
             are fused.
         fusion: How the raw inputs are combined, e.g. ``Concat``.
         encoders: Encoders run in order on the fused input. The last one must output an ``(n, d)`` embedding.
-        head: The head, e.g. ``CoxHead``. Its ``in_dim`` is the width of the embedding.
+        endpoint: The endpoint, e.g. ``CoxEndpoint(nn.Linear(d, 1, bias=False), ties="efron")``. Its head takes the
+            embedding.
     """
 
-    def __init__(self, modalities: list[str], fusion: FusionMethod, encoders: list[nn.Module], head: nn.Module):
-        super().__init__()
+    stage: ClassVar[Stage] = "early"
+
+    def __init__(self, modalities: list[str], fusion: TensorFusion, encoders: list[nn.Module], endpoint: BaseEndpoint):
+        super().__init__(endpoint)
         if isinstance(modalities, str) or len(modalities) < 2:
             raise ValueError("EarlyFusion needs a list of at least two modalities; use Unimodal for one")
-        _require_fusion_method(fusion, "fusion")
-        self.modalities = list(modalities)
+        self._modalities = list(modalities)
+        _require_interface(fusion, self.stage)
         self.fusion = fusion
         self.encoders = EncoderList(encoders, "fused")
-        self.head = head
-        # the raw widths depend on the transforms, which are fitted later, so only rules that need no width run here
-        fusion.check(FusionContext.without_data("early", dict.fromkeys(self.modalities)))
+
+    @property
+    def modalities(self) -> list[str]:
+        """The modalities that are fused, in order."""
+        return self._modalities
 
     def _check(self, data: MultimodalDataset, allow_undefined: bool) -> None:
         """Raise if the dataset does not suit this model.
 
         It raises if the dataset lacks a modality, a modality is not a ``FixedShapeModality``, its target does not
-        suit the head, or the fusion method cannot be fitted on it.
+        suit the endpoint, or the fusion method cannot be fitted on it.
         """
-        _check_modalities(data, self.modalities)
         bags = [name for name in self.modalities if not isinstance(data.modalities[name], FixedShapeModality)]
         if bags:
             raise TypeError(
                 f"EarlyFusion fuses raw inputs, so its modalities must be FixedShapeModality. {bags} are not"
             )
-        self._check_target(data)
-        _check_fusion(self.fusion, "early", data, dict.fromkeys(self.modalities), allow_undefined)
+        _check_fusion(self.fusion, self.stage, data, self.modalities, allow_undefined)
 
-    def _dry_run(self, data: MultimodalDataset, batch: dict, allow_undefined: bool) -> None:
-        """Check the fusion method against the widths of the transformed inputs, then run the whole model."""
-        widths = {name: _width(batch["inputs"].get(name)) for name in self.modalities}
-        _check_fusion(self.fusion, "early", data, widths, allow_undefined)
-        self(batch)
+    def _check_widths(self, batch: dict) -> None:
+        """Check the fusion method against the widths of the transformed inputs."""
+        self.fusion.check_widths(_known({name: _width(batch["inputs"].get(name)) for name in self.modalities}))
 
     def _defined_for(self, data: MultimodalDataset) -> pd.Series:
         """The patients the fusion method can combine."""
         return self.fusion.defined_rows(data.present[self.modalities])
 
-    def fit(self, train: MultimodalDataset) -> None:
+    def _fit_encoders(self, train: MultimodalDataset) -> None:
         """Fit the first encoder, if it is a ``FittedEncoder``.
 
         It is fitted on the fused input of the training patients who have every modality.
@@ -380,12 +533,12 @@ class EarlyFusion(_SingleHeadModel):
 
         _fit_encoders(self.encoders, train, ids, load)
 
-    def forward(self, batch: dict) -> ModelOutput:
-        """Fuse the raw inputs of the defined patients, run the encoder list on the result, then the head."""
+    def _embed(self, batch: dict) -> tuple[Tensor | None, Tensor]:
+        """Fuse the raw inputs of the defined patients, and run the encoder list on the result."""
         present = {name: batch["present"][name] for name in self.modalities}
         defined = self.fusion.defined(_presence(present))
         if not bool(defined.any()):
-            return self._finish(None, defined)
+            return None, defined
         index = defined.nonzero().squeeze(1)
         inputs = {
             name: _scatter(batch["inputs"][name], present[name])[index]
@@ -393,8 +546,7 @@ class EarlyFusion(_SingleHeadModel):
             if bool(present[name].any())
         }
         fused = self.fusion(inputs, {name: present[name][index] for name in self.modalities})
-        rows = self.encoders(fused, _selected_ids(batch["ids"], defined))
-        return self._finish(rows, defined)
+        return self.encoders(fused, _selected_ids(batch["ids"], defined)), defined
 
     def encoders_for(self, modality: str) -> EncoderList:
         """The one encoder list, named ``"fused"``."""
@@ -403,32 +555,69 @@ class EarlyFusion(_SingleHeadModel):
         return self.encoders
 
 
-class LateFusion(nn.Module):
-    """Branch models trained together, whose outputs ``fusion`` combines into one prediction.
+class LateFusion(BaseModel):
+    """Branch models trained together, whose outputs ``fusion`` combines into one output.
 
-    The loss is the unweighted sum of the branch losses. Each branch predicts only for the patients who have its
-    modalities.
+    Each branch predicts only for the patients who have its modalities. ``fusion`` combines the branches' typed
+    outputs, and ``endpoint``, when given, takes the result: it attaches the fused output's own state, such as a
+    Breslow baseline fitted on the fused log-hazards, and its loss trains the fused output.
+
+    The loss is the fused loss plus ``branch_weight`` times the sum of the branch losses, so the branches stay useful
+    on their own for ``branch=`` predictions.
 
     Args:
         branches: At least two models, by name. Each is a ``Unimodal``, ``EarlyFusion`` or ``IntermediateFusion``
-            with its own head.
+            with its own endpoint.
         fusion: How the branch outputs are combined, e.g. ``MaskedMean`` or ``MajorityVote``.
+        endpoint: The endpoint of the fused output, with no head, e.g. ``CoxEndpoint(None, ties="efron")``. It must
+            accept what ``fusion`` outputs. ``None`` to use the fusion method's output as it is, with no fused loss
+            and no fused state: for ``MajorityVote``, whose scores are not differentiable, or to train the branches
+            only. Over Cox branches, ``MaskedMean`` without an endpoint gives a ``RiskScore`` with no survival curve.
+        branch_weight: The weight of the branch losses against the fused loss, >= 0.
     """
 
-    def __init__(self, branches: dict[str, nn.Module], fusion: FusionMethod):
+    stage: ClassVar[Stage] = "late"
+
+    def __init__(
+        self,
+        branches: dict[str, SingleEndpointModel],
+        fusion: OutputFusion,
+        endpoint: BaseEndpoint | None,
+        branch_weight: float = 1.0,
+    ):
         super().__init__()
         if len(branches) < 2:
             raise ValueError("LateFusion needs at least two branches")
+        if "fused" in branches:
+            raise ValueError("'fused' names the fused loss in the loss report, so a branch cannot be called 'fused'")
         for name, branch in branches.items():
-            if not isinstance(branch, _SingleHeadModel):
+            if not isinstance(branch, SingleEndpointModel):
                 raise TypeError(
                     f"branches[{name!r}] must be Unimodal, EarlyFusion or IntermediateFusion, "
                     f"got {type(branch).__name__}"
                 )
-        _require_fusion_method(fusion, "fusion")
+        if branch_weight < 0:
+            raise ValueError(f"branch_weight must be >= 0, got {branch_weight}")
         self.branches = nn.ModuleDict(branches)
+        types = {name: branch.output_type for name, branch in self.branches.items()}
+        _require_interface(fusion, self.stage)
         self.fusion = fusion
-        fusion.check(self._fusion_context(None))
+        self.branch_weight = branch_weight
+        fused = fusion.output_type(types)
+        if endpoint is not None:
+            _require_endpoint(endpoint)
+            name = type(endpoint).__name__
+            if endpoint.head is not None:
+                raise ValueError(
+                    f"the fused endpoint takes the output of {type(fusion).__name__}: give {name} head=None"
+                )
+            if not issubclass(fused, endpoint.accepts):
+                raise TypeError(
+                    f"{name} takes a {endpoint.accepts.__name__}, but {type(fusion).__name__} outputs a {fused.__name__} "
+                    "from these branches"
+                )
+        self.endpoint = endpoint
+        self._fused_type = fused
 
     @property
     def modalities(self) -> list[str]:
@@ -436,52 +625,54 @@ class LateFusion(nn.Module):
         return list(dict.fromkeys(name for branch in self.branches.values() for name in branch.modalities))
 
     @property
-    def decomposable_loss(self) -> bool:
-        """Whether every branch loss is a mean over patients, so accumulating gradients reproduces a larger batch."""
-        return all(branch.decomposable_loss for branch in self.branches.values())
+    def output_type(self) -> type[BaseOutput]:
+        """The endpoint's output type, or without one, what ``fusion`` makes from the branch outputs."""
+        return self._fused_type if self.endpoint is None else self.endpoint.output_type
 
     @property
-    def _reference_head(self) -> nn.Module:
-        """The first branch's head, which turns a fused ``"output"`` into a prediction."""
-        return next(iter(self.branches.values())).head
-
-    def _fusion_context(self, data: MultimodalDataset | None) -> FusionContext:
-        """The context for ``fusion``.
-
-        It holds each branch head's width and kind and, given ``data``, which patients each branch predicts for.
-        """
-        heads = {name: branch.head for name, branch in self.branches.items()}
-        widths = {name: getattr(head, "out_dim", None) for name, head in heads.items()}
-        kinds = {name: getattr(head, "target_type", None) for name, head in heads.items()}
-        if data is None:
-            return FusionContext.without_data("late", widths, kinds)
-        # the inputs of late fusion are branches: a patient has one when that branch predicts for them
-        covered = pd.DataFrame({name: branch._defined_for(data) for name, branch in self.branches.items()})
-        return FusionContext("late", covered, pd.Series(True, index=covered.index), widths, kinds)
+    def decomposable_loss(self) -> bool:
+        """Whether every loss, branch and fused, is a mean over patients, so accumulating gradients works."""
+        branches = all(branch.decomposable_loss for branch in self.branches.values())
+        return branches and (self.endpoint is None or self.endpoint.decomposable_loss)
 
     def check(self, data: MultimodalDataset) -> None:
-        """Raise if a branch cannot be used with ``data``, or ``fusion`` cannot fuse the branches."""
+        """Raise if a branch or the fused endpoint cannot be used with ``data``, or ``fusion`` cannot fuse the branches.
+
+        Every patient must have a branch that predicts for them, and ``fusion.check_branches`` must accept which
+        branches each patient has.
+        """
         for branch in self.branches.values():
             branch._check(data, allow_undefined=True)
-        self.fusion.check(self._fusion_context(data))
+        if self.endpoint is not None and data.target is not None:
+            self.endpoint.check_target(data.target)
+        # the inputs of late fusion are branches: a patient has one when that branch predicts for them
+        covered = pd.DataFrame({name: branch._defined_for(data) for name, branch in self.branches.items()})
+        _check_presence(self.fusion, self.stage, covered, pd.Series(True, index=covered.index))
+        self.fusion.check_branches(covered, {name: branch.output_type for name, branch in self.branches.items()})
 
     def fit(self, train: MultimodalDataset) -> None:
-        """Call ``fit`` on each branch, which fits its first encoder if it is a ``FittedEncoder``."""
+        """Call ``fit`` on each branch, which binds its endpoint and fits its first encoder if it is fitted.
+
+        The fused endpoint is bound too.
+        """
         for branch in self.branches.values():
             branch.fit(train)
+        if self.endpoint is not None:
+            assert train.target is not None, "fit needs a dataset with a target"
+            self.endpoint.bind(train.target)
 
     def dry_run(self, data: MultimodalDataset, batch: dict) -> None:
-        """Dry-run each branch, as ``_SingleHeadModel.dry_run`` does, then run the whole model once on ``batch``."""
+        """Dry-run each branch, as ``SingleEndpointModel.dry_run`` does, then run the whole model and its loss."""
         for name, branch in self.branches.items():
             try:
                 branch._dry_run(data, batch, allow_undefined=True)
             except Exception as error:
                 error.add_note(f"in branch {name!r} ({type(branch).__name__})")
                 raise
-        self(batch)
+        self.loss(self(batch), batch["target"])
 
-    def forward(self, batch: dict) -> ModelOutput:
-        """Run every branch, then fuse the branch outputs of the patients ``fusion`` defines."""
+    def forward(self, batch: dict) -> BaseOutput:
+        """Run every branch, fuse the branch outputs of the patients ``fusion`` defines, and pass them to the endpoint."""
         outputs = {}
         for name, branch in self.branches.items():
             try:
@@ -491,33 +682,39 @@ class LateFusion(nn.Module):
                 raise
         present = {name: out.defined for name, out in outputs.items()}
         defined = self.fusion.defined(_presence(present))
-        by_output = self.fusion.input_space == "output"
-        values = {name: out.output if by_output else out.prediction for name, out in outputs.items()}
         index = defined.nonzero().squeeze(1)
         combined = self.fusion(
-            {name: v[index] for name, v in values.items()}, {n: m[index] for n, m in present.items()}
+            {name: out.select(index) for name, out in outputs.items()}, {n: m[index] for n, m in present.items()}
         )
-        output = _scatter(combined, defined)
-        prediction = self._reference_head.predict(output) if by_output else output
-        prediction = torch.where(defined.unsqueeze(-1), prediction, torch.full_like(prediction, float("nan")))
-        return ModelOutput(output=output, prediction=prediction, defined=defined, branches=outputs)
+        fused = combined.scatter(defined, list(batch["ids"]))
+        if self.endpoint is not None:
+            fused = self.endpoint.adopt(fused)
+        return dataclasses.replace(fused, branches=outputs)
 
-    def loss(self, output: ModelOutput, target: Mapping[str, Tensor]) -> dict[str, Tensor] | None:
-        """The unweighted sum of the branch losses, with each also reported as ``loss/<branch>``."""
-        parts = {}
+    def fit_state(self, output: BaseOutput, target: BaseTarget) -> dict[str, int]:
+        """Fit each branch's endpoint on its own output, and the fused endpoint on the fused output."""
         for name, branch in self.branches.items():
-            value = branch.loss(output.branches[name], target)
+            branch.fit_state(output.branches[name], target)
+        return {} if self.endpoint is None else self.endpoint.fit_state(output, target)
+
+    def loss(self, output: BaseOutput, target: Mapping[str, Tensor]) -> dict[str, Tensor] | None:
+        """The fused loss plus ``branch_weight`` times the branch losses, each reported as ``loss/<name>``.
+
+        The fused loss is reported as ``loss/fused``. Losses that have no signal in the batch are left out.
+        """
+        parts = {}
+        if self.endpoint is not None:
+            value = _endpoint_loss(self.endpoint, output, target)
             if value is not None:
-                parts[name] = value["loss"]
+                parts["fused"] = value
+        for name, branch in self.branches.items():
+            branch_loss = branch.loss(output.branches[name], target)
+            if branch_loss is not None:
+                parts[name] = branch_loss["loss"]
         if not parts:
             return None
-        return {"loss": torch.stack(list(parts.values())).sum(), **{f"loss/{name}": v for name, v in parts.items()}}
-
-    def columns(self, target: BaseTarget) -> list[str]:
-        """Prediction columns: the heads' when ``fusion`` fuses head outputs, otherwise ``fusion``'s own."""
-        if self.fusion.input_space == "output":
-            return self._reference_head.columns(target)
-        return self.fusion.columns(target)
+        total = sum(value if name == "fused" else self.branch_weight * value for name, value in parts.items())
+        return {"loss": total, **{f"loss/{name}": value for name, value in parts.items()}}
 
     def encoders_for(self, modality: str, branch: str | None = None) -> EncoderList:
         """The encoder list for ``modality``; pass ``branch`` when more than one branch reads it."""

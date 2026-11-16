@@ -21,9 +21,9 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
-from kalecancer.evaluate import EvalContext, HarrellC, bootstrap_ci
+from kalecancer.evaluate import HarrellC, bootstrap_ci
 from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent, train_test_split, Tabular
-from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion
+from kalecancer.model import ABMIL, Concat, CoxEndpoint, IntermediateFusion
 from kalecancer.pipeline import Pipeline
 from synthetic_data_generation import PATCH_DIM, make_cohort
 
@@ -62,7 +62,7 @@ model = IntermediateFusion(
         ],
     },
     fusion=Concat(),
-    head=CoxHead(in_dim=16, ties="efron"),
+    endpoint=CoxEndpoint(torch.nn.Linear(16, 1, bias=False), ties="efron"),
 )
 
 # 3. Pipeline: preprocessing and training settings. Transforms are 'trained' on the training patient only, and then
@@ -99,8 +99,7 @@ print(prediction.head())
 # 5. Uncertainty: a 95% bootstrap interval of Harrell's C over the test patients.
 
 assert test.target is not None
-target = test.target[prediction.index]
-context = EvalContext(train_target=pipeline.train_target_, classes=None)
-print("Harrell's C, 95% CI:", bootstrap_ci(HarrellC(), prediction, target, context))
+output = pipeline.predict_output(test)
+print("Harrell's C, 95% CI:", bootstrap_ci(HarrellC(), output, test.target, pipeline.train_target_))
 
 workdir.cleanup()

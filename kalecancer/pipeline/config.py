@@ -34,6 +34,9 @@ _PLAIN = (bool, int, float, str, type(None))
 _VARIADIC = (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
 
 
+_TORCH_UNSTORED = ("device", "dtype", "size_average", "reduce")
+
+
 def load_pipeline(config: str | Path | Mapping[str, Any]) -> Pipeline:
     """Build a Pipeline from a YAML path or a dict. Unknown arguments, wrong types and missing arguments raise.
 
@@ -175,7 +178,8 @@ def _dump_object(value: Any, path: str) -> dict[str, Any]:
     is_torch_module = isinstance(value, nn.Module) and cls.__module__.startswith("torch.")
     init_args = {}
     for name, parameter in inspect.signature(cls.__init__).parameters.items():
-        if name == "self" or parameter.kind in _VARIADIC or (is_torch_module and name in ("device", "dtype")):
+        # torch losses fold the deprecated size_average and reduce into reduction, and keep only that
+        if name == "self" or parameter.kind in _VARIADIC or (is_torch_module and name in _TORCH_UNSTORED):
             continue
         if not hasattr(value, name):
             raise TypeError(

@@ -19,7 +19,7 @@ from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
 from kalecancer.evaluate import AUROC, BalancedAccuracy
 from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, Tabular
-from kalecancer.model import ABMIL, ClassificationHead, LateFusion, MaskedMean, TabICLEncoder, Unimodal
+from kalecancer.model import ABMIL, ClassificationEndpoint, LateFusion, MaskedMean, TabICLEncoder, Unimodal
 from kalecancer.pipeline import EarlyStopping, Pipeline
 
 DATA = Path(__file__).resolve().parents[2] / "data" / "hancock"
@@ -93,7 +93,7 @@ def build_model() -> LateFusion:
                     ),
                     torch.nn.Linear(512, 64),
                 ],
-                head=ClassificationHead(in_dim=64, n_classes=2),
+                endpoint=ClassificationEndpoint(torch.nn.Linear(64, 2), loss_fn=torch.nn.CrossEntropyLoss()),
             ),
             "wsi": Unimodal(
                 modality="wsi",
@@ -101,10 +101,12 @@ def build_model() -> LateFusion:
                     ABMIL(in_dim=1024, hidden_dim=256, attention_dim=128, dropout=0.25),
                     torch.nn.Linear(256, 64),
                 ],
-                head=ClassificationHead(in_dim=64, n_classes=2),
+                endpoint=ClassificationEndpoint(torch.nn.Linear(64, 2), loss_fn=torch.nn.CrossEntropyLoss()),
             ),
         },
         fusion=MaskedMean(),
+        # the fused probabilities get their own loss, alongside the branch losses
+        endpoint=ClassificationEndpoint(None, loss_fn=torch.nn.CrossEntropyLoss()),
     )
 
 

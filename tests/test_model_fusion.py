@@ -2,14 +2,17 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
 from kalecancer.model import (
     ABMIL,
-    ClassificationHead,
+    ClassificationEndpoint,
+    ClassProbabilities,
     Concat,
-    CoxHead,
+    CoxEndpoint,
+    CoxOutput,
     EarlyFusion,
     EncoderList,
     FittedEncoder,
@@ -17,7 +20,9 @@ from kalecancer.model import (
     LateFusion,
     MajorityVote,
     MaskedMean,
+    RiskScore,
     Unimodal,
+    VoteScores,
 )
 
 
@@ -74,7 +79,7 @@ def intermediate(fusion=None, head_dim=8):
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
         },
         fusion=fusion or Concat(),
-        head=CoxHead(in_dim=head_dim, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(head_dim, 1, bias=False), "efron"),
     )
 
 
@@ -111,7 +116,7 @@ def test_intermediate_concat_forward_loss_and_gradients(cohort):
     model = intermediate()
     model.check(data)
     output = model(whole_batch(data))
-    assert output.prediction.shape == (30, 1) and bool(output.defined.all())
+    assert output.risk.shape == (30,) and bool(output.defined.all())
     loss = model.loss(output, whole_batch(data)["target"])["loss"]
     loss.backward()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
@@ -126,7 +131,7 @@ def test_fitted_encoders_are_fitted_on_and_see_present_patients_only(cohort):
             "wsi": [recorder, ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)],
         },
         fusion=MaskedMean(),
-        head=CoxHead(in_dim=4, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(4, 1, bias=False), "efron"),
     )
     with_slides = [f"{k:03d}" for k in range(1, 31)]
     model.fit(data)
@@ -142,7 +147,7 @@ def test_masked_mean_keeps_patients_missing_a_modality_with_finite_gradients(coh
     model.check(data)
     batch = whole_batch(data)
     output = model(batch)
-    assert bool(output.defined.all()) and torch.isfinite(output.prediction).all()
+    assert bool(output.defined.all()) and torch.isfinite(output.risk).all()
     model.loss(output, batch["target"])["loss"].backward()
     for name, parameter in model.named_parameters():
         assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
@@ -159,12 +164,14 @@ def test_concat_with_a_missing_modality_raises_at_check(cohort):
 
 def test_encoder_lists_must_end_with_vectors(cohort):
     data = make_data(cohort, required=["clinical", "wsi"])
-    model = IntermediateFusion(encoders={"wsi": []}, fusion=Concat(), head=CoxHead(in_dim=16, ties="efron"))
+    model = IntermediateFusion(
+        encoders={"wsi": []}, fusion=Concat(), endpoint=CoxEndpoint(nn.Linear(16, 1, bias=False), "efron")
+    )
     with pytest.raises(TypeError, match=r"encoders\['wsi'\] must output an \(n, d\) tensor, got a list"):
         model(whole_batch(data))
 
 
-def test_head_must_match_target_type(cohort):
+def test_endpoint_must_match_target_type(cohort):
     data = make_data(cohort, required=["clinical", "wsi"], task="classification")
     with pytest.raises(TypeError, match="time-to-event"):
         intermediate().check(data)
@@ -174,7 +181,11 @@ def test_head_must_match_target_type(cohort):
 
 
 def test_standalone_unimodal_requires_its_modality(cohort):
-    model = Unimodal("wsi", [ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)], CoxHead(4, "efron"))
+    model = Unimodal(
+        "wsi",
+        [ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)],
+        CoxEndpoint(nn.Linear(4, 1, bias=False), "efron"),
+    )
     with pytest.raises(ValueError, match="10 patients lack 'wsi'"):
         model.check(make_data(cohort, required=["clinical"]))
     model.check(make_data(cohort, required=["wsi"]))
@@ -183,7 +194,9 @@ def test_standalone_unimodal_requires_its_modality(cohort):
 def test_early_fusion_fits_and_runs_on_concatenated_rows_in_forward_order(cohort):
     data = make_data(cohort, required=["clinical", "lab"], with_lab=True)
     recorder = RecordingEncoder()
-    model = EarlyFusion(["clinical", "lab"], Concat(), [recorder, nn.Linear(5, 4)], CoxHead(4, "efron"))
+    model = EarlyFusion(
+        ["clinical", "lab"], Concat(), [recorder, nn.Linear(5, 4)], CoxEndpoint(nn.Linear(4, 1, bias=False), "efron")
+    )
     model.check(data)
     train = data.subset(data.ids[:20])
     model.fit(train)
@@ -191,11 +204,13 @@ def test_early_fusion_fits_and_runs_on_concatenated_rows_in_forward_order(cohort
     expected = torch.tensor(np.concatenate([clinical.loc[train.ids].to_numpy(), lab.loc[train.ids].to_numpy()], axis=1))
     torch.testing.assert_close(recorder.fit_x, expected.float())
     assert recorder.fit_ids == list(train.ids)
-    assert model(whole_batch(train)).prediction.shape == (20, 1)
+    assert model(whole_batch(train)).risk.shape == (20,)
 
 
 def test_early_fusion_rejects_bag_modalities_at_check(cohort):
-    model = EarlyFusion(["clinical", "wsi"], Concat(), [nn.Linear(18, 4)], CoxHead(4, "efron"))
+    model = EarlyFusion(
+        ["clinical", "wsi"], Concat(), [nn.Linear(18, 4)], CoxEndpoint(nn.Linear(4, 1, bias=False), "efron")
+    )
     with pytest.raises(TypeError, match=r"must be FixedShapeModality\. \['wsi'\] are not"):
         model.check(make_data(cohort, required=["clinical", "wsi"]))
 
@@ -203,29 +218,42 @@ def test_early_fusion_rejects_bag_modalities_at_check(cohort):
 # ---------------------------------------------------------------- late fusion
 
 
-def late(fusion, task="classification"):
-    head = (lambda d: ClassificationHead(d, 2)) if task == "classification" else (lambda d: CoxHead(d, "efron"))
+def late(fusion, task="classification", endpoint=None):
+    head = (
+        (lambda d: ClassificationEndpoint(nn.Linear(d, 2), nn.CrossEntropyLoss()))
+        if task == "classification"
+        else (lambda d: CoxEndpoint(nn.Linear(d, 1, bias=False), "efron"))
+    )
     return LateFusion(
         branches={
             "clinical": Unimodal("clinical", [nn.Linear(2, 4)], head(4)),
             "wsi": Unimodal("wsi", [ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)], head(4)),
         },
         fusion=fusion,
+        endpoint=endpoint,
     )
 
 
-def test_late_fusion_loss_is_sum_of_branch_losses_and_prediction_uses_mean_logits(cohort):
+def fused_classification():
+    return ClassificationEndpoint(None, nn.CrossEntropyLoss())
+
+
+def test_late_fusion_loss_is_fused_plus_branch_losses_and_prediction_uses_mean_logits(cohort):
     data = make_data(cohort, required=["clinical", "wsi"], task="classification")
-    model = late(MaskedMean())
+    model = late(MaskedMean(), endpoint=fused_classification())
     model.check(data)
+    model.fit(data)
     batch = whole_batch(data)
     output = model(batch)
     losses = model.loss(output, batch["target"])
     branch_sum = sum(model.branches[n].loss(output.branches[n], batch["target"])["loss"] for n in model.branches)
-    torch.testing.assert_close(losses["loss"], branch_sum)
-    mean_logits = (output.branches["clinical"].output + output.branches["wsi"].output) / 2
-    torch.testing.assert_close(output.prediction, torch.softmax(mean_logits, dim=-1))
-    assert model.columns(data.target) == ["probability[low]", "probability[high]"]
+    fused = F.cross_entropy(output.logits, batch["target"]["label"])
+    torch.testing.assert_close(losses["loss/fused"], fused)
+    torch.testing.assert_close(losses["loss"], fused + branch_sum)
+    mean_logits = (output.branches["clinical"].logits + output.branches["wsi"].logits) / 2
+    torch.testing.assert_close(output.probabilities, torch.softmax(mean_logits, dim=-1))
+    assert isinstance(output, ClassProbabilities) and model.output_type is ClassProbabilities
+    assert list(output.detach_cpu().frame().columns) == ["probability[low]", "probability[high]"]
 
 
 def test_late_fusion_cox_masked_mean_needs_complete_branches(cohort):
@@ -234,35 +262,78 @@ def test_late_fusion_cox_masked_mean_needs_complete_branches(cohort):
     late(MaskedMean(), task="survival").check(make_data(cohort, required=["clinical", "wsi"]))
 
 
+def test_the_fused_output_type_comes_from_the_fusion_method_or_the_endpoint():
+    # averaged log-hazards have no baseline of their own: they are a relative risk until an endpoint fits one
+    assert late(MaskedMean(), task="survival").output_type is RiskScore
+    assert late(MaskedMean(), task="survival", endpoint=CoxEndpoint(None, "efron")).output_type is CoxOutput
+    assert late(MajorityVote(tie_break="error")).output_type is VoteScores
+
+
+def test_the_fused_endpoint_must_accept_what_the_fusion_method_outputs():
+    with pytest.raises(TypeError, match="ClassificationEndpoint takes a ClassProbabilities, but MaskedMean outputs"):
+        late(MaskedMean(), task="survival", endpoint=fused_classification())
+    # vote scores are not logits, so no classification endpoint can take them
+    with pytest.raises(TypeError, match="but MajorityVote outputs a VoteScores"):
+        late(MajorityVote(tie_break="error"), endpoint=fused_classification())
+    with pytest.raises(ValueError, match="head=None"):
+        late(MaskedMean(), endpoint=ClassificationEndpoint(nn.Linear(2, 2), nn.CrossEntropyLoss()))
+    with pytest.raises(ValueError, match="branch_weight"):
+        LateFusion(late(MaskedMean()).branches, MaskedMean(), None, branch_weight=-1.0)
+
+
+def test_branch_weight_scales_the_branch_losses_against_the_fused_loss(cohort):
+    data = make_data(cohort, required=["clinical", "wsi"], task="classification")
+    model = late(MaskedMean(), endpoint=fused_classification())
+    model.fit(data)
+    batch = whole_batch(data)
+    output = model(batch)
+    model.branch_weight = 0.25
+    losses = model.loss(output, batch["target"])
+    branches = losses["loss/clinical"] + losses["loss/wsi"]
+    torch.testing.assert_close(losses["loss"], losses["loss/fused"] + 0.25 * branches)
+
+
 def test_late_fusion_with_missing_branch_rows(cohort):
     data = make_data(cohort, required=["clinical"], task="classification")
     model = late(MajorityVote(tie_break="mean_probability"))
     model.check(data)
+    model.fit(data)
     batch = whole_batch(data)
     output = model(batch)
     wsi = output.branches["wsi"]
-    assert int(wsi.defined.sum()) == 30 and torch.isnan(wsi.prediction[~wsi.defined]).all()
-    assert bool(output.defined.all()) and torch.isfinite(output.prediction).all()
-    assert model.columns(data.target) == ["vote_score[low]", "vote_score[high]"]
+    assert int(wsi.defined.sum()) == 30 and torch.isnan(wsi.logits[~wsi.defined]).all()
+    assert bool(output.defined.all()) and torch.isfinite(output.scores).all()
+    assert type(output) is VoteScores and model.output_type is VoteScores
+    assert list(output.detach_cpu().frame().columns) == ["score[low]", "score[high]"]
     model.loss(output, batch["target"])["loss"].backward()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
 
 
 def test_late_fusion_rejects_mixed_heads_and_resolves_encoder_lists():
-    with pytest.raises(TypeError, match="one kind"):
+    with pytest.raises(TypeError, match="one output type"):
         LateFusion(
             {
-                "a": Unimodal("clinical", [nn.Linear(2, 1)], CoxHead(1, "efron")),
-                "b": Unimodal("clinical", [nn.Linear(2, 1)], ClassificationHead(1, 2)),
+                "a": Unimodal("clinical", [nn.Linear(2, 1)], CoxEndpoint(nn.Linear(1, 1, bias=False), "efron")),
+                "b": Unimodal(
+                    "clinical", [nn.Linear(2, 1)], ClassificationEndpoint(nn.Linear(1, 2), nn.CrossEntropyLoss())
+                ),
             },
             MaskedMean(),
+            None,
         )
     hybrid = LateFusion(
         {
-            "tables": Unimodal("clinical", [nn.Linear(2, 2)], ClassificationHead(2, 2)),
-            "both": IntermediateFusion({"clinical": [nn.Linear(2, 2)], "wsi": []}, Concat(), ClassificationHead(18, 2)),
+            "tables": Unimodal(
+                "clinical", [nn.Linear(2, 2)], ClassificationEndpoint(nn.Linear(2, 2), nn.CrossEntropyLoss())
+            ),
+            "both": IntermediateFusion(
+                {"clinical": [nn.Linear(2, 2)], "wsi": []},
+                Concat(),
+                ClassificationEndpoint(nn.Linear(18, 2), nn.CrossEntropyLoss()),
+            ),
         },
         MaskedMean(),
+        None,
     )
     with pytest.raises(ValueError, match="2 branches match modality 'clinical'"):
         hybrid.encoders_for("clinical")
@@ -273,7 +344,12 @@ def test_models_reject_fusion_methods_for_another_stage_at_construction():
     with pytest.raises(TypeError, match="MajorityVote is for late fusion, not intermediate fusion"):
         intermediate(fusion=MajorityVote(tie_break="error"))
     with pytest.raises(TypeError, match="MajorityVote is for late fusion, not early fusion"):
-        EarlyFusion(["clinical", "lab"], MajorityVote(tie_break="error"), [nn.Linear(5, 4)], CoxHead(4, "efron"))
+        EarlyFusion(
+            ["clinical", "lab"],
+            MajorityVote(tie_break="error"),
+            [nn.Linear(5, 4)],
+            CoxEndpoint(nn.Linear(4, 1, bias=False), "efron"),
+        )
     with pytest.raises(TypeError, match="Concat is for early or intermediate fusion, not late fusion"):
         late(Concat())
     with pytest.raises(TypeError, match="fusion must be a FusionMethod"):
@@ -287,10 +363,17 @@ def test_late_fusion_branch_rejects_patients_with_only_some_of_its_modalities(co
         both = IntermediateFusion(
             {"clinical": [nn.Linear(2, 4)], "wsi": [ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)]},
             fusion,
-            ClassificationHead(width, 2),
+            ClassificationEndpoint(nn.Linear(width, 2), nn.CrossEntropyLoss()),
         )
         return LateFusion(
-            {"clinical": Unimodal("clinical", [nn.Linear(2, 2)], ClassificationHead(2, 2)), "both": both}, MaskedMean()
+            {
+                "clinical": Unimodal(
+                    "clinical", [nn.Linear(2, 2)], ClassificationEndpoint(nn.Linear(2, 2), nn.CrossEntropyLoss())
+                ),
+                "both": both,
+            },
+            MaskedMean(),
+            None,
         )
 
     with pytest.raises(ValueError, match="Concat cannot combine 10 patients"):

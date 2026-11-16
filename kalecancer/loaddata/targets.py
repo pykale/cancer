@@ -36,6 +36,10 @@ class BaseTarget(ABC):
         return self.frame.index
 
     @abstractmethod
+    def subset(self, ids: Iterable[str]) -> BaseTarget:
+        """The same kind of target for ``ids`` only, such as the training patients that IPCW metrics read."""
+
+    @abstractmethod
     def tensors(self, ids: Iterable[str]) -> dict[str, Tensor]:
         """The target for ``ids``, in that order, as the tensors the head's loss reads."""
 
@@ -83,6 +87,11 @@ class TimeToEvent(BaseTarget):
             {"time": numeric_time.to_numpy(dtype=np.float32), "event": event.to_numpy(dtype=bool)}, index=ids
         )
 
+    def subset(self, ids: Iterable[str]) -> TimeToEvent:
+        """The outcomes of ``ids`` only."""
+        rows = self[list(ids)]
+        return TimeToEvent(rows["time"], rows["event"])
+
     def tensors(self, ids: Iterable[str]) -> dict[str, Tensor]:
         """``time`` (float32) and ``event`` (bool) tensors for ``ids``, in that order."""
         rows = self.frame.loc[list(ids)]
@@ -124,6 +133,10 @@ class Classification(BaseTarget):
             raise ValueError(f"Classification: labels {unknown[:5]} are not in classes {ordered}")
         self._index = {c: k for k, c in enumerate(ordered)}
         self.frame = pd.DataFrame({"label": labels.to_numpy(dtype=object)}, index=ids)
+
+    def subset(self, ids: Iterable[str]) -> Classification:
+        """The labels of ``ids`` only, with the same classes."""
+        return Classification(self[list(ids)]["label"], self.classes)
 
     def tensors(self, ids: Iterable[str]) -> dict[str, Tensor]:
         """A ``label`` tensor of class indices (int64) for ``ids``, in that order."""
