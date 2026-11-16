@@ -229,8 +229,10 @@ an instance property on `BaseEndpoint`, because with a user-supplied loss it dep
 - The endpoint does not check the loss's `reduction`. `"none"` fails loudly, because the loss is not a scalar, and
   `"sum"` is a legitimate choice that only changes the loss scale.
 
-A model combines its endpoints' answers with its own: late fusion over patients who lack some modalities averages
-each branch over a different subset, so it is not decomposable even when every endpoint is.
+A model combines its endpoints' answers, its fusion method's and its own: late fusion over patients who lack some
+modalities averages each branch over a different subset, so it is not decomposable even when every endpoint is. A
+late fusion method's `decomposable_loss` is `True` when it adds no loss (§5), and `False` by default once it overrides
+`loss`, for the same reason as the endpoint's default.
 
 In survival, the loss is the statistical model: the Cox partial likelihood is what makes a Breslow baseline valid, and
 DeepHit's loss gives a different output type. So each family is its own endpoint, `CoxEndpoint(head, ties=...)` and later
@@ -327,7 +329,25 @@ method was rejected: `LateFusion` and the single-endpoint fusion models have dif
 **Choice:**
 
 - The endpoint computes the loss on the output it builds, a branch's or a fused one (§3).
-- A fusion method may add its own loss terms, so that future trainable fusion methods can be trained and regularised.
+- A late fusion method may add a regulariser of its own, so that future trainable methods can be regularised:
+  `OutputFusion.loss(output, target) -> Tensor | None`, `None` by default. `LateFusion` calls it on the fused output
+  of the patients it defines, whose `branches` hold the branch outputs, whenever another loss has a signal. The term
+  is added unweighted, since the method holds its own weight, and reported as `loss/regulariser`, so no branch may be
+  called `regulariser` either. It is named so that it can't be confused with the fused loss: the fused loss scores the
+  fused prediction, and the regulariser is a penalty on the method itself. A model whose method adds no regulariser
+  reports what it did before. The total is `fused + branch_weight × (sum of the branch losses) + regulariser`.
+- The term is computed from the output, the target and the method's parameters, not from state kept during
+  `forward`. Training validates on the outputs of the whole epoch joined together, so a term stored on the module
+  during `forward` would hold only the last batch's value, and ADR §1 keeps modules stateless between calls. That
+  covers regularising the method's own weights, such as the entropy of learned branch weights, and terms on the
+  branch outputs, such as their agreement.
+- Only late fusion has the hook. In `EarlyFusion` and `IntermediateFusion` the output comes from the head, two or
+  three steps after the fusion method, so a term on it could only regularise the method's parameters, and an
+  `output` argument there would mislead. A trainable tensor fusion method is still trained there, by the endpoint's
+  loss through the graph. Its own terms, such as attention entropy or a contrastive alignment between modality
+  embeddings, need what only `forward` sees: an open question. A method that is both, such as a `MaskedMean`
+  subclass with a term, adds it in late fusion only. Its docstring says so, and models don't check for it, because
+  nothing breaks and the check would need to inspect the method's class.
 - Late fusion's loss is the fused endpoint's loss plus `branch_weight` (default 1) times the sum of the branch
   losses, which is the usual deep supervision pattern. Each part is reported as `loss/fused` and `loss/<branch>`, so
   no branch may be called `fused`.
@@ -350,9 +370,12 @@ method was rejected: `LateFusion` and the single-endpoint fusion models have dif
   order), and from the training patients' outputs once training ends (`fit_state`, e.g. `CoxEndpoint.baseline_`).
   `to_output` attaches it to every output, so outputs fit nothing themselves.
 - The fitted population is `train_ids_`, for the baseline and for the IPCW censoring distribution alike. Validation
-  patients were used to choose the model, not to fit it. To confirm against the libraries before implementing: pycox's
-  `compute_baseline_hazards` and sksurv's `CoxPHSurvivalAnalysis` fit the baseline on the training data, and sksurv's
-  `concordance_index_ipcw` estimates censoring from the training data, as in Uno et al.
+  patients were used to choose the model, not to fit it. This is the libraries' convention (checked 2026-11-16):
+  - pycox: `fit` stores only the training `input` and `target` as `training_data`, not `val_data`, and
+    `compute_baseline_hazards()` falls back to `training_data`. Its CoxPH example early-stops on validation data and
+    then fits the baseline on the training split only, which is our setup.
+  - sksurv 0.28: `CoxPHSurvivalAnalysis.fit(X, y)` fits its `BreslowEstimator` on the data it was given, and
+    `concordance_index_ipcw` fits its `CensoringDistributionEstimator` on `survival_train`, as in Uno et al.
 
 ## 7. Each check runs at the earliest point its information exists
 
@@ -446,14 +469,22 @@ to be implemented later:
 
 - **Class weights from the training target.** `nn.CrossEntropyLoss(weight=...)` takes fixed weights. Weights computed
   at `fit`, as sklearn's `class_weight="balanced"` does, would need an endpoint option that builds them in `bind`.
+- **Loss terms for tensor fusion methods.** Only late fusion has a fusion loss hook (§5). A term for an early or
+  intermediate method, such as attention entropy or a contrastive alignment between modality embeddings, needs what
+  only `forward` sees. `TensorFusion.forward` would have to return the term, and the model carry it on the output,
+  where it must survive `cat` across validation batches as a sum weighted by batch size. Left out until such a
+  method is added.
 - **A `loss_fn=` for `CoxEndpoint`,** taking functions with torchsurv's signature `(log_hz, event, time)`. Left out until
   someone needs it.
 - **A default head.** Users always size the head now. A convenience such as `CoxEndpoint.linear(in_dim)` could cover the
   common case.
-- **The names** of `BaseOutput`, its subclasses, `BaseModel` and `SingleEndpointModel`. Endpoints are named
-  `<Family>Endpoint` (`CoxEndpoint`, `ClassificationEndpoint`), which keeps them apart from targets such as
-  `Classification`. Their loss method is `loss`, as on models, so a user-supplied loss is the argument `loss_fn`:
-  configs store each `__init__` argument under its own name, so the two can't share one.
+- **The names.** **Decided (2026-11-16):** the current names are final. Outputs: `BaseOutput`, `RiskScore`,
+  `CoxOutput`, `SurvivalFunction`, `ClassScores`, `ClassProbabilities`, `VoteScores`. Models: `BaseModel`,
+  `SingleEndpointModel`, `LateFusion`. Fusion: `FusionMethod`, `TensorFusion`, `OutputFusion`, with the hooks
+  `output_type`, `check_branches`, `check_widths` and `loss`. Endpoints: `bind`, `to_output`, `adopt`, `fit_state`.
+  Endpoints are named `<Family>Endpoint` (`CoxEndpoint`, `ClassificationEndpoint`), which keeps them apart from
+  targets such as `Classification`. Their loss method is `loss`, as on models, so a user-supplied loss is the argument
+  `loss_fn`: configs store each `__init__` argument under its own name, so the two can't share one.
 - **Labels for fitted encoders.** TabICL labels its context with `strata`, which for `TimeToEvent` is the event flag,
   so a patient censored at 3 months looks like a long-term survivor. The endpoint, not the splitter, should decide
   what labels an encoder sees.

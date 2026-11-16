@@ -8,7 +8,8 @@ the two interfaces a method has, never for a particular method, so adding one ne
 ``defined`` says which patients a method can combine. Models use the same answer to check a dataset and in
 ``forward``, so the two cannot disagree, and ``forward`` only ever receives rows it accepts. Each other rule has its own
 hook, called when the information it needs first exists (ADR 0005 §7): ``OutputFusion.output_type`` when the model is
-built, ``OutputFusion.check_branches`` for each dataset, and ``TensorFusion.check_widths`` in the dry run.
+built, ``OutputFusion.check_branches`` for each dataset, and ``TensorFusion.check_widths`` in the dry run. A trainable
+late fusion method may add a regulariser of its own with ``OutputFusion.loss``, which ``LateFusion`` adds to its loss.
 """
 
 from __future__ import annotations
@@ -114,6 +115,31 @@ class OutputFusion(FusionMethod):
             present: One row per patient and one bool column per branch, ``True`` where the branch predicts.
             input_types: Each branch's output type, which ``output_type`` accepted when the model was built.
         """
+
+    def loss(self, output: BaseOutput, target: Mapping[str, Tensor]) -> Tensor | None:
+        """A regulariser of the method's own, which ``LateFusion`` adds to its loss. ``None``, the default, adds nothing.
+
+        For trainable methods to regularise themselves (ADR 0005 §5); ``LateFusion`` reports it as ``loss/regulariser``,
+        unweighted, so the method applies its own weight. ``LateFusion`` calls it whenever one of its
+        other losses has a signal. Early and intermediate fusion never call it, because their output comes from the
+        head, not from the method, so a method that is also a ``TensorFusion`` adds its term in late fusion only. The
+        term must come from ``output``, ``target`` and the method's parameters, never from state kept during
+        ``forward``: validation computes its loss once, on the outputs of every batch joined together.
+
+        Args:
+            output: The fused output for the patients the model defines. Its ``branches`` hold the branch outputs.
+            target: The target tensors of the same patients.
+        """
+        return None
+
+    @property
+    def decomposable_loss(self) -> bool:
+        """Whether ``loss`` doesn't depend on how patients are grouped into batches, so gradients can be accumulated.
+
+        ``True`` for a method that adds no loss. A method that overrides ``loss`` is ``False`` unless it overrides
+        this too: a wrong ``True`` gives silently wrong gradients, while a wrong ``False`` only refuses accumulation.
+        """
+        return type(self).loss is OutputFusion.loss
 
     @abstractmethod
     def forward(self, values: Mapping[str, BaseOutput], present: Mapping[str, Tensor]) -> BaseOutput:

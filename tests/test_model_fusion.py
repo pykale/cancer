@@ -293,6 +293,89 @@ def test_branch_weight_scales_the_branch_losses_against_the_fused_loss(cohort):
     torch.testing.assert_close(losses["loss"], losses["loss/fused"] + 0.25 * branches)
 
 
+class PenalisedMean(MaskedMean):
+    """MaskedMean with a trainable loss term of its own, which records the output it was given."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.tensor(0.5))
+        self.seen = None
+
+    def loss(self, output, target):
+        self.seen = output
+        return self.weight**2
+
+
+class DecomposablePenalisedMean(PenalisedMean):
+    @property
+    def decomposable_loss(self):
+        return True
+
+
+def decomposable_late(fusion):
+    """``late`` with classification endpoints that all declare their loss a mean over patients."""
+
+    def endpoint(head):
+        return ClassificationEndpoint(head, nn.CrossEntropyLoss(), decomposable_loss=True)
+
+    return LateFusion(
+        branches={
+            "clinical": Unimodal("clinical", [nn.Linear(2, 4)], endpoint(nn.Linear(4, 2))),
+            "wsi": Unimodal(
+                "wsi", [ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)], endpoint(nn.Linear(4, 2))
+            ),
+        },
+        fusion=fusion,
+        endpoint=endpoint(None),
+    )
+
+
+def test_a_fusion_method_without_a_loss_adds_nothing_and_stays_decomposable(cohort):
+    data = make_data(cohort, required=["clinical", "wsi"], task="classification")
+    model = late(MaskedMean(), endpoint=fused_classification())
+    model.fit(data)
+    batch = whole_batch(data)
+    assert "loss/regulariser" not in model.loss(model(batch), batch["target"])
+    assert MaskedMean().decomposable_loss and decomposable_late(MaskedMean()).decomposable_loss
+
+
+def test_only_late_fusion_adds_the_fusion_methods_loss_term(cohort):
+    # in intermediate fusion the output comes from the head, not the method, so the method's term is never asked for
+    data = make_data(cohort, required=["clinical", "wsi"])
+    fusion = PenalisedMean()
+    model = intermediate(fusion, head_dim=4)
+    batch = whole_batch(data)
+    assert set(model.loss(model(batch), batch["target"])) == {"loss"}
+    assert fusion.seen is None
+    assert not fusion.decomposable_loss and DecomposablePenalisedMean().decomposable_loss
+
+
+def test_late_fusion_adds_the_fusion_methods_term_unweighted_and_gives_it_the_branches(cohort):
+    data = make_data(cohort, required=["clinical", "wsi"], task="classification")
+    fusion = PenalisedMean()
+    model = late(fusion, endpoint=fused_classification())
+    model.fit(data)
+    model.branch_weight = 0.25
+    batch = whole_batch(data)
+    losses = model.loss(model(batch), batch["target"])
+    branches = losses["loss/clinical"] + losses["loss/wsi"]
+    torch.testing.assert_close(losses["loss/regulariser"], torch.tensor(0.25))
+    torch.testing.assert_close(losses["loss"], losses["loss/fused"] + 0.25 * branches + 0.25)
+    losses["loss"].backward()
+    assert fusion.weight.grad is not None
+    assert set(fusion.seen.branches) == {"clinical", "wsi"} and len(fusion.seen.ids) == len(data.ids)
+    # a method with its own term is refused gradient accumulation unless it says the term decomposes
+    assert not decomposable_late(PenalisedMean()).decomposable_loss
+    assert decomposable_late(DecomposablePenalisedMean()).decomposable_loss
+
+
+def test_late_fusion_branches_cannot_take_the_names_of_loss_report_parts():
+    branches = dict(late(MaskedMean()).branches)
+    for reserved in ("fused", "regulariser"):
+        with pytest.raises(ValueError, match=f"cannot be called '{reserved}'"):
+            LateFusion({**branches, reserved: branches["clinical"]}, MaskedMean(), None)
+
+
 def test_late_fusion_with_missing_branch_rows(cohort):
     data = make_data(cohort, required=["clinical"], task="classification")
     model = late(MajorityVote(tie_break="mean_probability"))

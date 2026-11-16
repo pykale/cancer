@@ -142,14 +142,20 @@ def _known(widths: Mapping[str, int | None]) -> dict[str, int]:
     return {name: width for name, width in widths.items() if width is not None}
 
 
-def _endpoint_loss(endpoint: BaseEndpoint, output: BaseOutput, target: Mapping[str, Tensor]) -> Tensor | None:
-    """``endpoint``'s loss over the patients ``output`` defines; ``None`` when it defines none or there is no signal."""
+def _defined_rows(output: BaseOutput, target: Mapping[str, Tensor]) -> tuple[BaseOutput, Mapping[str, Tensor]] | None:
+    """``output`` and ``target`` for the patients ``output`` defines; ``None`` when it defines none."""
     defined = output.defined
     if not bool(defined.any()):
         return None
     if not bool(defined.all()):
-        output, target = output.select(defined), {key: t[defined] for key, t in target.items()}
-    return endpoint.loss(output, target)
+        return output.select(defined), {key: t[defined] for key, t in target.items()}
+    return output, target
+
+
+def _endpoint_loss(endpoint: BaseEndpoint, output: BaseOutput, target: Mapping[str, Tensor]) -> Tensor | None:
+    """``endpoint``'s loss over the patients ``output`` defines; ``None`` when it defines none or there is no signal."""
+    rows = _defined_rows(output, target)
+    return None if rows is None else endpoint.loss(*rows)
 
 
 class BaseModel(nn.Module, ABC):
@@ -562,8 +568,14 @@ class LateFusion(BaseModel):
     outputs, and ``endpoint``, when given, takes the result: it attaches the fused output's own state, such as a
     Breslow baseline fitted on the fused log-hazards, and its loss trains the fused output.
 
-    The loss is the fused loss plus ``branch_weight`` times the sum of the branch losses, so the branches stay useful
-    on their own for ``branch=`` predictions.
+    The total loss is::
+
+        fused loss + branch_weight × (sum of the branch losses) + the fusion method's regulariser
+
+    The fused loss scores the fused prediction and comes from ``endpoint``; there is none when ``endpoint`` is
+    ``None``. The branch losses score each branch's own prediction, which keeps the branches useful on their own for
+    ``branch=`` predictions. The regulariser is a penalty the fusion method may put on itself (``OutputFusion.loss``),
+    weighted by the method; most methods add none.
 
     Args:
         branches: At least two models, by name. Each is a ``Unimodal``, ``EarlyFusion`` or ``IntermediateFusion``
@@ -588,8 +600,11 @@ class LateFusion(BaseModel):
         super().__init__()
         if len(branches) < 2:
             raise ValueError("LateFusion needs at least two branches")
-        if "fused" in branches:
-            raise ValueError("'fused' names the fused loss in the loss report, so a branch cannot be called 'fused'")
+        if reserved := sorted({"fused", "regulariser"} & set(branches)):
+            raise ValueError(
+                f"'fused' and 'regulariser' name the fused loss and the fusion method's regulariser in the loss report, "
+                f"so a branch cannot be called {reserved[0]!r}"
+            )
         for name, branch in branches.items():
             if not isinstance(branch, SingleEndpointModel):
                 raise TypeError(
@@ -631,9 +646,10 @@ class LateFusion(BaseModel):
 
     @property
     def decomposable_loss(self) -> bool:
-        """Whether every loss, branch and fused, is a mean over patients, so accumulating gradients works."""
+        """Whether every loss, branch, fused and the fusion method's, is a mean over patients, so accumulating works."""
         branches = all(branch.decomposable_loss for branch in self.branches.values())
-        return branches and (self.endpoint is None or self.endpoint.decomposable_loss)
+        fused = self.endpoint is None or self.endpoint.decomposable_loss
+        return branches and fused and self.fusion.decomposable_loss
 
     def check(self, data: MultimodalDataset) -> None:
         """Raise if a branch or the fused endpoint cannot be used with ``data``, or ``fusion`` cannot fuse the branches.
@@ -698,9 +714,10 @@ class LateFusion(BaseModel):
         return {} if self.endpoint is None else self.endpoint.fit_state(output, target)
 
     def loss(self, output: BaseOutput, target: Mapping[str, Tensor]) -> dict[str, Tensor] | None:
-        """The fused loss plus ``branch_weight`` times the branch losses, each reported as ``loss/<name>``.
+        """The total loss, ``fused + branch_weight × branches + regulariser``, under ``loss``, and each part.
 
-        The fused loss is reported as ``loss/fused``. Losses that have no signal in the batch are left out.
+        The parts are reported as ``loss/fused``, ``loss/<branch>`` and ``loss/regulariser``. Losses that have no signal
+        in the batch are left out, and the regulariser is added only when some other loss has a signal.
         """
         parts = {}
         if self.endpoint is not None:
@@ -713,7 +730,12 @@ class LateFusion(BaseModel):
                 parts[name] = branch_loss["loss"]
         if not parts:
             return None
-        total = sum(value if name == "fused" else self.branch_weight * value for name, value in parts.items())
+        rows = _defined_rows(output, target)
+        term = None if rows is None else self.fusion.loss(*rows)
+        if term is not None:
+            parts["regulariser"] = term
+        unweighted = ("fused", "regulariser")
+        total = sum(value if name in unweighted else self.branch_weight * value for name, value in parts.items())
         return {"loss": total, **{f"loss/{name}": value for name, value in parts.items()}}
 
     def encoders_for(self, modality: str, branch: str | None = None) -> EncoderList:

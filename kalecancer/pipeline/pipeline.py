@@ -321,7 +321,8 @@ class Pipeline(BaseEstimator):
         if trainer_kwargs.get("accumulate_grad_batches", 1) != 1 and not (self.model.decomposable_loss and complete):
             raise ValueError(
                 "accumulate_grad_batches does not reproduce a larger batch for this model: the loss is not a mean over "
-                "patients (a Cox risk set, or branch losses averaged over patients with a modality). "
+                "patients (a Cox risk set, a fusion method's own term, or branch losses averaged over patients with a "
+                "modality). "
                 "Increase batch_size instead; memory-bound encoders should process their inputs in chunks"
             )
         if unknown := sorted(set(self.transforms) - set(data.modalities)):
