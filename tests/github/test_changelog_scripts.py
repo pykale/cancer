@@ -571,7 +571,9 @@ def test_release_uses_trusted_scripts_and_checks_before_merging():
     assert "ref: ${{ github.event.pull_request.base.sha }}" in workflow
     assert 'python3 "$RUNNER_TEMP/release_version.py" kalecancer/__init__.py' in workflow
     assert 'python3 "$RUNNER_TEMP/release_notes.py"' in workflow
-    assert '.workflowName == "CI" and .conclusion == "success"' in workflow
+    assert 'cp trusted-base/.github/scripts/release_checks.py "$RUNNER_TEMP/release_checks.py"' in workflow
+    assert 'python3 "$RUNNER_TEMP/release_checks.py" "$WORKFLOW_NAME"' in workflow
+    assert '[ "$status" -ne 3 ]' in workflow
     assert 'gh api -X PUT "repos/$REPOSITORY/pulls/$PR_NUMBER/merge"' in workflow
     assert '-f sha="$HEAD_SHA" -f merge_method=merge' in workflow
     assert "select(.merged == true) | .sha" in workflow
@@ -647,3 +649,106 @@ def test_project_board_is_kalecancer_and_never_given_to_forks():
     assert workflow.count("project-url: https://github.com/orgs/pykale/projects/14") == 2
     assert "projects/4" not in workflow
     assert "github.event.pull_request.head.repo.full_name == github.repository" in workflow
+
+
+def run(workflow, status="completed", conclusion="success"):
+    """Returns a workflow run as ``gh run list --json workflowName,status,conclusion`` gives it."""
+    return {"workflowName": workflow, "status": status, "conclusion": conclusion if status == "completed" else ""}
+
+
+OWN = "release-on-approval"
+
+
+@pytest.mark.parametrize(
+    "runs, expected",
+    [
+        ([run("CI"), run("codeql-analysis")], "passed"),
+        ([run("CI", conclusion="skipped")], "passed"),
+        ([run("CI", conclusion="failure"), run("CI")], "failed"),
+        ([run("CI", conclusion="cancelled")], "failed"),
+        ([run("CI", conclusion="action_required"), run("CI", conclusion="failure")], "failed"),
+        ([run("CI", conclusion="action_required"), run("CI")], "passed"),
+        ([run("CI", conclusion="action_required"), run("CI", status="in_progress")], "running"),
+        ([run("CI", conclusion="action_required")], "awaiting approval"),
+    ],
+)
+def test_release_checks_judge_each_workflow_as_a_whole(runs, expected):
+    """A run waiting for approval never ran, so it neither fails its workflow nor counts as a pass."""
+    assert load("release_checks").workflow_state(runs) == expected
+
+
+def test_release_checks_pass_bot_commit_once_dispatched_ci_passed():
+    """The changelog commit's own pull_request runs wait for approval, but the CI run changelog.yml dispatches passed.
+
+    This is what an approval of an unedited changelog commit sees, e.g. 4f45e8d on pykale/cancer#54. CodeQL has no
+    other run, so the release waits for it to be approved and run instead of failing.
+    """
+    checks = load("release_checks")
+    runs = [
+        run("CI", conclusion="action_required"),
+        run("codeql-analysis", conclusion="action_required"),
+        run("CI"),
+        run(OWN, status="in_progress"),
+    ]
+
+    status, message = checks.summarise(runs, OWN)
+
+    assert status == checks.EXIT_PENDING
+    assert "waiting for approval: codeql-analysis" in message
+    assert "CI" not in message.split("waiting for approval:")[1].split("(")[0]
+
+    status, message = checks.summarise([*runs[:1], run("codeql-analysis"), *runs[2:]], OWN)
+    assert (status, message) == (checks.EXIT_PASSED, "All checks passed.")
+
+
+def test_release_checks_report_failures_before_pending_runs():
+    checks = load("release_checks")
+    runs = [run("CI", status="queued"), run("codeql-analysis", conclusion="failure")]
+
+    status, message = checks.summarise(runs, OWN)
+
+    assert status == checks.EXIT_FAILED
+    assert message == "Checks failed: codeql-analysis. Fix them, push, and approve again."
+
+
+@pytest.mark.parametrize(
+    "runs, waiting_for",
+    [
+        ([], "no CI run has passed yet"),
+        ([run("codeql-analysis")], "no CI run has passed yet"),
+        ([run("CI", status="in_progress")], "running: CI"),
+    ],
+)
+def test_release_checks_require_ci(runs, waiting_for):
+    """The release never goes ahead without a passing CI run, even when nothing else is pending."""
+    checks = load("release_checks")
+    status, message = checks.summarise(runs, OWN)
+    assert status == checks.EXIT_PENDING
+    assert waiting_for in message
+
+
+def test_release_checks_ignore_their_own_run():
+    checks = load("release_checks")
+    assert checks.summarise([run("CI"), run(OWN, status="in_progress")], OWN)[0] == checks.EXIT_PASSED
+
+
+@pytest.mark.parametrize(
+    "runs, exit_code, output",
+    [
+        ([run("CI")], 0, "All checks passed.\n"),
+        ([run("CI", conclusion="failure")], 1, "Checks failed: CI. Fix them, push, and approve again.\n"),
+        ([run("CI", conclusion="action_required")], 3, "Waiting: waiting for approval: CI"),
+    ],
+)
+def test_release_checks_main(monkeypatch, capsys, runs, exit_code, output):
+    """Tests the exit status the workflow's wait loop acts on: 0 to merge, 3 to keep waiting, anything else to stop."""
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(runs)))
+    assert load("release_checks").main([OWN]) == exit_code
+    assert capsys.readouterr().out.startswith(output)
+
+
+def test_release_checks_usage_error(capsys):
+    assert load("release_checks").main([]) == 2
+    assert "usage:" in capsys.readouterr().err
