@@ -164,3 +164,56 @@ def test_pipeline(test_model, num_classes, url):
 
     assert str(test_model) is not None
     assert len(str(test_model)) > 0
+
+
+def test_pipeline_single_modality_without_multimodal_decoder():
+    # with one modality and no multimodal decoder, Lightning returns a single optimizer
+    # and test_step predicts from the unimodal output
+    root = "tests/test_data/multiomics/trainer/single_modality"
+    file_names = ["1_tr.csv", "1_lbl_tr.csv", "1_te.csv", "1_lbl_te.csv", "1_feat_name.csv"]
+    dataset = SparseMultiomicsDataset(
+        root=root,
+        raw_file_names=file_names,
+        num_modalities=1,
+        num_classes=2,
+        edge_per_node=2,
+        url=binary_class_data_url,
+        random_split=False,
+        train_size=0.7,
+        equal_weight=False,
+        pre_transform=ToTensor(dtype=torch.float),
+        target_pre_transform=ToOneHotEncoding(dtype=torch.float),
+    )
+    model = MultiomicsTrainer(
+        dataset=dataset,
+        num_modalities=1,
+        num_classes=2,
+        unimodal_encoder=[
+            MogonetGCN(in_channels=dataset.get(0).num_features, hidden_channels=[64, 64, 32], dropout=0.5)
+        ],
+        unimodal_decoder=[LinearClassifier(in_dim=32, out_dim=2)],
+        loss_fn=CrossEntropyLoss(reduction="none"),
+        multimodal_decoder=None,
+    )
+    assert len(model.configure_optimizers()) == 1
+
+    set_seed(2023)
+    trainer = pl.Trainer(
+        default_root_dir="./tests/outputs",
+        max_epochs=2,
+        accelerator="cpu",
+        enable_model_summary=False,
+        logger=False,
+        enable_checkpointing=False,
+    )
+    weights_before = [p.detach().clone() for p in model.unimodal_encoder[0].parameters()]
+    trainer.fit(model)
+    assert any(
+        not torch.equal(b, p) for b, p in zip(weights_before, model.unimodal_encoder[0].parameters(), strict=True)
+    )
+
+    result = trainer.test(model)
+    assert 0 <= result[0]["Accuracy"] <= 1
+    assert 0 <= result[0]["F1"] <= 1
+    assert 0 <= result[0]["AUC"] <= 1
+    assert "Multimodal decoder" not in str(model)

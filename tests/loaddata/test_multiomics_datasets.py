@@ -71,6 +71,14 @@ def test_multiomics_datasets(random_split):
         assert dataset.get(modality).x.dtype == torch.float
         assert dataset.get(modality).y.dtype == torch.float
 
+    # Test set method
+    original = dataset.get(0)
+    replacement = Data(x=torch.zeros(2, 3))
+    dataset.set(replacement, 0)
+    assert dataset.get(0) is replacement
+    dataset.set(original, 0)
+    assert dataset.get(0) is original
+
     dataset.process()
     data = next(iter(dataset))[0]
     _ = dataset.extend_data(data)
@@ -141,6 +149,18 @@ def test_sparse_multiomics_datasets():
         assert hasattr(data, "edge_index_train")
         assert hasattr(data, "edge_weight_train")
         assert hasattr(data, "adj_t_train")
+
+    # Test sample weights follow the class distribution unless equal_weight is set
+    labels = torch.tensor([0, 0, 0, 1])
+    assert torch.allclose(dataset._get_sample_weight(labels), torch.tensor([0.75, 0.75, 0.75, 0.25]))
+    dataset.equal_weight = True
+    assert torch.allclose(dataset._get_sample_weight(labels), torch.full((4,), 0.25))
+    dataset.equal_weight = False
+
+    # Test the sparse adjacency matrix needs a similarity threshold
+    dataset.sim_threshold = None
+    with pytest.raises(RuntimeError, match="sim_threshold is not set"):
+        dataset._generate_sparse_adj(torch.ones(3, 3))
 
     assert str(dataset) is not None
     assert len(str(dataset)) > 0
