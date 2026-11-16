@@ -20,11 +20,13 @@ Or with pip, which is more fragile because it resolves versions from the bounds 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e ".[tabular,imaging,pathology,interpret]" --group dev
+python -m pip install -e ".[tabular,imaging,pathology,interpret,multiomics]" --group dev
 pre-commit install
 ```
 
 With pip, drop the `uv run` prefix from the commands below.
+
+The `multiomics` extra also needs two compiled PyTorch Geometric packages that cannot be declared; see [Code migrated from PyKale](#code-migrated-from-pykale).
 
 ## Before opening a pull request
 
@@ -37,7 +39,7 @@ uv run pytest --cov=kalecancer
 
 ### Tests
 
-Tests mirror the package layout, as in PyKale: code in `kalecancer/model/fusion.py` is tested in `tests/model/test_fusion.py`, and an example in `tests/examples/`. They build synthetic HDF5 cohorts with `make_cohort` from `tests/conftest.py` and never access the network. Add tests for new code to the matching file.
+Tests mirror the package layout, as in PyKale: code in `kalecancer/model/fusion.py` is tested in `tests/model/test_fusion.py`, and an example in `tests/examples/`. They build synthetic HDF5 cohorts with `make_cohort` from `tests/conftest.py` and never access the network, except the MOGONET tests described in [Code migrated from PyKale](#code-migrated-from-pykale). Add tests for new code to the matching file.
 
 ## Releasing
 
@@ -51,6 +53,38 @@ Releases follow PyKale's process, with the steps maintainers did by hand for PyK
 Only approvals from owners, members and collaborators, of the pull request's latest commit, start a release. If a check fails, fix it, push, and approve again.
 
 Publishing uses PyPI trusted publishing, so no PyPI token is stored. pypi.org and test.pypi.org each trust two workflows of `pykale/cancer`: `release-on-approval.yml` and `release.yml`, which publishes a release created by hand. The publishers use the environments `pypi` and `testpypi`. The repository needs the `new feature`, `bug`, `refactor`, `enhancement`, `dependencies`, `tests` and `documentation` labels that `.github/changelog-config.json` groups by. New issues and pull requests are added to the [KaleCancer project](https://github.com/orgs/pykale/projects/14), which needs the `ADD_TO_PROJECT_PAT` secret.
+
+## Code migrated from PyKale
+
+MOGONET, the multiomics classifier, was moved from PyKale in its source format. This round is a migration, not an enhancement: its outputs, public APIs and contracts are those of PyKale 0.2.2, whose MOGONET code is unchanged since 0.2.1. To pass this repository's checks, the import paths, docstrings and type hints changed, and two misuse cases now behave differently: `MultiomicsTrainer` skips its per-step loss logging when no logger is attached instead of failing, and the dataset raises a `RuntimeError` if an adjacency matrix is built before its similarity threshold is set.
+
+| KaleCancer | Moved from PyKale |
+| --- | --- |
+| `kalecancer/loaddata/multiomics_datasets.py` | `kale.loaddata.multiomics_datasets` |
+| `kalecancer/model/encode/mogonet.py` | `kale.embed.model_lib.mogonet` |
+| `LinearClassifier` in `kalecancer/model/heads.py` | `kale.predict.decode` |
+| `kalecancer/pipeline/multiomics_trainer.py` | `kale.pipeline.multiomics_trainer` |
+| `kalecancer/interpret/model_weights.py` | `select_top_features_by_masking` in `kale.interpret.model_weights` |
+| `examples/multiomics_mogonet/` | `examples/multiomics_mogonet/` |
+
+`VCDN`, `calculate_distance`, `load_graph_data`, `ToTensor` and `ToOneHotEncoding` stay in PyKale and are imported from `kale`.
+
+This code differs from the rest of KaleCancer, and the differences are deliberate until a later enhancement round:
+
+- **It is built on PyTorch, not on scikit-learn and NumPy.** Each omics type is a PyTorch Geometric graph of similar patients, and training runs in `MultiomicsTrainer`, a PyTorch Lightning module, rather than through the scikit-learn-style `Pipeline` over NumPy arrays and pandas frames. `MultiomicsTrainer` is therefore an exception to the single-estimator convention below, and these modules are not exported from their subpackage `__init__.py`, so importing `kalecancer` does not require PyTorch Geometric.
+- **Its dependencies are the `multiomics` extra:** `torch_geometric`, and `yacs` for the example. Like PyKale, KaleCancer cannot declare `torch_scatter` and `torch_sparse`, because they are built for each PyTorch and CUDA version and published only on the PyG wheel index. Install them for the PyTorch you have, as CI does:
+
+  ```bash
+  TORCH=$(python -c "import torch; print(torch.__version__)")
+  python -m pip install --only-binary :all: torch_scatter torch_sparse -f "https://data.pyg.org/whl/torch-${TORCH}.html"
+  ```
+
+  In a uv environment, use `uv pip install` in place of `python -m pip install`.
+
+- **Its tests keep PyKale's format.** `tests/model/encode/test_mogonet.py`, `tests/loaddata/test_multiomics_datasets.py` and `tests/pipeline/test_multiomics_trainer.py` download ROSMAP and TCGA-BRCA from [pykale/data](https://github.com/pykale/data/tree/main/multiomics) into `tests/test_data/`, which git ignores, so they need network access. `tests/interpret/test_model_weights.py` uses synthetic data.
+- **The example keeps PyKale's layout.** Run it from its folder: `python main.py --cfg configs/MOGONET_BRCA_quick_test.yaml`.
+
+Don't change this code's behaviour as part of the migration. Adapting it to the conventions below is separate work, recorded in [docs/adr/](docs/adr/) when it happens.
 
 ## Adding a component
 

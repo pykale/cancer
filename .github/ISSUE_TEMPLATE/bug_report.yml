@@ -41,6 +41,7 @@ body:
         - Pipeline (fit, predict, evaluate, encode, configs)
         - Evaluation metrics, bootstrap or cross-validation
         - Interpretation (attention, attribution)
+        - MOGONET multiomics (migrated from PyKale)
         - An example
         - Not sure
     validations:
