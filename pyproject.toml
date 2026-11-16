@@ -56,6 +56,12 @@ interpret = [
     "captum",
     "umap-learn",
 ]
+# MOGONET, migrated from PyKale. It also needs the torch_scatter and torch_sparse wheels built for the installed
+# PyTorch, which only the PyG wheel index provides; see CONTRIBUTING.md.
+multiomics = [
+    "torch-geometric>=2.6",
+    "yacs>=0.1.7",
+]
 
 [dependency-groups]
 dev = [

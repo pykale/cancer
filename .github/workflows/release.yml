@@ -1,0 +1,58 @@
+# Publishes a release created by hand to PyPI, or to Test PyPI for a pre-release.
+# The published event also covers releases first saved as drafts in the GitHub UI.
+# https://packaging.python.org/guides/publishing-package-distribution-releases-using-github-actions-ci-cd-workflows/
+#
+# Copied from PyKale (pykale/pykale) and changed to trusted publishing: PyPI trusts this workflow file and its
+# GitHub environment, configured on pypi.org and test.pypi.org, so no API token is stored. Approved release pull
+# requests are published by release-on-approval.yml instead: a release created with a workflow's GITHUB_TOKEN does
+# not trigger this one.
+
+name: release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distribution
+    uses: ./.github/workflows/build-dist.yml
+
+  publish-testpypi:
+    name: Publish distribution to Test PyPI
+    needs: build
+    if: github.event.release.prerelease
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/kalecancer
+    permissions:
+      id-token: write # mandatory for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: Publish distribution to PyPI
+    needs: build
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/kalecancer
+    permissions:
+      id-token: write # mandatory for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

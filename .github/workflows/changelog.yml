@@ -1,0 +1,186 @@
+ # Copied from PyKale (pykale/pykale), .github/workflows/changelog.yml, which was
+# adapted from KaleLinear (pykale/linear), pull request #22:
+# https://github.com/pykale/linear/pull/22
+# Source file: .github/workflows/changelog.yml
+# Copyright (c) 2018-2026 Shuo Zhou
+# Copyright (c) 2026 PyKale contributors
+# Licensed under the MIT License: https://github.com/pykale/linear/blob/main/LICENSE
+# Generates the changelog for release pull requests.
+#
+# A pull request titled with the word "release" and the version being released,
+# e.g. "Release 0.3.0", gets a label-grouped list of every pull request merged
+# since the previous tag. The list is inserted at the top of .github/CHANGELOG.md,
+# committed to the pull request branch, and posted as a pull request comment.
+#
+# See https://github.com/mikepenz/release-changelog-builder-action
+
+name: changelog
+
+on:
+  pull_request:
+    # Runs once, when the pull request is opened. Later pushes (e.g. rewording
+    # the changelog) and title or description edits don't run it again. To
+    # retry after a wrong title, close the pull request and open a new one.
+    types: [opened]
+
+# Writing the changelog commit and the pull request comment needs more than
+# the default read-only token.
+permissions:
+  contents: write
+  pull-requests: write
+  # Dispatching CI on the changelog commit, which a GITHUB_TOKEN push does not trigger.
+  actions: write
+
+# Prevent overlapping attempts, including manually rerun jobs for the same PR.
+concurrency:
+  group: changelog-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  log-changes:
+    name: Log changes
+    runs-on: ubuntu-latest
+    # - Pull requests from forks receive a read-only token, which can neither
+    #   push nor comment, so only branches of this repository are supported.
+    # - Dependabot titles such as "Bump x from 1.2.3 to 1.2.4" are never
+    #   releases, and Dependabot's token is read-only as well.
+    # - contains() is case-insensitive, so non-release pull requests skip the
+    #   job without starting a runner; the version step does the exact check.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      contains(github.event.pull_request.title, 'release')
+    steps:
+      - name: Checkout pull request branch
+        uses: actions/checkout@v4
+        with:
+          # Check out the current tip of the branch, not the event's head.sha:
+          # "Re-run jobs" replays the original event, whose head.sha predates a
+          # changelog commit an earlier attempt may already have pushed. From
+          # the tip, a rerun finds that section, commits nothing and goes on
+          # to comment, instead of building a second commit that can't push.
+          ref: ${{ github.event.pull_request.head.ref }}
+          # The full history is needed to locate the previous release tag.
+          fetch-depth: 0
+          # Keep credentials out of the pull request checkout. The push step
+          # receives a short-lived token only when it needs one.
+          persist-credentials: false
+
+      # Load helpers from the base commit rather than PR modifications.
+      # The PR workflow itself remains editable by same-repository contributors;
+      # this is not isolation from contributors who can change the workflow.
+      - name: Checkout changelog files from the base commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted-base
+          sparse-checkout: .github
+          persist-credentials: false
+
+      # Use temporary copies so later steps cannot pick up the pull request's
+      # versions by mistake.
+      - name: Load base-commit changelog files
+        run: |
+          cp trusted-base/.github/scripts/release_version.py "$RUNNER_TEMP/release_version.py"
+          cp trusted-base/.github/scripts/update_changelog.py "$RUNNER_TEMP/update_changelog.py"
+          cp trusted-base/.github/changelog-config.json "$RUNNER_TEMP/changelog-config.json"
+
+      - name: Get release version from pull request title
+        id: version
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        # Accepts one X.Y.Z, X.Y.ZaN, X.Y.ZbN or X.Y.ZrcN version matching
+        # kalecancer/__init__.py; see the script and tests/github for the rules.
+        run: python3 "$RUNNER_TEMP/release_version.py" kalecancer/__init__.py
+
+      - name: Record checked-out commit
+        id: head
+        if: steps.version.outputs.version != ''
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Find previous release tag
+        id: previous
+        if: steps.version.outputs.version != ''
+        run: |
+          tag=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Previous release tag: ${tag:-none}"
+
+      - name: Build changelog
+        if: steps.version.outputs.version != ''
+        # v6.3.0, pinned to a commit so an upstream tag move cannot change the
+        # code that runs here. Dependabot can bump this.
+        uses: mikepenz/release-changelog-builder-action@cb021f9b36a51a7c6f18e4679b6fa2cb77a1260c
+        with:
+          configuration: ${{ runner.temp }}/changelog-config.json
+          fromTag: ${{ steps.previous.outputs.tag }}
+          # The commit actually checked out, so the range matches the files the
+          # steps below read and the commit they push on top of.
+          toTag: ${{ steps.head.outputs.sha }}
+          outputFile: .github/changelog.generated.md
+          # Without this, a failed commit-comparison request (e.g. a bad tag or
+          # an API error) is treated as an empty result, and the "no pull
+          # requests" placeholder would be committed as if it were real.
+          failOnError: true
+          # Collect PRs from the compared commits rather than the bounded
+          # date-based search (200 PRs and 365 days by default).
+          fetchViaCommits: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update changelog
+        if: steps.version.outputs.version != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 "$RUNNER_TEMP/update_changelog.py" \
+            "$VERSION" \
+            .github/changelog.generated.md \
+            .github/CHANGELOG.md
+
+      - name: Commit changelog
+        id: commit
+        if: steps.version.outputs.version != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          REPOSITORY: ${{ github.repository }}
+          # Use the short-lived, repository-scoped token only for this step.
+          # Do not replace it with a broader or longer-lived credential.
+          # Its push does not trigger CI; the next step dispatches CI instead.
+          PUSH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Stage first: git diff without --cached ignores a changelog created for the first release.
+          git add .github/CHANGELOG.md
+          if git diff --cached --quiet -- .github/CHANGELOG.md; then
+            echo "::notice::CHANGELOG.md already has a section for $VERSION, nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Do not run hooks from the pull request checkout.
+          git -c core.hooksPath=/dev/null commit -m "Update CHANGELOG.md for version $VERSION"
+          # A plain (non-force) push only fast-forwards, so it fails rather than
+          # overwriting if someone pushed to the branch during this run. The
+          # token goes on the command line because the checkout persisted none;
+          # Actions masks the secret in the log.
+          git push "https://x-access-token:$PUSH_TOKEN@github.com/$REPOSITORY.git" "HEAD:refs/heads/$HEAD_REF"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run CI on the changelog commit
+        # release-on-approval.yml merges only once CI has passed on the head commit.
+        if: steps.commit.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: gh workflow run ci.yml --repo "$REPOSITORY" --ref "$HEAD_REF"
+
+      - name: Comment changelog on pull request
+        # Not gated on whether a commit was pushed: a rerun after an attempt that
+        # pushed but failed before commenting commits nothing, and must still
+        # comment. update_changelog.py always writes the comment body.
+        if: steps.version.outputs.version != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr comment "$PR_NUMBER" --body-file .github/changelog.generated.md
