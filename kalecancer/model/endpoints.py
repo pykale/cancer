@@ -204,7 +204,7 @@ class CoxEndpoint(BaseEndpoint):
 class ClassificationEndpoint(BaseEndpoint):
     """Class logits, trained with any torch-style classification loss.
 
-    Named ``ClassificationEndpoint`` to avoid clashing with the ``Classification`` target (ADR 0005, open questions).
+    Named ``ClassificationEndpoint`` to avoid clashing with the ``Classification`` target (ADR 0005 §10).
 
     Args:
         head: E.g. ``nn.Linear(in_dim, n_classes)``. Its output width must be the number of classes in the target,

@@ -129,7 +129,7 @@ class Pipeline(BaseEstimator):
         model: A ``Unimodal``, ``EarlyFusion``, ``IntermediateFusion`` or ``LateFusion`` model.
         transforms: sklearn transformers per table modality, fitted on the training patients only.
         optimizer: Called with parameter groups, e.g. ``functools.partial(torch.optim.AdamW, lr=1e-4)``.
-        batch_size: Patients per batch. For Cox heads the risk set of the loss is the batch.
+        batch_size: Patients per batch. For a Cox endpoint the risk set of the loss is the batch.
         drop_last: Drop the last, smaller training batch.
         max_epochs: Upper bound on training epochs.
         validation: An sklearn splitter with ``n_splits=1`` that carves validation patients out of the training

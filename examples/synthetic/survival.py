@@ -49,7 +49,7 @@ data = MultimodalDataset(
 print(data.summary())
 train, test = train_test_split(data, test_size=0.25, stratify=True, random_state=0)
 
-# 2. Model: stages for each modality, a fusion method, and a prediction head. Pipeline(random_state=...) seeds
+# 2. Model: encoders for each modality, a fusion method, and an endpoint. Pipeline(random_state=...) seeds
 # training, but the initial weights are drawn here, so seed them too.
 
 torch.manual_seed(0)

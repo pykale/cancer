@@ -54,7 +54,7 @@ The rules:
 Two base classes in `model/encode/base_encoders.py` add abilities. Subclass one only when you need it.
 
 **`FittedEncoder`**: fitted on the training patients before training starts, e.g. a PCA, a codebook or TabICL's
-context.
+context. It may only be the first encoder in a list, because the inputs of later encoders change as the encoder before them train. In `EarlyFusion` the fusion method runs before it, so the fusion method must have no trainable parameters; `fit` raises otherwise.
 
 ```python
 class Centre(FittedEncoder):
@@ -92,7 +92,7 @@ Export currently reads `(N_i,)` weights. Encoders before it must not change the 
 model = IntermediateFusion(
     encoders={"rna": [Scale(5), nn.Linear(5, 8)], "wsi": [ABMIL(1024, 256, 128, 0.25), nn.Linear(256, 8)]},
     fusion=Concat(),
-    head=CoxHead(in_dim=16, ties="efron"),
+    endpoint=CoxEndpoint(nn.Linear(16, 1, bias=False), ties="efron"),
 )
 ```
 

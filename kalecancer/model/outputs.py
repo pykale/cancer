@@ -11,8 +11,7 @@ types it scores; the one thing a type declares for every method that combines it
 (ADR 0005 §2).
 
 Convention: a field is per patient (indexed by ``select``, ``scatter`` and ``cat``) exactly when it is a ``Tensor``.
-Other fields, such as ``classes`` and ``baseline``, are shared by every row and copied by reference. ADR 0005 lists
-this as an open question.
+Other fields, such as ``classes`` and ``baseline``, are shared by every row and copied by reference.
 """
 
 from __future__ import annotations

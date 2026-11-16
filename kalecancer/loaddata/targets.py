@@ -41,7 +41,7 @@ class BaseTarget(ABC):
 
     @abstractmethod
     def tensors(self, ids: Iterable[str]) -> dict[str, Tensor]:
-        """The target for ``ids``, in that order, as the tensors the head's loss reads."""
+        """The target for ``ids``, in that order, as the tensors the endpoint's loss reads."""
 
     @abstractmethod
     def strata(self, ids: Sequence[str]) -> np.ndarray:

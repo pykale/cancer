@@ -207,6 +207,46 @@ def test_early_fusion_fits_and_runs_on_concatenated_rows_in_forward_order(cohort
     assert model(whole_batch(train)).risk.shape == (20,)
 
 
+class GatedConcat(Concat):
+    """Concat with a trainable gate, standing in for a trainable early fusion method."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, values, present):
+        return self.gate * super().forward(values, present)
+
+
+def test_early_fusion_refuses_a_trainable_fusion_method_before_a_fitted_encoder(cohort):
+    data = make_data(cohort, required=["clinical", "lab"], with_lab=True)
+    train = data.subset(data.ids[:20])
+
+    def model(fusion, first):
+        return EarlyFusion(
+            ["clinical", "lab"], fusion, [first, nn.Linear(5, 4)], CoxEndpoint(nn.Linear(4, 1, bias=False), "efron")
+        )
+
+    # the fitted encoder would be fitted on a fused input that training then changes
+    with pytest.raises(ValueError, match="GatedConcat has trainable parameters"):
+        model(GatedConcat(), RecordingEncoder()).fit(train)
+    # a frozen fusion method, or no fitted encoder, is fine; the fitting data carries no gradient
+    frozen = GatedConcat().requires_grad_(False)
+    recorder = RecordingEncoder()
+    model(frozen, recorder).fit(train)
+    assert not recorder.fit_x.requires_grad
+    model(GatedConcat(), nn.Identity()).fit(train)
+
+
+def test_models_load_training_inputs_only_for_a_fitted_first_encoder(cohort, monkeypatch):
+    data = make_data(cohort, required=["clinical", "wsi"])
+    loads = []
+    real = data.modalities["wsi"].tensors
+    monkeypatch.setattr(data.modalities["wsi"], "tensors", lambda ids: loads.append(len(ids)) or real(ids))
+    intermediate().fit(data)
+    assert loads == []
+
+
 def test_early_fusion_rejects_bag_modalities_at_check(cohort):
     model = EarlyFusion(
         ["clinical", "wsi"], Concat(), [nn.Linear(18, 4)], CoxEndpoint(nn.Linear(4, 1, bias=False), "efron")

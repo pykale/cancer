@@ -2,7 +2,7 @@
 
 Each metric declares the weakest output type it needs (``requires``), so a metric that cannot score a model is refused
 before training or prediction, not after. IPCW metrics also read the training target, from which they estimate the
-censoring distribution (ADR 0005 §8).
+censoring distribution.
 
 Survival metrics come from torchsurv and classification metrics from scikit-learn.
 """

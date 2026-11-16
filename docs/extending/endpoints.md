@@ -1,26 +1,24 @@
 # Adding an endpoint
 
-> **Work in progress.** Targets and heads haven't been refactored yet, so this interface will change. Heads have no
-> base class: models read `out_dim`, `target_type` and `decomposable_loss` with `getattr`, so nothing enforces the
-> table below. The `Pipeline` also fills `EvalContext.classes` only for `Classification` targets. Expect to adapt an
-> endpoint written against this guide.
+An endpoint is what a model predicts, such as survival or a class label. Adding one takes up to four pieces:
 
-An endpoint is what the model predicts, such as survival or a class label. It takes two classes: a target in
-`kalecancer/loaddata/targets.py` that holds the outcomes, and a head in `kalecancer/model/heads.py` that predicts them
-and owns the loss. The `Pipeline` and models stay as they are.
+| Piece | File | Job |
+| --- | --- | --- |
+| Target | `kalecancer/loaddata/targets.py` | holds the outcomes |
+| Output type | `kalecancer/model/outputs.py` | says what a prediction means; only needed if no existing type fits |
+| Endpoint | `kalecancer/model/endpoints.py` | wraps the head and the loss, and builds the output |
+| Metric | `kalecancer/evaluate/metrics.py` | scores the output; usually needed |
+
+The `Pipeline`, models and fusion methods don't change. The example below adds regression. The design is in
+[ADR 0005](../adr/0005-endpoint-architecture.md).
 
 ## 1. The target
 
-Subclass `BaseTarget`, check the outcomes in `__init__`, store them in `frame` (indexed by patient id), and implement
-three methods:
+Subclass `BaseTarget`, check the outcomes in `__init__`, and store them in `frame`, indexed by patient id:
 
 ```python
 class Continuous(BaseTarget):
-    """A real-valued outcome per patient.
-
-    Args:
-        values: The outcome per patient, finite.
-    """
+    """A real-valued outcome per patient."""
 
     def __init__(self, values: pd.Series):
         self.values = values
@@ -30,7 +28,10 @@ class Continuous(BaseTarget):
             raise ValueError(f"Continuous: {int((~np.isfinite(numeric)).sum())} values are missing or not finite")
         self.frame = pd.DataFrame({"value": numeric.astype(np.float32)}, index=ids)
 
-    def tensors(self, ids: Sequence[str]) -> dict[str, Tensor]:
+    def subset(self, ids: Iterable[str]) -> Continuous:
+        return Continuous(self[list(ids)]["value"])
+
+    def tensors(self, ids: Iterable[str]) -> dict[str, Tensor]:
         return {"value": torch.tensor(self.frame.loc[list(ids), "value"].to_numpy())}
 
     def strata(self, ids: Sequence[str]) -> np.ndarray:
@@ -40,77 +41,126 @@ class Continuous(BaseTarget):
         return {"patients": len(ids)}
 ```
 
-- **`frame`** holds the checked outcomes. Metrics score predictions against it, and `fit` keeps the training rows in
-  `train_target_`.
-- **`tensors(ids)`** returns the outcomes of `ids`, in that order, as the tensors the head's `loss` reads. Each batch
-  carries them as `batch["target"]`.
-- **`strata(ids)`** returns one discrete label per patient. Stratified splits and the validation carve use it, and a
-  `FittedEncoder` may read it as a label.
-- **`counts(ids)`** returns the summary counts that `data.summary()`, fit reports and cross-validation folds show.
-- **Reject missing outcomes** rather than guessing. `TimeToEvent` raises on a missing `event`, because an unknown
-  outcome isn't a censored one.
+| Method | Returns |
+| --- | --- |
+| `subset(ids)` | the same target for some patients, such as the training patients |
+| `tensors(ids)` | the outcomes as the tensors the endpoint's loss reads |
+| `strata(ids)` | one discrete label per patient, for stratified splits |
+| `counts(ids)` | summary counts for reports, such as the number of events |
 
-## 2. The head
+Reject missing outcomes rather than guessing: an unknown event is not a censored one.
 
-A head is an `nn.Module` that owns everything about the endpoint: its output, the prediction, the loss, the target
-check and the names of the prediction columns.
+## 2. The output type
+
+Reuse an existing type if it means what your endpoint predicts. For example, a ranking survival loss gives a
+`RiskScore`, which `HarrellC` already scores. Otherwise subclass `BaseOutput`:
 
 ```python
-class RegressionHead(nn.Module):
-    """Linear output trained with mean squared error."""
+@dataclass(kw_only=True)
+class PointPrediction(BaseOutput):
+    """A predicted value per patient, on the outcome's own scale."""
 
-    target_type: Final[type[Continuous]] = Continuous
-    decomposable_loss = True
+    value: Tensor  # (n,)
 
-    def __init__(self, in_dim: int):
-        super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = 1
-        self.linear = nn.Linear(in_dim, 1)
+    comparable_across_models = True  # on the outcome's scale whichever model gives it
 
-    def forward(self, z: Tensor) -> Tensor:
-        return self.linear(z)
+    def frame(self) -> pd.DataFrame:
+        return pd.DataFrame({"value": _detach_cpu(self.value).numpy()}, index=pd.Index(self.ids, name="id"))
+```
 
-    def predict(self, output: Tensor) -> Tensor:
-        return output
+- **Per-patient fields are tensors; shared fields aren't.** The base class indexes tensors by patient and copies
+  anything else, such as class names, as it is.
+- **Store raw values and compute views on demand**, as `ClassProbabilities` stores logits.
+- **Name the type after what it means**, not how it was trained.
+- **`comparable_across_models`** says whether outputs of different models share a scale. It is `False` by default,
+  as for risk scores.
+- **`frame()`** is what `Pipeline.predict` returns.
 
-    def columns(self, target: Continuous) -> list[str]:
-        return ["value"]
+## 3. The endpoint
+
+Subclass `BaseEndpoint`:
+
+```python
+class RegressionEndpoint(BaseEndpoint):
+    """A value per patient, trained with any torch-style regression loss, e.g. ``nn.MSELoss()``."""
+
+    output_type = PointPrediction
+    accepts = PointPrediction
+
+    def __init__(self, head: nn.Module | None, loss_fn: nn.Module, decomposable_loss: bool = False):
+        super().__init__(head)
+        self.loss_fn = loss_fn
+        self._decomposable_loss = decomposable_loss
+
+    @property
+    def decomposable_loss(self) -> bool:
+        return self._decomposable_loss
+
+    @property
+    def out_dim(self) -> int:
+        return 1
 
     def check_target(self, target: BaseTarget) -> None:
-        if not isinstance(target, self.target_type):
-            raise TypeError(f"RegressionHead needs a continuous target, got {type(target)}")
+        if not isinstance(target, Continuous):
+            raise TypeError(f"RegressionEndpoint needs a continuous target, got {type(target).__name__}")
 
-    def loss(self, output: Tensor, target: Mapping[str, Tensor]) -> Tensor | None:
-        with torch.autocast(device_type=output.device.type, enabled=False):
-            return F.mse_loss(output.float().reshape(-1), target["value"])
+    def to_output(self, raw: Tensor, ids: list[str], defined: Tensor) -> PointPrediction:
+        return PointPrediction(ids=ids, defined=defined, value=raw.reshape(-1))
+
+    def adopt(self, output: BaseOutput) -> PointPrediction:
+        assert isinstance(output, PointPrediction)
+        return PointPrediction(ids=output.ids, defined=output.defined, value=output.value)
+
+    def loss(self, output: BaseOutput, target: Mapping[str, Tensor]) -> Tensor | None:
+        assert isinstance(output, PointPrediction)
+        with torch.autocast(device_type=output.value.device.type, enabled=False):
+            return self.loss_fn(output.value.float(), target["value"])
 ```
 
 | Member | Contract |
 | --- | --- |
-| `target_type` | the target class it predicts. Late fusion methods read it from `FusionContext.head_kinds`. |
-| `out_dim` | the width of `forward`'s output. Patients with no prediction get a row of NaN of this width. |
-| `forward(z)` | the raw output (logits, log-hazards) from the fused `(n, in_dim)` embedding. |
-| `predict(output)` | the prediction, with one column per entry of `columns`. |
-| `columns(target)` | the names of the prediction columns, read from the target where needed (e.g. class order). |
-| `check_target(target)` | raises if the head can't train on this target. Accept `target_type` or a subclass. |
-| `loss(output, target)` | the loss of a batch, or `None` when the batch carries no signal. For Cox, that's a batch with no event that has anyone else at risk. The `Pipeline` skips such batches and reports them. |
-| `decomposable_loss` | `True` only if the loss is a mean over patients, so gradient accumulation reproduces a larger batch. Cox isn't: its risk set is the batch. |
+| `output_type` | the output type it produces |
+| `accepts` | the type it takes as the fused endpoint of a `LateFusion` model |
+| `out_dim` | the width of the head's output, which the dry run checks |
+| `check_target(target)` | raises if the endpoint can't train on this target |
+| `to_output(raw, ids, defined)` | builds the typed output of a batch |
+| `adopt(output)` | in `LateFusion`, turns the fusion method's output into this endpoint's output |
+| `loss(output, target)` | the loss of a batch, in float32; `None` if the batch has no signal |
+| `decomposable_loss` | whether the loss is a mean over patients, which gradient accumulation needs; `False` by default |
+| `bind(target)` | optional: takes what it needs from the training target, such as the class order |
+| `fit_state(output, target)` | optional: fits state after training, such as the Breslow baseline |
 
-Compute the loss in float32, outside autocast, as the stock heads do, so that mixed precision doesn't overflow it.
+- **Classification and regression take a `loss_fn=`**, so users can pick a loss without writing an endpoint.
+  **Survival endpoints are one class per family**, because there the loss defines what the output means: the Cox
+  partial likelihood is what makes a Breslow baseline valid.
+- **Name endpoints `<Family>Endpoint`**, to keep them apart from targets.
+- **Store each `__init__` argument under its own name** (or a property of that name), so configs can be saved.
+- **For late fusion**, a fusion method must know how to combine the new type: `MaskedMean`, for example, would need a
+  rule for averaging `PointPrediction`s (see [fusion.md](fusion.md)).
 
-## 3. Metrics
+## 4. The metric
 
-An endpoint usually needs a metric too. Subclass `Metric` in `kalecancer/evaluate/metrics.py`. Set
-`higher_is_better`, and implement `__call__(prediction, target, context)`: it scores the prediction frame against the
-target's `frame`, matched by patient id. Use scikit-learn or TorchSurv for the computation where they have it.
+Subclass `Metric`, declare `higher_is_better` and the output type it `requires`, and implement `score`:
+
+```python
+class MeanAbsoluteError(Metric):
+    higher_is_better = False
+    requires = PointPrediction
+
+    def score(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
+        assert isinstance(output, PointPrediction)
+        observed = _outcomes(output, target, Continuous, repr(self))["value"].to_numpy()
+        return float(np.abs(output.value.numpy() - observed).mean())
+```
+
+`_outcomes` returns the target rows in the output's order, and raises if a patient has no prediction. `train_target`
+holds the training patients' outcomes, which censoring-weighted survival metrics need and other metrics ignore.
 
 ## Checklist
 
-- [ ] The target is exported from `kalecancer/loaddata/__init__.py`, the head from `kalecancer/model/__init__.py`, and
-  any metric from `kalecancer/evaluate/__init__.py`.
-- [ ] Tests in `tests/test_loaddata.py` cover the target's checks, `tensors`, `strata` and `counts`. Tests in
-  `tests/test_model_components.py` cover the head's loss against a reference value, and `check_target`.
+- [ ] The target, output type, endpoint and metric are exported from their package's `__init__.py`.
+- [ ] Tests cover the target's checks and methods (`tests/test_loaddata.py`), and the endpoint's loss against a
+  reference value (`tests/test_model_components.py`).
 - [ ] A short `Pipeline.fit` and `evaluate` on synthetic data runs end to end.
-- [ ] The target and head tables in `docs/architecture.md` list them.
+- [ ] The tables in `docs/architecture.md` list them.
 - [ ] The [Conventions](../../CONTRIBUTING.md#conventions) are followed.

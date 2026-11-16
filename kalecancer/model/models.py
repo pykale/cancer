@@ -6,7 +6,7 @@ by a mask), and heads run on defined rows only. This keeps gradients finite when
 
 ``Unimodal``, ``EarlyFusion`` and ``IntermediateFusion`` end in one endpoint, which turns their embedding into a typed
 output. ``LateFusion`` combines the typed outputs of such models, and an optional endpoint of its own takes the fused
-output (ADR 0005 §4).
+output.
 
 Models never test for a particular fusion method, only for its interface (``TensorFusion`` or ``OutputFusion``). They
 ask the method's ``defined`` which patients it combines, and check themselves that it covers every patient they must
@@ -56,9 +56,16 @@ def _loader(source: Modality) -> Callable[[list[str]], Any]:
 def _fit_encoders(
     encoders: EncoderList, train: MultimodalDataset, ids: list[str], load: Callable[[list[str]], Any]
 ) -> None:
-    """Fit ``encoders`` on the rows ``load(ids)``, loading them only if its first encoder is fitted."""
+    """Fit ``encoders`` on the rows ``load(ids)``, loading them only if its first encoder is fitted.
+
+    The rows are loaded without gradients: they are the encoder's fitting data, not part of training.
+    """
+    if not encoders.needs_fit:
+        return
     assert train.target is not None, "fitting an encoder needs a dataset with a target"
-    encoders.fit(load(ids), train.target, ids)
+    with torch.no_grad():
+        x = load(ids)
+    encoders.fit(x, train.target, ids)
 
 
 def _fusion_stages(fusion: FusionMethod) -> str:
@@ -527,8 +534,19 @@ class EarlyFusion(SingleEndpointModel):
     def _fit_encoders(self, train: MultimodalDataset) -> None:
         """Fit the first encoder, if it is a ``FittedEncoder``.
 
-        It is fitted on the fused input of the training patients who have every modality.
+        It is fitted on the fused input of the training patients who have every modality. So the fusion method must
+        have no trainable parameters: training would change the fused input after the encoder was fitted on it.
+
+        Raises:
+            ValueError: If the first encoder is fitted and the fusion method has trainable parameters.
         """
+        if self.encoders.needs_fit and any(p.requires_grad for p in self.fusion.parameters()):
+            raise ValueError(
+                f"{type(self.encoders[0]).__name__} is fitted on the fused input before training, so the fusion "
+                f"method in front of it must not train, but {type(self.fusion).__name__} has trainable parameters. "
+                "Freeze them (requires_grad_(False)), or use IntermediateFusion, whose encoders see each modality's "
+                "own input"
+            )
         # the context is built from complete rows, fused exactly as forward fuses them
         ids = [pid for pid in train.ids if all(train.present.at[pid, name] for name in self.modalities)]
 
