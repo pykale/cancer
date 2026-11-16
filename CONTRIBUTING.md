@@ -48,7 +48,7 @@ Releases follow PyKale's process, with the steps maintainers did by hand for PyK
 1. Bump `__version__` in `kalecancer/__init__.py`, e.g. to `0.2.0` or `0.2.0rc1`, and open a pull request from a branch of this repository titled `Release 0.2.0`.
 2. `changelog.yml` collects the pull requests merged since the last tag, grouped by label, and commits the section to `.github/CHANGELOG.md` on the branch. Within each group the entries are sorted by pull request number, titles lose any `feat:`-style prefix and start with a capital letter, and earlier release pull requests are left out. It also posts the section as a comment and runs CI on the new commit.
 3. Review the section and edit it on the branch if needed. A rerun never overwrites an existing section.
-4. Approve the pull request. `release-on-approval.yml` waits for the checks, merges, creates the `v0.2.0` GitHub release with the changelog section as its notes, builds the package with `build-dist.yml` and publishes it: alpha, beta and release-candidate versions go to Test PyPI, the rest to PyPI.
+4. Approve the pull request. `release-on-approval.yml` waits for the checks, merges, creates the `v0.2.0` GitHub release with the changelog section as its notes, builds the package with `build-dist.yml` and publishes it: alpha, beta and release-candidate versions go to Test PyPI, the rest to PyPI. GitHub may hold the checks on the changelog commit until someone approves them. The release then waits: approve and run them from the pull request's checks, and it goes ahead once they pass.
 
 Only approvals from owners, members and collaborators, of the pull request's latest commit, start a release. If a check fails, fix it, push, and approve again.
 
