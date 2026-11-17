@@ -1,3 +1,13 @@
+# Version  0.1.0a2
+
+#### Bug Fixes
+
+* [#55](https://github.com/pykale/cancer/pull/55): Wait for release checks that need approval instead of failing
+
+#### Code Improvements
+
+* [#57](https://github.com/pykale/cancer/pull/57): Release hand-merged release pull requests and publish pre-releases to PyPI
+
 # Version  0.1.0a1
 
 #### New Features
