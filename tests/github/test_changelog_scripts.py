@@ -2,11 +2,13 @@
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / ".github" / "scripts"
@@ -579,6 +581,7 @@ def test_release_uses_trusted_scripts_and_checks_before_merging():
     assert "select(.merged == true) | .sha" in workflow
     order = [
         'release_notes.py" "$VERSION"',
+        'gh release view "v$VERSION"',
         "Wait for the other checks",
         "gh api -X PUT",
         "gh release create",
@@ -629,6 +632,108 @@ def test_approved_release_publishes_the_merge_commit():
     assert "ref: ${{ needs.merge-and-tag.outputs.sha }}" in workflow
     assert "if: needs.merge-and-tag.outputs.prerelease == 'true'" in workflow
     assert "if: needs.merge-and-tag.outputs.prerelease == 'false'" in workflow
+
+
+# Releasing a pull request a maintainer merged by hand before the approval run started
+
+APPROVED = "a" * 40
+LATER = "b" * 40
+MERGE_COMMIT = "c" * 40
+
+
+def workflow_step(name):
+    """Returns a step of the release-on-approval merge-and-tag job, found by its name."""
+    workflow = yaml.safe_load((WORKFLOWS / "release-on-approval.yml").read_text(encoding="utf-8"))
+    return next(step for step in workflow["jobs"]["merge-and-tag"]["steps"] if step["name"] == name)
+
+
+def run_step(tmp_path, name, gh, **env):
+    """Runs a workflow step's script with bash -e, as GitHub does, and with ``gh`` replaced by a shell function.
+
+    Args:
+        tmp_path (Path): The working directory, which also holds the step's output file.
+        name (str): The step's name.
+        gh (str): The body of the fake ``gh`` function.
+        **env (str): The step's environment.
+
+    Returns:
+        tuple[int, dict[str, str], str]: The exit status, the outputs the step wrote and its standard output.
+    """
+    script = f"gh() {{\n{gh}\n}}\n{workflow_step(name)['run']}"
+    environment = {**os.environ, "GITHUB_OUTPUT": "outputs", **env}
+    result = subprocess.run(
+        [shutil.which("bash"), "-e", "-c", script],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output_file = tmp_path / "outputs"
+    lines = output_file.read_text(encoding="utf-8").splitlines() if output_file.exists() else []
+    return result.returncode, dict(line.split("=", 1) for line in lines), result.stdout
+
+
+STATE_STEP = "Require approval of the pull request's latest commit"
+STATE_ENV = {"PR_NUMBER": "22", "REPOSITORY": "pykale/cancer", "HEAD_SHA": APPROVED}
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not installed")
+@pytest.mark.parametrize(
+    "state, head, merge_commit, reviewed, exit_code, outputs",
+    [
+        ("OPEN", APPROVED, "", APPROVED, 0, {"approved": "true"}),
+        # Merged by hand at the approved commit: released from the merge commit.
+        ("MERGED", APPROVED, MERGE_COMMIT, APPROVED, 0, {"merged_sha": MERGE_COMMIT, "approved": "true"}),
+        # Merged by hand after another push: that commit was never approved, so nothing is released.
+        ("MERGED", LATER, MERGE_COMMIT, APPROVED, 0, {}),
+        ("CLOSED", APPROVED, "", APPROVED, 0, {}),
+        # The head moved after the approval, or an older commit was approved.
+        ("OPEN", LATER, "", APPROVED, 1, {}),
+        ("OPEN", APPROVED, "", LATER, 1, {}),
+    ],
+)
+def test_release_state_accepts_only_the_approved_head(
+    tmp_path, state, head, merge_commit, reviewed, exit_code, outputs
+):
+    """Tests which pull request states start a release, including one merged by hand before the run started."""
+    gh = f"printf '%s\t%s\t%s\n' {state} {head} '{merge_commit}'"
+
+    status, written, _ = run_step(tmp_path, STATE_STEP, gh, REVIEWED_SHA=reviewed, **STATE_ENV)
+
+    assert (status, written) == (exit_code, outputs)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not installed")
+def test_release_state_fails_when_gh_fails(tmp_path):
+    """Tests that a failed pull request lookup fails the run instead of being read as an unapproved head."""
+    status, written, _ = run_step(tmp_path, STATE_STEP, "return 1", REVIEWED_SHA=APPROVED, **STATE_ENV)
+
+    assert status != 0
+    assert written == {}
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not installed")
+@pytest.mark.parametrize("released, outputs", [(True, {}), (False, {"version": "0.2.0"})])
+def test_release_stops_when_the_version_is_already_released(tmp_path, released, outputs):
+    """Tests that a second approval of a released pull request stops before merging or releasing again."""
+    gh = f'[ "$*" = "release view v0.2.0 --repo pykale/cancer" ] && return {0 if released else 1}; return 99'
+
+    status, written, _ = run_step(
+        tmp_path, "Stop if this version is already released", gh, VERSION="0.2.0", REPOSITORY="pykale/cancer"
+    )
+
+    assert (status, written) == (0, outputs)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not installed")
+def test_hand_merged_release_uses_the_merge_commit_without_merging(tmp_path):
+    """Tests that a pull request merged by hand is released from its merge commit, with no second merge."""
+    status, written, _ = run_step(
+        tmp_path, "Merge the release pull request", "return 99", MERGED_SHA=MERGE_COMMIT, **STATE_ENV
+    )
+
+    assert (status, written) == (0, {"sha": MERGE_COMMIT})
 
 
 def test_changelog_commit_runs_ci():
