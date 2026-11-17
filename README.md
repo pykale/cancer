@@ -32,19 +32,21 @@ See [architecture](docs/architecture.md) for more details.
 
 KaleCancer supports Python 3.11 or 3.12.
 
-Install `kalecancer` with [uv](https://docs.astral.sh/uv/) into your own project:
+Install `kalecancer` from [PyPI](https://pypi.org/project/kalecancer/) with [uv](https://docs.astral.sh/uv/) into your own project:
 
 ```bash
-uv add "kalecancer @ git+https://github.com/pykale/cancer.git"
+uv add kalecancer
 ```
 
 Or with pip:
 
 ```bash
-pip install "git+https://github.com/pykale/cancer.git"
+pip install kalecancer
 ```
 
-Heavy libraries are kept out of the core install and grouped into extras, so that a pathology workflow does not pull in a radiology stack. Add one with `--extra <name>` in uv, or `".[<name>]"` in pip:
+KaleCancer is in alpha. Once a final release is out, a newer alpha needs `--prerelease allow` in uv or `--pre` in pip. To install the development version from GitHub instead, use `uv add "kalecancer @ git+https://github.com/pykale/cancer.git"` or `pip install "git+https://github.com/pykale/cancer.git"`.
+
+Heavy libraries are kept out of the core install and grouped into extras, so that a pathology workflow does not pull in a radiology stack. Add one with `uv add "kalecancer[<name>]"` or `pip install "kalecancer[<name>]"`:
 
 | Extra | Packages | When to use |
 | --- | --- | --- |
