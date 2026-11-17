@@ -596,15 +596,16 @@ def test_release_workflows_use_trusted_publishing(name):
     """Tests that both release paths build through build-dist.yml and publish from a top-level job without tokens.
 
     Trusted publishing cannot run inside a reusable workflow, so the publish jobs must be in the workflow files that
-    pypi.org and test.pypi.org trust, each with id-token: write and the environment configured there.
+    pypi.org trusts, with id-token: write and the environment configured there. Pre-releases go to PyPI too.
     """
     workflow = (WORKFLOWS / name).read_text(encoding="utf-8")
 
     assert "uses: ./.github/workflows/build-dist.yml" in workflow
-    assert workflow.count("id-token: write") == 2
-    assert workflow.count("uses: pypa/gh-action-pypi-publish@release/v1") == 2
-    assert "name: testpypi" in workflow and "repository-url: https://test.pypi.org/legacy/" in workflow
+    assert workflow.count("id-token: write") == 1
+    assert workflow.count("uses: pypa/gh-action-pypi-publish@release/v1") == 1
     assert "name: pypi" in workflow
+    assert "test.pypi.org" not in workflow and "testpypi" not in workflow
+    assert "prerelease ==" not in workflow and "release.prerelease" not in workflow
     assert "password:" not in workflow and "PYPI_API_TOKEN" not in workflow
     assert "secrets: inherit" not in workflow
 
@@ -626,12 +627,12 @@ def test_build_workflow_only_builds():
 
 
 def test_approved_release_publishes_the_merge_commit():
-    """Tests that the approval workflow builds the merge commit and picks the index from the version."""
+    """Tests that the approval workflow builds and publishes the merge commit, marking a/b/rc versions as pre-releases."""
     workflow = (WORKFLOWS / "release-on-approval.yml").read_text(encoding="utf-8")
 
     assert "ref: ${{ needs.merge-and-tag.outputs.sha }}" in workflow
-    assert "if: needs.merge-and-tag.outputs.prerelease == 'true'" in workflow
-    assert "if: needs.merge-and-tag.outputs.prerelease == 'false'" in workflow
+    assert "if: needs.merge-and-tag.outputs.sha != ''" in workflow
+    assert "flags+=(--prerelease)" in workflow
 
 
 # Releasing a pull request a maintainer merged by hand before the approval run started

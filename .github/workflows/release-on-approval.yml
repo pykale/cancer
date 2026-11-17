@@ -5,16 +5,15 @@
 #   2. changelog.yml writes the formatted changelog section to .github/CHANGELOG.md on that branch and runs CI.
 #   3. A maintainer reviews the changelog and approves the pull request.
 #   4. This workflow waits for the checks, merges, tags vX.Y.Z with the changelog section as release notes, builds
-#      the distribution with build-dist.yml and publishes it: X.Y.ZaN, bN and rcN versions to Test PyPI, others to
-#      PyPI. If a maintainer merges the approved pull request by hand before the run gets there, the run releases
-#      that merge commit instead, unless the version is already released.
+#      the distribution with build-dist.yml and publishes it to PyPI. X.Y.ZaN, bN and rcN versions are marked as
+#      pre-releases on GitHub; PyPI marks them itself. If a maintainer merges the approved pull request by hand
+#      before the run gets there, the run releases that merge commit instead, unless the version is already released.
 #
 # Everything happens in one run because merges and releases made with GITHUB_TOKEN do not trigger other workflows,
 # so GitHub's own auto-merge followed by a separate "release" workflow would never publish.
 #
-# Publishing uses PyPI trusted publishing: pypi.org and test.pypi.org trust this workflow file and its GitHub
-# environment, so no API token is stored. The publish jobs are in this file because trusted publishing cannot run
-# inside a reusable workflow.
+# Publishing uses PyPI trusted publishing: pypi.org trusts this workflow file and its GitHub environment, so no API
+# token is stored. The publish job is in this file because trusted publishing cannot run inside a reusable workflow.
 #
 # Trust: GitHub runs this review-triggered workflow from the default branch. It only acts on same-repository pull
 # requests approved at their latest commit by an owner, member or collaborator; scripts come from the base commit.
@@ -52,7 +51,6 @@ jobs:
       actions: read
     outputs:
       version: ${{ steps.version.outputs.version }}
-      prerelease: ${{ steps.release.outputs.prerelease }}
       sha: ${{ steps.merge.outputs.sha }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -196,7 +194,6 @@ jobs:
           if [[ "$VERSION" =~ (a|b|rc)[0-9]+$ ]]; then
             prerelease=true
           fi
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           flags=()
           if [ "$prerelease" = true ]; then
             flags+=(--prerelease)
@@ -214,29 +211,10 @@ jobs:
     with:
       ref: ${{ needs.merge-and-tag.outputs.sha }}
 
-  publish-testpypi:
-    name: Publish distribution to Test PyPI
-    needs: [merge-and-tag, build]
-    if: needs.merge-and-tag.outputs.prerelease == 'true'
-    runs-on: ubuntu-latest
-    environment:
-      name: testpypi
-      url: https://test.pypi.org/p/kalecancer
-    permissions:
-      id-token: write # mandatory for trusted publishing
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          repository-url: https://test.pypi.org/legacy/
-
   publish-pypi:
     name: Publish distribution to PyPI
     needs: [merge-and-tag, build]
-    if: needs.merge-and-tag.outputs.prerelease == 'false'
+    if: needs.merge-and-tag.outputs.sha != ''
     runs-on: ubuntu-latest
     environment:
       name: pypi
