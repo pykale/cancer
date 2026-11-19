@@ -52,7 +52,7 @@ jobs:
       contains(github.event.pull_request.title, 'release')
     steps:
       - name: Checkout pull request branch
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Check out the current tip of the branch, not the event's head.sha:
           # "Re-run jobs" replays the original event, whose head.sha predates a
@@ -70,7 +70,7 @@ jobs:
       # The PR workflow itself remains editable by same-repository contributors;
       # this is not isolation from contributors who can change the workflow.
       - name: Checkout changelog files from the base commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: trusted-base
