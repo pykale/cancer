@@ -64,7 +64,7 @@ class WeightedMean(OutputFusion):
         total, norm = 0.0, 0.0
         for name, out in branches.items():
             mask, w = present[name].unsqueeze(-1), weights[self.branches.index(name)]
-            total = total + torch.where(mask, w * out.logits, 0.0)
+            total = total + w * torch.where(mask, out.logits, 0.0)
             norm = norm + w * mask
         logits = total / norm
         return ClassProbabilities(ids=first.ids, defined=_everyone(first, logits), logits=logits, classes=first.classes)
