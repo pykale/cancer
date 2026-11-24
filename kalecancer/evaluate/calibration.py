@@ -23,8 +23,13 @@ from kalecancer.model.outputs import BaseOutput, SurvivalFunction
 def _check_times(times: Sequence[float], what: str) -> list[float]:
     """``times`` as floats, after checking there is at least one and they strictly increase."""
     checked = [float(t) for t in times]
-    if not checked or any(b <= a for a, b in zip(checked, checked[1:], strict=False)):
-        raise ValueError(f"{what} needs at least one time, strictly increasing, got {times!r}")
+    if (
+        not checked
+        or not np.isfinite(checked).all()
+        or any(t < 0 for t in checked)
+        or any(b <= a for a, b in zip(checked, checked[1:], strict=False))
+    ):
+        raise ValueError(f"{what} needs finite times >= 0, strictly increasing, got {times!r}")
     return checked
 
 
