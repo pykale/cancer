@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -300,6 +302,22 @@ def test_late_fusion_cox_masked_mean_needs_complete_branches(cohort):
     with pytest.raises(ValueError, match="arbitrary offset"):
         late(MaskedMean(), task="survival").check(make_data(cohort, required=["clinical"]))
     late(MaskedMean(), task="survival").check(make_data(cohort, required=["clinical", "wsi"]))
+
+
+def test_late_fusion_rejects_branch_predicting_for_none(tmp_path):
+    # no patient has slides: the wsi branch predicts for nobody, fits nothing, and would later fail
+    # (e.g. Breslow baseline fit on zero patients) with an unclear error -> fail early in check instead
+    ids = [f"{k:03d}" for k in range(1, 11)]
+    clinical = pd.DataFrame(
+        {"age": np.full(10, 60.0), "sex": ["female"] * 10, "smoking": ["never"] * 10},
+        index=pd.Index(ids, name="patient_id"),
+    )
+    wsi_files = pd.Series([], dtype=object, index=pd.Index([], name="id"))
+    labels = pd.Series(["low"] * 10, index=pd.Index(ids, name="patient_id"))
+    cohort = SimpleNamespace(ids=ids, clinical=clinical, wsi_files=wsi_files, labels=labels)
+    data = make_data(cohort, required=["clinical"], task="classification")
+    with pytest.raises(ValueError, match="the following branches predict"):
+        late(MaskedMean(), task="classification").check(data)
 
 
 def test_the_fused_output_type_comes_from_the_fusion_method_or_the_endpoint():
