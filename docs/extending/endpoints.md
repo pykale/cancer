@@ -9,8 +9,7 @@ An endpoint is what a model predicts, such as survival or a class label. Adding 
 | Endpoint | `kalecancer/model/endpoints.py` | wraps the head and the loss, and builds the output |
 | Metric | `kalecancer/evaluate/metrics.py` | scores the output; usually needed |
 
-The `Pipeline`, models and fusion methods don't change. The example below adds regression. The design is in
-[ADR 0005](../adr/0005-endpoint-architecture.md).
+The `Pipeline`, models and fusion methods don't change. The example below adds regression. The design is in [ADR 0005](../adr/0005-endpoint-architecture.md).
 
 ## 1. The target
 
@@ -52,8 +51,7 @@ Reject missing outcomes rather than guessing: an unknown event is not a censored
 
 ## 2. The output type
 
-Reuse an existing type if it means what your endpoint predicts. For example, a ranking survival loss gives a
-`RiskScore`, which `HarrellC` already scores. Otherwise subclass `BaseOutput`:
+Reuse an existing type if it means what your endpoint predicts. For example, a ranking survival loss gives a `RiskScore`, which `HarrellC` already scores. Otherwise subclass `BaseOutput`:
 
 ```python
 @dataclass(kw_only=True)
@@ -68,12 +66,10 @@ class PointPrediction(BaseOutput):
         return pd.DataFrame({"value": _detach_cpu(self.value).numpy()}, index=pd.Index(self.ids, name="id"))
 ```
 
-- **Per-patient fields are tensors; shared fields aren't.** The base class indexes tensors by patient and copies
-  anything else, such as class names, as it is.
+- **Per-patient fields are tensors; shared fields aren't.** The base class indexes tensors by patient and copies anything else, such as class names, as it is.
 - **Store raw values and compute views on demand**, as `ClassProbabilities` stores logits.
 - **Name the type after what it means**, not how it was trained.
-- **`comparable_across_models`** says whether outputs of different models share a scale. It is `False` by default,
-  as for risk scores.
+- **`comparable_across_models`** says whether outputs of different models share a scale. It is `False` by default, as for risk scores.
 - **`frame()`** is what `Pipeline.predict` returns.
 
 ## 3. The endpoint
@@ -130,13 +126,10 @@ class RegressionEndpoint(BaseEndpoint):
 | `bind(target)` | optional: takes what it needs from the training target, such as the class order |
 | `fit_state(output, target)` | optional: fits state after training, such as the Breslow baseline |
 
-- **Classification and regression take a `loss_fn=`**, so users can pick a loss without writing an endpoint.
-  **Survival endpoints are one class per family**, because there the loss defines what the output means: the Cox
-  partial likelihood is what makes a Breslow baseline valid.
+- **Classification and regression take a `loss_fn=`**, so users can pick a loss without writing an endpoint. **Survival endpoints are one class per family**, because there the loss defines what the output means: the Cox partial likelihood is what makes a Breslow baseline valid.
 - **Name endpoints `<Family>Endpoint`**, to keep them apart from targets.
 - **Store each `__init__` argument under its own name** (or a property of that name), so configs can be saved.
-- **For late fusion**, a fusion method must know how to combine the new type: `MaskedMean`, for example, would need a
-  rule for averaging `PointPrediction`s (see [fusion.md](fusion.md)).
+- **For late fusion**, a fusion method must know how to combine the new type: `MaskedMean`, for example, would need a rule for averaging `PointPrediction`s (see [fusion.md](fusion.md)).
 
 ## 4. The metric
 
@@ -153,14 +146,12 @@ class MeanAbsoluteError(Metric):
         return float(np.abs(output.value.numpy() - observed).mean())
 ```
 
-`_outcomes` returns the target rows in the output's order, and raises if a patient has no prediction. `train_target`
-holds the training patients' outcomes, which censoring-weighted survival metrics need and other metrics ignore.
+`_outcomes` returns the target rows in the output's order, and raises if a patient has no prediction. `train_target` holds the training patients' outcomes, which censoring-weighted survival metrics need and other metrics ignore.
 
 ## Checklist
 
 - [ ] The target, output type, endpoint and metric are exported from their package's `__init__.py`.
-- [ ] Tests cover the target's checks and methods (`tests/test_loaddata.py`), and the endpoint's loss against a
-  reference value (`tests/test_model_components.py`).
+- [ ] Tests cover the target's checks and methods (`tests/loaddata/test_loaddata.py`), and the endpoint's loss against a reference value (`tests/model/test_model_components.py`).
 - [ ] A short `Pipeline.fit` and `evaluate` on synthetic data runs end to end.
 - [ ] The tables in `docs/architecture.md` list them.
 - [ ] The [Conventions](../../CONTRIBUTING.md#conventions) are followed.

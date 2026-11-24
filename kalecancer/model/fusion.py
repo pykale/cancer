@@ -16,11 +16,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Literal, cast, overload
+from typing import ClassVar, Literal, cast, overload
 
 import pandas as pd
 import torch
-import torch.nn.functional as F
+from kale.embed.multimodal_fusion import MajorityVote as _KaleMajorityVote
+from kale.embed.multimodal_fusion import MaskedMean as _KaleMaskedMean
+from kale.embed.multimodal_fusion import NamedInputConcat as _KaleNamedInputConcat
+from kale.embed.multimodal_fusion import masked_mean as _kale_masked_mean
+from kale.embed.multimodal_fusion import stack_present as _kale_stack_present
 from torch import Tensor, nn
 
 from kalecancer.model.outputs import BaseOutput, ClassProbabilities, OutputT, RiskScore, VoteScores
@@ -33,18 +37,31 @@ def _check_one_width(method: FusionMethod, widths: Mapping[str, int]) -> None:
 
 
 def _stack_defined(values: Mapping[str, Tensor], defined: Mapping[str, Tensor]) -> tuple[Tensor, Tensor]:
-    """Stack the inputs into ``(n_inputs, n, d)`` values and an ``(n_inputs, n)`` presence mask."""
-    stacked = torch.stack([values[name] for name in values])
-    mask = torch.stack([defined[name] for name in values])
-    return stacked, mask
+    """Stack named inputs and match their presence masks by name.
+
+    Args:
+        values: Floating ``(n, d)`` tensors in input order. Entirely absent inputs may be omitted.
+        defined: Boolean ``(n,)`` masks keyed by input name.
+
+    Returns:
+        Values shaped ``(n_inputs, n, d)`` and boolean masks shaped ``(n_inputs, n)``.
+    """
+    # preserve the helper used by existing custom fusion methods
+    return _kale_stack_present(values, defined)
 
 
 def _masked_mean(stacked: Tensor, mask: Tensor) -> Tensor:
-    """Mean of each row over the inputs it has; 0 for a row that has none."""
-    # where() rather than multiplication: absent rows hold NaN, and NaN * 0 is NaN
-    filled = torch.where(mask.unsqueeze(-1), stacked, torch.zeros((), dtype=stacked.dtype, device=stacked.device))
-    count = mask.sum(dim=0).clamp(min=1).unsqueeze(-1).to(stacked.dtype)
-    return filled.sum(dim=0) / count
+    """Average available inputs without propagating absent NaNs.
+
+    Args:
+        stacked: Floating values shaped ``(n_inputs, n, d)``.
+        mask: Boolean availability shaped ``(n_inputs, n)``.
+
+    Returns:
+        Means shaped ``(n, d)`` with the input dtype and device; zero for rows with no inputs.
+        Absent entries have zero gradient. Half-precision inputs accumulate in float32.
+    """
+    return _kale_masked_mean(stacked, mask)
 
 
 class FusionMethod(nn.Module, ABC):
@@ -54,6 +71,10 @@ class FusionMethod(nn.Module, ABC):
     fusion), or both, and subclasses those rather than this class: no model takes a bare ``FusionMethod``. The model
     checks that every patient it must predict for is ``defined``, so a method cannot skip that rule.
     """
+
+    # the PyKale operations that methods borrow read this; models validate in the dry run and pass ``forward`` only
+    # defined rows, so skip PyKale's per-batch checks
+    validate_inputs: ClassVar[bool] = False
 
     @abstractmethod
     def defined(self, present: Tensor) -> Tensor:
@@ -91,7 +112,7 @@ class TensorFusion(FusionMethod):
             present: ``(n,)`` bool for every input, ``True`` where the row has it.
 
         Returns:
-            An ``(n, d')`` tensor.
+            A floating ``(n, d')`` tensor on the input device.
         """
 
 
@@ -167,13 +188,9 @@ class Concat(TensorFusion):
     Not for late fusion: concatenated branch outputs are not a prediction.
     """
 
-    def defined(self, present: Tensor) -> Tensor:
-        """The patients who have every input."""
-        return present.all(dim=1)
-
-    def forward(self, values: Mapping[str, Tensor], present: Mapping[str, Tensor]) -> Tensor:
-        """Concatenate the inputs along the feature dimension, in input order."""
-        return torch.cat([values[name] for name in values], dim=-1)
+    # borrow PyKale's stateless operations, which pass raw NaN cells through to encoders that handle them
+    defined = _KaleNamedInputConcat.defined
+    forward = _KaleNamedInputConcat.forward
 
 
 class MaskedMean(TensorFusion, OutputFusion):
@@ -182,12 +199,11 @@ class MaskedMean(TensorFusion, OutputFusion):
     In late fusion it averages the branches' risk scores, giving a ``RiskScore``, or their logits, giving
     ``ClassProbabilities``. An average of Cox log-hazards is a ``RiskScore`` with no baseline, because each branch's
     baseline belongs to its own log-hazards; a fused endpoint such as ``CoxEndpoint`` fits one for it. Averaging logits
-    rather than probabilities takes the normalised geometric mean of the branches' probabilities.
+    rather than probabilities takes the normalised geometric mean of the branches' probabilities. Float16 and bfloat16
+    inputs accumulate in float32 before returning the input dtype.
     """
 
-    def defined(self, present: Tensor) -> Tensor:
-        """The patients who have at least one input."""
-        return present.any(dim=1)
+    defined = _KaleMaskedMean.defined
 
     def check_widths(self, widths: Mapping[str, int]) -> None:
         """Inputs must have one width."""
@@ -229,7 +245,7 @@ class MaskedMean(TensorFusion, OutputFusion):
         if first is None:
             raise ValueError("MaskedMean needs at least one input")
         if isinstance(first, Tensor):
-            return _masked_mean(*_stack_defined(cast(Mapping[str, Tensor], values), present))
+            return _KaleMaskedMean.forward(self, cast(Mapping[str, Tensor], values), present)  # type: ignore[arg-type]
         return self._average_outputs(cast(Mapping[str, BaseOutput], values), present)
 
     def _average_outputs(self, outputs: Mapping[str, BaseOutput], present: Mapping[str, Tensor]) -> BaseOutput:
@@ -256,20 +272,19 @@ class MajorityVote(OutputFusion):
     Scores are ``(votes_c + 0.5 * mean_probability_c) / (n_branches + 0.5)``: they sum to 1, their argmax is the
     majority class, and ties between classes with equal votes are broken by mean probability. The probability
     term can never outweigh a whole vote.
+    Scores are not calibrated probabilities. float32 and float64 inputs retain their dtype.
 
     Args:
         tie_break: ``"mean_probability"`` breaks ties as above. ``"error"`` raises when a patient's votes are tied.
     """
 
-    def __init__(self, tie_break: Literal["mean_probability", "error"]):
+    def __init__(self, tie_break: Literal["mean_probability", "error"]) -> None:
         super().__init__()
         if tie_break not in ("mean_probability", "error"):
             raise ValueError(f"tie_break must be 'mean_probability' or 'error', got {tie_break!r}")
         self.tie_break = tie_break
 
-    def defined(self, present: Tensor) -> Tensor:
-        """The patients who have at least one input."""
-        return present.any(dim=1)
+    defined = _KaleMajorityVote.defined
 
     def output_type(self, input_types: Mapping[str, type[BaseOutput]]) -> type[BaseOutput]:
         """``VoteScores``: vote scores are not probabilities. The branches must output class probabilities."""
@@ -282,15 +297,6 @@ class MajorityVote(OutputFusion):
         """Score each class from the votes of the branches each row has; with ``tie_break="error"``, raise on a tie."""
         branches = _as(values, ClassProbabilities)
         first = next(iter(branches.values()))
-        stacked, mask = _stack_defined({name: out.probabilities for name, out in branches.items()}, present)
-        n_classes = stacked.shape[-1]
-        choice = torch.nan_to_num(stacked, nan=-1.0).argmax(dim=-1)
-        votes = (F.one_hot(choice, n_classes).to(stacked.dtype) * mask.unsqueeze(-1)).sum(dim=0)
-        n_branches = mask.sum(dim=0).to(stacked.dtype).unsqueeze(-1)
-        if self.tie_break == "error":
-            top = votes.max(dim=-1, keepdim=True).values
-            tied = ((votes == top).sum(dim=-1) > 1) & (n_branches.squeeze(-1) > 0)
-            if bool(tied.any()):
-                raise ValueError(f"MajorityVote: {int(tied.sum())} patients have tied votes and tie_break='error'")
-        scores = (votes + 0.5 * _masked_mean(stacked, mask)) / (n_branches + 0.5)
+        probabilities = {name: out.probabilities for name, out in branches.items()}
+        scores = _KaleMajorityVote.forward(self, probabilities, present)  # type: ignore[arg-type]
         return VoteScores(ids=first.ids, defined=_everyone(first, scores), votes=scores, classes=first.classes)

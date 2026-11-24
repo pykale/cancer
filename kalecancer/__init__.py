@@ -10,4 +10,4 @@ Import from the subpackages:
 - ``kalecancer.interpret``
 """
 
-__version__ = "0.1.0a0"
+__version__ = "0.1.0a2"

@@ -4,7 +4,7 @@ Each metric declares the weakest output type it needs (``requires``), so a metri
 before training or prediction, not after. IPCW metrics also read the training target, from which they estimate the
 censoring distribution.
 
-Survival metrics come from torchsurv and classification metrics from scikit-learn.
+Survival metrics come from torchsurv, and classification metrics from PyKale and scikit-learn.
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ from typing import ClassVar
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+from kale.evaluate.classification_metrics import roc_auc as _kale_roc_auc
+from sklearn.metrics import balanced_accuracy_score
 
 from kalecancer.loaddata.targets import BaseTarget, Classification, TimeToEvent
 from kalecancer.model.outputs import BaseOutput, ClassScores, RiskScore, SurvivalFunction
@@ -272,6 +273,118 @@ class IntegratedBrier(Metric):
         return float(brier.integral())
 
 
+def _quantile_groups(values: np.ndarray, n_groups: int) -> np.ndarray:
+    """Assign each value to one of ``n_groups`` equal-sized quantile groups: 0 the lowest, ``n_groups - 1`` highest.
+
+    Unique cuts are not enough to guarantee every group gets a member: e.g. ``[0, 1, 1, 2]`` with ``n_groups=4``
+    gives distinct edges but codes ``[0, 1, 1, 3]`` -- group 2 is empty, because the two tied ``1``s both land in
+    the same bin rather than splitting across the one edge between them. Checked here, after assigning codes,
+    rather than left for a caller to discover when it tries to estimate something (survival, a group mean) over
+    an empty group.
+
+    Raises:
+        ValueError: If ``n_groups < 2``, if the quantile cuts are not unique, or if a cut leaves one of the
+            ``n_groups`` groups with no members -- both mean the values are too heavily tied to form that many
+            distinct, non-empty groups.
+    """
+    if n_groups < 2:
+        raise ValueError(f"n_groups must be at least 2, got {n_groups}")
+    edges = np.quantile(values, np.linspace(0.0, 1.0, n_groups + 1))
+    if np.unique(edges).size != edges.size:
+        raise ValueError(
+            f"cannot form {n_groups} risk groups: quantile cuts are not unique among {values.size} values "
+            f"({np.unique(values).size} distinct) -- they are too heavily tied"
+        )
+    codes = np.clip(np.digitize(values, edges[1:-1], right=True), 0, n_groups - 1)
+    empty = np.flatnonzero(np.bincount(codes, minlength=n_groups) == 0)
+    if empty.size:
+        raise ValueError(
+            f"cannot form {n_groups} risk groups: group(s) {empty.tolist()} would be empty among {values.size} "
+            f"values ({np.unique(values).size} distinct) -- they are too heavily tied"
+        )
+    return codes
+
+
+def _log_rank_statistic(time: np.ndarray, event: np.ndarray, group: np.ndarray, n_groups: int) -> float:
+    """Mantel-Cox chi-square statistic across groups -- the same statistic ``sksurv.compare.compare_survival`` computes.
+
+    Observed minus expected events per group at each distinct event time, with the hypergeometric
+    variance-covariance, reduced to a quadratic form over ``n_groups - 1`` groups (the last is linearly dependent
+    on the others).
+    """
+    distinct_times, inverse = np.unique(time, return_inverse=True)
+    n_times = distinct_times.shape[0]
+
+    count_at_time = np.zeros((n_times, n_groups))
+    np.add.at(count_at_time, (inverse, group), 1.0)
+    events_at_time = np.zeros((n_times, n_groups))
+    at_event = event.astype(bool)
+    np.add.at(events_at_time, (inverse[at_event], group[at_event]), 1.0)
+
+    total_per_group = count_at_time.sum(axis=0)
+    left_before = np.vstack([np.zeros((1, n_groups)), np.cumsum(count_at_time, axis=0)[:-1]])
+    at_risk = total_per_group - left_before  # (n_times, n_groups): n_g at each distinct time
+
+    n_j = at_risk.sum(axis=1)
+    d_j = events_at_time.sum(axis=1)
+
+    observed = events_at_time.sum(axis=0)
+    safe_n_j = np.where(n_j > 0, n_j, 1.0)
+    expected = (at_risk * (d_j / safe_n_j)[:, None]).sum(axis=0)
+
+    has_variance = n_j > 1
+    factor = np.zeros(n_times)
+    factor[has_variance] = (d_j[has_variance] * (n_j[has_variance] - d_j[has_variance])) / (
+        (n_j[has_variance] - 1) * n_j[has_variance] ** 2
+    )
+    weighted_at_risk = at_risk * factor[:, None]
+    covariance = np.diag((weighted_at_risk * n_j[:, None]).sum(axis=0)) - weighted_at_risk.T @ at_risk
+
+    diff = (observed - expected)[:-1]
+    try:
+        return float(diff @ np.linalg.solve(covariance[:-1, :-1], diff))
+    except np.linalg.LinAlgError:
+        return float("nan")
+
+
+class LogRank(Metric):
+    """Mantel-Cox log-rank statistic across risk-quantile groups of the risk scores.
+
+    Splits patients into ``n_groups`` equal-sized quantile groups by risk score (2 is a median split, 3
+    tertiles, 4 quartiles) and computes the Mantel-Cox chi-square statistic for a difference in survival across
+    them -- the standard log-rank test, generalised beyond two groups.
+
+    A larger statistic means more separation between the groups' survival curves, which is why
+    ``higher_is_better = True``; a p-value would invert that meaning, since a SMALLER p-value means more separation.
+    If the p-value itself is wanted: ``scipy.stats.chi2.sf(statistic, n_groups - 1)``.
+
+    This measures SEPARATION between risk groups, not calibration (how close predicted and observed survival are --
+    see ``IntegratedBrier``) or ranking accuracy (see ``HarrellC``, ``UnoC``).
+    """
+
+    higher_is_better = True
+    requires = RiskScore
+
+    def __init__(self, n_groups: int = 2):
+        self.n_groups = n_groups
+
+    def score(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
+        """The Mantel-Cox chi-square statistic across ``n_groups`` quantile groups of the risk scores."""
+        risk, event, time = _survival_inputs(self, output, target)
+        group = _quantile_groups(risk.numpy().astype(np.float64), self.n_groups)
+        event_arr = event.numpy()
+        time_arr = time.numpy().astype(np.float64)
+
+        if not event_arr.any():
+            raise ValueError(f"{self!r} is undefined: no observed event among the evaluated patients")
+        occupied = np.bincount(group, minlength=self.n_groups)
+        if np.count_nonzero(occupied) < 2:
+            raise ValueError(f"{self!r} is undefined: fewer than two non-empty risk groups to compare")
+
+        statistic = _log_rank_statistic(time_arr, event_arr, group, self.n_groups)
+        return _defined(statistic, f"{self!r} is undefined: the group covariance is singular")
+
+
 def _classification_inputs(metric: Metric, output: BaseOutput, target: BaseTarget) -> tuple[np.ndarray, np.ndarray]:
     """Class scores in the output's class order and labels, both in the output's patient order."""
     assert isinstance(output, ClassScores), "__call__ checked the output type"
@@ -306,7 +419,7 @@ class AUROC(Metric):
         positive = labels == self.positive_class
         if positive.all() or not positive.any():
             raise ValueError(f"{self!r} is undefined: the target needs both {self.positive_class!r} and other labels")
-        return float(roc_auc_score(positive, scores[:, classes.index(self.positive_class)]))
+        return _kale_roc_auc(positive, scores[:, classes.index(self.positive_class)])
 
 
 class BalancedAccuracy(Metric):

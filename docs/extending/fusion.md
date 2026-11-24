@@ -1,15 +1,13 @@
 # Adding a fusion method
 
-A fusion method combines named inputs, any of which a patient may lack. It goes in `kalecancer/model/fusion.py` and
-implements one or both interfaces:
+A fusion method combines named inputs, any of which a patient may lack. It goes in `kalecancer/model/fusion.py` and implements one or both interfaces:
 
 | Interface | Used in | Combines |
 | --- | --- | --- |
 | `TensorFusion` | `EarlyFusion`, `IntermediateFusion` | `(n, d)` tensors: raw inputs or embeddings |
 | `OutputFusion` | `LateFusion` | the branches' typed outputs |
 
-Models only check which interface a method has, so adding one needs no change to the models. The design is in
-[ADR 0005](../adr/0005-endpoint-architecture.md).
+Models only check which interface a method has, so adding one needs no change to the models. The design is in [ADR 0005](../adr/0005-endpoint-architecture.md).
 
 ## 1. A tensor fusion method
 
@@ -35,8 +33,7 @@ class Max(TensorFusion):
 | `forward(values, present)` | combines the rows `defined` accepts |
 | `check_widths(widths)` | optional: raises if the input widths can't be combined; runs in the dry run |
 
-Absent inputs hold NaN, so select with `torch.where` rather than multiplying by the mask: `NaN × 0` is NaN. Learnable
-parameters, such as a gate, are trained by the endpoint's loss.
+Absent inputs hold NaN, so select with `torch.where` rather than multiplying by the mask: `NaN × 0` is NaN. Learnable parameters, such as a gate, are trained by the endpoint's loss.
 
 ## 2. A late fusion method
 
@@ -90,16 +87,12 @@ class WeightedMean(OutputFusion):
 | `loss(output, target)` | optional: a regulariser, which `LateFusion` adds to its loss unweighted |
 | `decomposable_loss` | whether the regulariser is independent of batching; `False` once `loss` is overridden |
 
-- **Name the types you combine**, and declare only what fusing keeps: `MaskedMean` over Cox outputs returns a plain
-  `RiskScore`, because no branch's baseline belongs to the average. Types you don't name are refused.
-- **The regulariser** is computed from the output, the target and the method's own parameters, never from state
-  saved during `forward`. The total loss is `fused + branch_weight × branch losses + regulariser`.
+- **Name the types you combine**, and declare only what fusing keeps: `MaskedMean` over Cox outputs returns a plain `RiskScore`, because no branch's baseline belongs to the average. Types you don't name are refused.
+- **The regulariser** is computed from the output, the target and the method's own parameters, never from state saved during `forward`. The total loss is `fused + branch_weight × branch losses + regulariser`.
 
 ## 3. A method for both
 
-A method that works in every stage subclasses both interfaces, as `MaskedMean(TensorFusion, OutputFusion)` does. Its
-`forward` has one `@overload` per interface and checks whether it was given tensors or outputs. Its regulariser, if
-any, applies in late fusion only.
+A method that works in every stage subclasses both interfaces, as `MaskedMean(TensorFusion, OutputFusion)` does. Its `forward` has one `@overload` per interface and checks whether it was given tensors or outputs. Its regulariser, if any, applies in late fusion only.
 
 ## 4. Use it
 
@@ -122,7 +115,6 @@ The method can change the width the head takes: `Concat` sums the input widths, 
 ## Checklist
 
 - [ ] The method is exported from `kalecancer/model/__init__.py`.
-- [ ] Tests in `tests/test_model_fusion.py` cover rows with missing inputs (finite values and gradients),
-  `output_type`, each rule, and any regulariser.
+- [ ] Tests in `tests/model/test_fusion.py` cover rows with missing inputs (finite values and gradients), `output_type`, each rule, and any regulariser.
 - [ ] The fusion table in `docs/architecture.md` lists it.
 - [ ] The [Conventions](../../CONTRIBUTING.md#conventions) are followed.

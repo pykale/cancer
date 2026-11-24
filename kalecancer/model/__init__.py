@@ -13,6 +13,7 @@ from kalecancer.model.fusion import (
     OutputFusion,
     TensorFusion,
 )
+from kalecancer.model.heads import LinearClassifier
 from kalecancer.model.models import (
     BaseModel,
     EarlyFusion,
@@ -51,6 +52,7 @@ __all__ = [
     "FittedEncoder",
     "IntermediateFusion",
     "LateFusion",
+    "LinearClassifier",
     "MajorityVote",
     "MaskedMean",
     "OutputFusion",

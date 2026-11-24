@@ -9,12 +9,16 @@ dist/
 build/
 *.egg
 .coverage
+coverage.xml
 .pytest_cache/
 
 # Data and experiment outputs
 data/
 outputs/
+# Data downloaded by the multiomics tests migrated from PyKale
+tests/test_data/
 checkpoints/
 
 # OS
 .DS_Store
+_port_ref/

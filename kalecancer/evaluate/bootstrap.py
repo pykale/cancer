@@ -9,6 +9,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from kale.evaluate.bootstrap import bootstrap_ci as _kale_bootstrap_ci
 
 from kalecancer.evaluate.metrics import Metric
 from kalecancer.loaddata.targets import BaseTarget
@@ -120,50 +121,51 @@ def bootstrap_ci(
     if n_resamples < 1:
         raise ValueError(f"n_resamples must be positive, got {n_resamples}")
     baseline_train_target = train_target if baseline_train_target is None else baseline_train_target
-    # Raises on misuse (missing outcomes, a wrong output type) before any resampling can mistake it for an undefined
-    # value.
-    estimate = _score(metric, output, baseline, target, train_target, baseline_train_target)
+    # Taking the patients in the target's order below would drop those without an outcome, so check for them first.
+    missing = sorted(set(output.ids) - set(target.ids))
+    if missing:
+        raise ValueError(f"{len(missing)} patients of the output have no outcome in the target (e.g. {missing[:5]})")
 
     # Positions in the target's order, so the resamples do not depend on the order of the output's patients.
     have = set(output.ids)
     patients = [pid for pid in target.ids if pid in have]
     output = _in_order(output, patients, "output")
     baseline = None if baseline is None else _in_order(baseline, patients, "baseline")
-    n = len(patients)
-    ids = [str(k) for k in range(n)]
-    rng = np.random.default_rng(random_state)
-    values = []
-    for _ in range(n_resamples):
-        rows = rng.integers(0, n, size=n)
-        try:
-            values.append(
-                _score(
-                    metric,
-                    _resample(output, rows, ids),
-                    None if baseline is None else _resample(baseline, rows, ids),
-                    _resample_target(target, patients, rows, ids),
-                    train_target,
-                    baseline_train_target,
-                )
-            )
-        except ValueError:
-            # Metrics raise ValueError when they are undefined, e.g. a resample without an event or a positive.
-            continue
-    n_undefined = n_resamples - len(values)
-    if not values:
-        raise ValueError(f"{metric!r} is undefined on every one of {n_resamples} resamples")
+    everyone = np.arange(len(patients))
+
+    def score_rows(rows: np.ndarray) -> float:
+        # PyKale scores every patient once, for the estimate, before resampling; there an error is misuse rather than
+        # an undefined resample and propagates, so those patients keep their ids for its message to name
+        ids = patients if np.array_equal(rows, everyone) else [str(k) for k in range(len(rows))]
+        return _score(
+            metric,
+            _resample(output, rows, ids),
+            None if baseline is None else _resample(baseline, rows, ids),
+            _resample_target(target, patients, rows, ids),
+            train_target,
+            baseline_train_target,
+        )
+
+    # Metrics raise ValueError when they are undefined, e.g. on a resample without an event or a positive.
+    result = _kale_bootstrap_ci(
+        score_rows,
+        everyone,
+        n_resamples=n_resamples,
+        confidence=confidence,
+        seed=random_state,
+        undefined_errors=(ValueError,),
+    )
+    n_undefined = n_resamples - result["n_used"]
     if n_undefined:
         warnings.warn(
             f"{metric!r} is undefined on {n_undefined} of {n_resamples} resamples; the interval is computed from "
             "the others, which can make it too narrow",
             stacklevel=2,
         )
-    tail = 100 * (1 - confidence) / 2
-    lower, upper = np.percentile(values, [tail, 100 - tail])
     return BootstrapCI(
-        estimate=float(estimate),
-        lower=float(lower),
-        upper=float(upper),
+        estimate=result["point"],
+        lower=result["low"],
+        upper=result["high"],
         confidence=confidence,
         n_resamples=n_resamples,
         n_undefined=n_undefined,
