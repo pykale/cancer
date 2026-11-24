@@ -466,7 +466,7 @@ class Pipeline(BaseEstimator):
         return pd.DataFrame(
             output.probabilities.numpy(),
             index=pd.Index(output.ids, name="id"),
-            columns=pd.Index(list(output.classes), name="class"),
+            columns=pd.Index(list(output.classes), name="class", tupleize_cols=False),
         )
 
     def predict_survival_function(
