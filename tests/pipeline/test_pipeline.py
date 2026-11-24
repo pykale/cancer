@@ -672,6 +672,39 @@ def test_gpu_training_with_early_stopping_matches_its_own_bookkeeping(cohort):
     assert np.isfinite(pipe.predict(test).to_numpy()).all()
 
 
+def weighted_classifier():
+    """A classifier whose losses hold class weights, which Lightning moves to the model's device."""
+    weight = torch.tensor([1.0, 3.0])
+    return Unimodal(
+        "clinical", [nn.Linear(3, 4)], ClassificationEndpoint(nn.Linear(4, 2), nn.CrossEntropyLoss(weight=weight))
+    )
+
+
+def test_validation_loss_with_a_weighted_loss(cohort):
+    train, _ = split(dataset(cohort, task="classification"))
+    pipe = pipeline(
+        weighted_classifier(),
+        validation=StratifiedShuffleSplit(n_splits=1, test_size=0.3, random_state=0),
+        early_stopping=EarlyStopping(metric=BalancedAccuracy(), patience=2, restore_best=False),
+    ).fit(train)
+    assert np.isfinite(pipe.history_["val_loss"]).all()
+    assert pipe.history_["val_metric"].between(0.0, 1.0).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_gpu_validation_loss_with_a_weighted_loss(cohort):
+    # the class weights live on the GPU, so the validation loss must be computed there too
+    train, _ = split(dataset(cohort, task="classification"))
+    pipe = pipeline(
+        weighted_classifier(),
+        validation=StratifiedShuffleSplit(n_splits=1, test_size=0.3, random_state=0),
+        early_stopping=EarlyStopping(metric=BalancedAccuracy(), patience=2, restore_best=False),
+        accelerator="gpu",
+    ).fit(train)
+    assert np.isfinite(pipe.history_["val_loss"]).all()
+    assert pipe.history_["val_metric"].between(0.0, 1.0).all()
+
+
 class ContextIds(FittedEncoder):
     """Passes rows through, and keeps the ids it was fitted on as non-tensor fitted state."""
 

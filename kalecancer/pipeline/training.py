@@ -110,8 +110,9 @@ class _TrainingModule(L.LightningModule):
 
     def validation_step(self, batch: dict, batch_index: int) -> None:
         _record_non_finite(self.non_finite, batch)
-        target = {key: value.detach().cpu() for key, value in batch["target"].items()}
-        self._validation.append((self.model(batch).detach_cpu(), target))
+        # kept on the model's device until the epoch's loss is computed, since the loss can hold tensors there, such as
+        # the class weights of a weighted nn.CrossEntropyLoss
+        self._validation.append((self.model(batch), batch["target"]))
 
     def on_validation_epoch_end(self) -> None:
         output = BaseOutput.cat([out for out, _ in self._validation])
@@ -121,6 +122,7 @@ class _TrainingModule(L.LightningModule):
         row = {"val_loss": float(losses["loss"]) if losses is not None else float("nan")}
         if isinstance(self.monitor, Metric):
             assert self.validation_target is not None, "a Metric monitor needs a validation target"
+            output = output.detach_cpu()
             row["val_metric"] = float(self.monitor(output, self.validation_target, self.train_target))
         if self.monitor is not None:
             self.log("monitor", row["val_loss"] if self.monitor == "loss" else row["val_metric"])
