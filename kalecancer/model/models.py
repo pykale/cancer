@@ -672,11 +672,13 @@ class LateFusion(BaseModel):
     def check(self, data: MultimodalDataset) -> None:
         """Raise if a branch or the fused endpoint cannot be used with ``data``, or ``fusion`` cannot fuse the branches.
 
-        Every patient must have a branch that predicts for them, and ``fusion.check_branches`` must accept which
-        branches each patient has.
+        Every patient must have a branch that predicts for them, every branch's endpoint must accept the target, and
+        ``fusion.check_branches`` must accept which branches each patient has.
         """
         for branch in self.branches.values():
             branch._check(data, allow_undefined=True)
+            if data.target is not None:
+                branch.endpoint.check_target(data.target)
         if self.endpoint is not None and data.target is not None:
             self.endpoint.check_target(data.target)
         # the inputs of late fusion are branches: a patient has one when that branch predicts for them

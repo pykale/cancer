@@ -302,6 +302,14 @@ def test_late_fusion_cox_masked_mean_needs_complete_branches(cohort):
     late(MaskedMean(), task="survival").check(make_data(cohort, required=["clinical", "wsi"]))
 
 
+def test_late_fusion_checks_the_target_against_every_branch_endpoint(cohort):
+    # every branch trains on the same target, so a branch endpoint that cannot take it is rejected in check,
+    # not later in fit or the loss with an unclear error
+    data = make_data(cohort, required=["clinical", "wsi"], task="classification")
+    with pytest.raises(TypeError, match="time-to-event"):
+        late(MaskedMean(), task="survival").check(data)
+
+
 def test_the_fused_output_type_comes_from_the_fusion_method_or_the_endpoint():
     # averaged log-hazards have no baseline of their own: they are a relative risk until an endpoint fits one
     assert late(MaskedMean(), task="survival").output_type is RiskScore
