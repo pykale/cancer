@@ -1,6 +1,6 @@
 """Tests for patient_report and save_reports.
 
-The fitted pipeline's clinical encoder, wsi encoder and Cox head are hand-built exactly as in test_modality.py:
+The fitted pipeline's clinical encoder, wsi encoder and Cox endpoint are hand-built exactly as in test_modality.py:
 ``log_hazard`` is an exact, deterministic function of ``age`` alone -- the clinical encoder has zero weight on
 ``sex``/``smoking``, the wsi branch's final layer is zeroed to a constant, and the head reads only the clinical
 half of the fused embedding. That makes wsi's and sex/smoking's contributions exactly zero and age/clinical's
@@ -21,7 +21,7 @@ from torch import nn
 from kalecancer.evaluate import HarrellC
 from kalecancer.interpret import modality_shapley, patient_report, save_reports
 from kalecancer.loaddata import MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
-from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, LateFusion, MaskedMean, Unimodal
+from kalecancer.model import ABMIL, Concat, CoxEndpoint, IntermediateFusion, LateFusion, MaskedMean, Unimodal
 
 
 def masked_mean_model() -> IntermediateFusion:
@@ -34,16 +34,17 @@ def masked_mean_model() -> IntermediateFusion:
     with torch.no_grad():
         wsi_final.weight.zero_()
         wsi_final.bias.zero_()
+    head = nn.Linear(2, 1, bias=False)
     model = IntermediateFusion(
         encoders={
             "clinical": [clinical_encoder],
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), wsi_final],
         },
         fusion=MaskedMean(),
-        head=CoxHead(in_dim=2, ties="efron"),
+        endpoint=CoxEndpoint(head, ties="efron"),
     )
     with torch.no_grad():
-        model.head.linear.weight[:] = torch.tensor([[1.0, 0.0]])
+        head.weight[:] = torch.tensor([[1.0, 0.0]])
     return model
 
 
@@ -315,7 +316,7 @@ def mean_pool_model() -> IntermediateFusion:
     return IntermediateFusion(
         encoders={"clinical": [nn.Linear(3, 4)], "wsi": [MeanPool(16), nn.Linear(16, 4)]},
         fusion=MaskedMean(),
-        head=CoxHead(in_dim=4, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(4, 1, bias=False), ties="efron"),
     )
 
 
@@ -389,7 +390,7 @@ def fitted_with_tabicl(cohort_factory, dataset_factory, split_factory, pipeline_
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 2)],
         },
         fusion=MaskedMean(),
-        head=CoxHead(in_dim=2, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(2, 1, bias=False), ties="efron"),
     )
     cohort = cohort_factory(n_patients=40, n_with_wsi=30, seed=0)
     train, test = split_factory(dataset_factory(cohort), n_train=22)
@@ -431,15 +432,16 @@ def test_late_fusion_raises_the_explicit_limitation_error(
             "clinical_lab": IntermediateFusion(
                 encoders={"clinical": [nn.Linear(3, 4)], "lab": [nn.Linear(2, 4)]},
                 fusion=Concat(),
-                head=CoxHead(in_dim=8, ties="efron"),
+                endpoint=CoxEndpoint(nn.Linear(8, 1, bias=False), ties="efron"),
             ),
             "wsi": Unimodal(
                 "wsi",
                 [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
-                CoxHead(in_dim=4, ties="efron"),
+                CoxEndpoint(nn.Linear(4, 1, bias=False), ties="efron"),
             ),
         },
         fusion=MaskedMean(),
+        endpoint=CoxEndpoint(None, ties="efron"),
     )
     pipe = pipeline_factory(model).fit(train)
 

@@ -1,22 +1,28 @@
-"""Evaluation metrics: a score of a prediction frame against a target frame, both indexed by patient id.
+"""Evaluation metrics: a score of a model's typed output against the target, matched by patient id.
 
-Survival metrics come from torchsurv and classification metrics from scikit-learn.
+Each metric declares the weakest output type it needs (``requires``), so a metric that cannot score a model is refused
+before training or prediction, not after. IPCW metrics also read the training target, from which they estimate the
+censoring distribution.
+
+Survival metrics come from torchsurv, and classification metrics from PyKale and scikit-learn.
 """
 
 from __future__ import annotations
 
 import math
-import re
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Hashable, Sequence
-from dataclasses import dataclass
+from typing import ClassVar
 
 import numpy as np
 import pandas as pd
 import torch
 from kale.evaluate.classification_metrics import roc_auc as _kale_roc_auc
 from sklearn.metrics import balanced_accuracy_score
+
+from kalecancer.loaddata.targets import BaseTarget, Classification, TimeToEvent
+from kalecancer.model.outputs import BaseOutput, ClassScores, RiskScore, SurvivalFunction
 
 with warnings.catch_warnings():
     # torchsurv applies torch.jit.script when imported, which recent torch deprecates; users cannot act on it
@@ -28,70 +34,73 @@ with warnings.catch_warnings():
     from torchsurv.stats.kaplan_meier import KaplanMeierEstimator
 
 
-@dataclass(frozen=True)
-class EvalContext:
-    """What a metric may use besides the evaluated rows.
-
-    Args:
-        train_target: Target frame of the ids the model was fitted on; IPCW metrics estimate censoring from it.
-        classes: Class values in prediction-column order; ``None`` for time-to-event targets.
-    """
-
-    train_target: pd.DataFrame
-    classes: Sequence[Hashable] | None
-
-
 class Metric(ABC):
-    """Scores ``prediction`` against ``target`` row by row, matched by id.
+    """Scores a model's output against the target, patient by patient, matched by id.
 
-    ``__init__`` arguments are stored under their own names, which config dumps rely on.
+    Subclasses set ``higher_is_better`` and ``requires``, the weakest output type they can score, and implement
+    ``score``. ``__init__`` arguments are stored under their own names, which config dumps rely on.
     """
 
     higher_is_better: bool
+    # a type, not only a BaseOutput: SurvivalFunction is a view that outputs provide
+    requires: ClassVar[type]
 
-    @abstractmethod
-    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
-        """Score ``prediction`` against ``target``, matching rows by patient id.
+    def check_output_type(self, output_type: type) -> None:
+        """Raise ``TypeError`` if this metric cannot score outputs of ``output_type``.
+
+        ``Pipeline`` calls it before training for an early-stopping metric, and before predicting in ``evaluate`` and
+        ``cross_validate``.
+        """
+        if not issubclass(output_type, self.requires):
+            raise TypeError(
+                f"{self!r} needs a model that outputs {self.requires.__name__}; this one outputs {output_type.__name__}"
+            )
+
+    def __call__(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
+        """Score ``output`` against ``target``, matching patients by id.
 
         Args:
-            prediction: Predictions indexed by patient id, as ``Pipeline.predict`` returns them.
-            target: The target's ``frame`` for the same patients.
-            context: The training target and class order, for metrics that need them.
+            output: A model's output, as ``Pipeline.predict_output`` returns it. Every patient must be defined: a
+                metric is never computed on the defined subset.
+            target: The outcomes of at least the patients of ``output``.
+            train_target: The outcomes of the patients the model was fitted on. IPCW metrics estimate the censoring
+                distribution from it, and the others ignore it.
         """
+        self.check_output_type(type(output))
+        return self.score(output.detach_cpu(), target, train_target)
+
+    @abstractmethod
+    def score(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
+        """The metric, once ``__call__`` has checked the output type and moved it to the CPU (``detach_cpu``)."""
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({', '.join(f'{k}={v!r}' for k, v in vars(self).items())})"
 
 
-def _require_columns(frame: pd.DataFrame, columns: Sequence[str], what: str) -> None:
-    missing = [c for c in columns if c not in frame.columns]
-    if missing:
-        raise ValueError(f"{what} needs columns {list(columns)}; missing {missing} among {list(frame.columns)}")
-
-
-def _aligned_values(prediction: pd.DataFrame, target: pd.DataFrame, columns: list, dtype: type) -> np.ndarray:
-    """``prediction[columns]`` in the target's row order."""
-    for name, frame in (("prediction", prediction), ("target", target)):
-        if not frame.index.is_unique:
-            duplicated = frame.index[frame.index.duplicated()][:5].tolist()
-            raise ValueError(f"{name} ids must be unique; duplicated: {duplicated}")
-    unpredicted = target.index.difference(prediction.index)
-    untargeted = prediction.index.difference(target.index)
-    if len(unpredicted) or len(untargeted):
+def _outcomes(output: BaseOutput, target: BaseTarget, kind: type[BaseTarget], what: str) -> pd.DataFrame:
+    """The target rows of ``output``'s patients, in its order, after checking ``target`` and that all are defined."""
+    if not isinstance(target, kind):
+        raise TypeError(f"{what} needs a {kind.__name__} target, got {type(target).__name__}")
+    ids = pd.Index(output.ids)
+    if not ids.is_unique:
+        raise ValueError(f"output ids must be unique; duplicated: {ids[ids.duplicated()][:5].tolist()}")
+    missing = ids.difference(target.ids)
+    if len(missing):
         raise ValueError(
-            f"prediction and target ids differ: {len(unpredicted)} target ids lack a prediction "
-            f"(e.g. {unpredicted[:5].tolist()}) and {len(untargeted)} predicted ids lack a target "
-            f"(e.g. {untargeted[:5].tolist()})"
+            f"{len(missing)} patients of the output have no outcome in the target (e.g. {missing[:5].tolist()})"
         )
-    values = prediction.loc[target.index, columns]
-    undefined = values.isna().any(axis=1)
+    undefined = ~output.defined.numpy()
     if undefined.any():
-        examples = values.index[undefined][:5].tolist()
+        examples = ids[undefined][:5].tolist()
         raise ValueError(
-            f"{int(undefined.sum())} of {len(values)} predictions are NaN (e.g. {examples}); "
+            f"{int(undefined.sum())} of {len(ids)} patients have no prediction (e.g. {examples}); "
             "a metric is never computed on the defined subset"
         )
-    return values.to_numpy(dtype=dtype)
+    return target.frame.loc[ids]
+
+
+def _event_time(frame: pd.DataFrame) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.tensor(frame["event"].to_numpy(dtype=bool)), torch.tensor(frame["time"].to_numpy(dtype=np.float32))
 
 
 def _float32_bound(value: float) -> np.float32:
@@ -110,71 +119,67 @@ def _defined(value: float, reason: str) -> float:
     return value
 
 
-def _event_time(frame: pd.DataFrame, what: str) -> tuple[torch.Tensor, torch.Tensor]:
-    _require_columns(frame, ["time", "event"], what)
-    if not pd.api.types.is_bool_dtype(frame["event"]):
-        raise TypeError(f"{what}: column 'event' must be bool (True = event observed), got {frame['event'].dtype}")
-    return torch.tensor(frame["event"].to_numpy(dtype=bool)), torch.tensor(frame["time"].to_numpy(dtype=np.float32))
+def _survival_inputs(metric: Metric, output: BaseOutput, target: BaseTarget) -> tuple[torch.Tensor, ...]:
+    assert isinstance(output, RiskScore), "__call__ checked the output type"
+    event, time = _event_time(_outcomes(output, target, TimeToEvent, repr(metric)))
+    return output.risk, event, time
 
 
-def _survival_inputs(prediction: pd.DataFrame, target: pd.DataFrame) -> tuple[torch.Tensor, ...]:
-    _require_columns(prediction, ["log_hazard"], "survival prediction")
-    event, time = _event_time(target, "target")
-    risk = torch.tensor(_aligned_values(prediction, target, ["log_hazard"], np.float32)[:, 0])
-    return risk, event, time
-
-
-def _ipcw_training(metric: Metric, name: str, value: float, context: EvalContext) -> tuple[torch.Tensor, ...]:
+def _ipcw_training(metric: Metric, name: str, value: float, train_target: BaseTarget) -> tuple[torch.Tensor, ...]:
     """Training event and time, after checking that censoring weights at ``value`` are defined.
 
     torchsurv gives zero weight where the training censoring survival G is zero, which silently drops test events;
     sksurv raises instead.
     """
-    event, time = _event_time(context.train_target, "context.train_target")
+    if not isinstance(train_target, TimeToEvent):
+        raise TypeError(f"{metric!r} needs a TimeToEvent train_target, got {type(train_target).__name__}")
+    event, time = _event_time(train_target.frame)
     last = float(time.max())
     km = KaplanMeierEstimator()
     km(event, time, censoring_dist=True)
     if not (value < last and float(km.predict(torch.tensor([value], dtype=torch.float32))[0]) > 0):
         raise ValueError(
             f"{metric!r}: {name} must be below the last training time {last}, where the censoring survival G "
-            f"estimated on context.train_target is positive (valid: {name} < {last} and G({name}) > 0)"
+            f"estimated on train_target is positive (valid: {name} < {last} and G({name}) > 0)"
         )
     return event, time
 
 
 class HarrellC(Metric):
-    """Harrell's concordance of ``log_hazard``.
+    """Harrell's concordance of the risk scores.
 
     Among comparable pairs (the earlier time is an event), the share in which the earlier patient has the higher
-    log-hazard. Tied log-hazards count one half.
+    risk. Tied risks count one half.
     """
 
     higher_is_better = True
+    requires = RiskScore
 
-    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
-        """Harrell's C of the ``log_hazard`` column against the target's ``time`` and ``event``."""
-        risk, event, time = _survival_inputs(prediction, target)
+    def score(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
+        """Harrell's C of the risk scores against the target's ``time`` and ``event``."""
+        risk, event, time = _survival_inputs(self, output, target)
         return float(ConcordanceIndex()(risk, event, time))
 
 
 class UnoC(Metric):
-    """Uno's concordance of ``log_hazard``, truncated at ``tau``.
+    """Uno's concordance of the risk scores, truncated at ``tau``.
 
     Harrell's pairs whose earlier time is before ``tau``, weighted by 1 / G(earlier time)², with G the Kaplan–Meier
-    censoring survival of ``context.train_target``.
+    censoring survival of ``train_target``.
 
     Raises unless ``tau`` is below the last training time with G(tau) > 0.
     """
 
     higher_is_better = True
+    requires = RiskScore
 
     def __init__(self, tau: float):
         self.tau = tau
 
-    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
-        """Uno's C of the ``log_hazard`` column, truncated at ``tau``."""
-        risk, event, time = _survival_inputs(prediction, target)
-        train_event, train_time = _ipcw_training(self, "tau", self.tau, context)
+    def score(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
+        """Uno's C of the risk scores, truncated at ``tau``."""
+        risk, event, time = _survival_inputs(self, output, target)
+        train_event, train_time = _ipcw_training(self, "tau", self.tau, train_target)
         weight = get_ipcw(train_event, train_time, new_time=time)
         tmax = torch.tensor(_float32_bound(self.tau))
         c = float(ConcordanceIndex()(risk, event, time, weight=weight, tmax=tmax))
@@ -182,24 +187,25 @@ class UnoC(Metric):
 
 
 class TimeDependentAUC(Metric):
-    """Cumulative/dynamic AUC of ``log_hazard`` at ``time``.
+    """Cumulative/dynamic AUC of the risk scores at ``time``.
 
     Cases had the event by ``time`` and are weighted by 1 / G(event time), with G the Kaplan–Meier censoring
-    survival of ``context.train_target``; controls are still event-free after ``time``.
+    survival of ``train_target``; controls are still event-free after ``time``.
 
     Raises unless ``time`` is below the last training time with G(time) > 0, and within the target's follow-up:
     min target time <= ``time`` < max target time.
     """
 
     higher_is_better = True
+    requires = RiskScore
 
     def __init__(self, time: float):
         self.time = time
 
-    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
-        """The cumulative/dynamic AUC of the ``log_hazard`` column at ``time``."""
-        risk, event, time = _survival_inputs(prediction, target)
-        train_event, train_time = _ipcw_training(self, "time", self.time, context)
+    def score(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
+        """The cumulative/dynamic AUC of the risk scores at ``time``."""
+        risk, event, time = _survival_inputs(self, output, target)
+        train_event, train_time = _ipcw_training(self, "time", self.time, train_target)
         first, last = float(time.min()), float(time.max())
         if not first <= self.time < last:
             raise ValueError(f"{self!r}: time must lie within the follow-up of the target, [{first}, {last})")
@@ -216,44 +222,44 @@ class TimeDependentAUC(Metric):
         return _defined(float(auc[0]), f"{self!r} is undefined: no target event at or before time")
 
 
-_SURVIVAL_COLUMN = re.compile(r"survival\[(.+)\]")
-
-
 class IntegratedBrier(Metric):
-    """Integrated Brier score of the ``survival[<time>]`` columns: how far predicted survival is from the outcome.
+    """Integrated Brier score of the survival function at ``times``: how far predicted survival is from the outcome.
 
-    At each column's time t, patients with an event by t contribute S(t)², weighted by 1 / G(event time), and patients
-    still event-free after t contribute (1 - S(t))², weighted by 1 / G(t), with G the Kaplan–Meier censoring survival
-    of ``context.train_target``. These Brier scores are integrated over the column times with the trapezoidal rule and
-    divided by their range. Unlike the concordances it scores calibration as well as ranking. ``Pipeline.predict`` and
-    ``Pipeline.evaluate`` add the columns when given ``survival_times``.
+    At each time t, patients with an event by t contribute S(t)², weighted by 1 / G(event time), and patients still
+    event-free after t contribute (1 - S(t))², weighted by 1 / G(t), with G the Kaplan–Meier censoring survival of
+    ``train_target``. These Brier scores are integrated over ``times`` with the trapezoidal rule and divided by their
+    range. Unlike the concordances it scores calibration as well as ranking.
 
-    Raises unless there are at least two columns, their last time is below the last training time with G > 0, and
-    they lie within the target's follow-up: min target time <= first time and last time < max target time.
+    Raises unless the last time is below the last training time with G > 0, and the times lie within the target's
+    follow-up: min target time <= first time and last time < max target time.
+
+    Args:
+        times: At least two strictly increasing times.
     """
 
     higher_is_better = False
+    requires = SurvivalFunction
 
-    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
-        """The integrated Brier score of the ``survival[<time>]`` columns."""
-        columns = {float(m[1]): c for c in prediction.columns if (m := _SURVIVAL_COLUMN.fullmatch(str(c)))}
-        if len(columns) < 2:
-            raise ValueError(
-                f"{self!r} needs at least two 'survival[<time>]' columns, got {list(prediction.columns)}; set "
-                "survival_times with two or more times in Pipeline.predict, evaluate or cross_validate"
-            )
-        times = sorted(columns)
-        event, time = _event_time(target, "target")
-        survival = torch.tensor(_aligned_values(prediction, target, [columns[t] for t in times], np.float64))
-        train_event, train_time = _ipcw_training(self, "the last survival time", times[-1], context)
+    def __init__(self, times: Sequence[float]):
+        checked = [float(t) for t in times]
+        if len(checked) < 2 or any(b <= a for a, b in zip(checked, checked[1:], strict=False)):
+            raise ValueError(f"IntegratedBrier needs at least two strictly increasing times, got {times!r}")
+        self.times = list(times)
+
+    def score(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
+        """The integrated Brier score of the output's survival function at ``times``."""
+        assert isinstance(output, SurvivalFunction), "__call__ checked the output type"
+        times = [float(t) for t in self.times]
+        event, time = _event_time(_outcomes(output, target, TimeToEvent, repr(self)))
+        survival = output.survival(times).double()
+        train_event, train_time = _ipcw_training(self, "the last time", times[-1], train_target)
         first, last = float(time.min()), float(time.max())
         if not (first <= times[0] and times[-1] < last):
             raise ValueError(
-                f"{self!r}: survival times {times[0]}..{times[-1]} must lie within the follow-up of the target, "
-                f"[{first}, {last})"
+                f"{self!r}: times {times[0]}..{times[-1]} must lie within the follow-up of the target, [{first}, {last})"
             )
-        # float64 so event times are compared with the column times themselves, as in sksurv: torchsurv compares each
-        # time as a 0-dim tensor, which would not promote float32 event times
+        # float64 so event times are compared with the times themselves, as in sksurv: torchsurv compares each time as
+        # a 0-dim tensor, which would not promote float32 event times
         new_time = torch.tensor(times, dtype=torch.float64)
         brier = BrierScore()
         brier(
@@ -342,9 +348,9 @@ def _log_rank_statistic(time: np.ndarray, event: np.ndarray, group: np.ndarray, 
 
 
 class LogRank(Metric):
-    """Mantel-Cox log-rank statistic across risk-quantile groups of ``log_hazard``.
+    """Mantel-Cox log-rank statistic across risk-quantile groups of the risk scores.
 
-    Splits patients into ``n_groups`` equal-sized quantile groups by ``log_hazard`` (2 is a median split, 3
+    Splits patients into ``n_groups`` equal-sized quantile groups by risk score (2 is a median split, 3
     tertiles, 4 quartiles) and computes the Mantel-Cox chi-square statistic for a difference in survival across
     them -- the standard log-rank test, generalised beyond two groups.
 
@@ -357,13 +363,14 @@ class LogRank(Metric):
     """
 
     higher_is_better = True
+    requires = RiskScore
 
     def __init__(self, n_groups: int = 2):
         self.n_groups = n_groups
 
-    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
-        """The Mantel-Cox chi-square statistic across ``n_groups`` quantile groups of ``log_hazard``."""
-        risk, event, time = _survival_inputs(prediction, target)
+    def score(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
+        """The Mantel-Cox chi-square statistic across ``n_groups`` quantile groups of the risk scores."""
+        risk, event, time = _survival_inputs(self, output, target)
         group = _quantile_groups(risk.numpy().astype(np.float64), self.n_groups)
         event_arr = event.numpy()
         time_arr = time.numpy().astype(np.float64)
@@ -378,47 +385,35 @@ class LogRank(Metric):
         return _defined(statistic, f"{self!r} is undefined: the group covariance is singular")
 
 
-def _classification_inputs(
-    prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext
-) -> tuple[np.ndarray, np.ndarray]:
-    """Class scores in ``context.classes`` order and labels, both in the target's row order."""
-    if context.classes is None:
-        raise ValueError("classification metrics need context.classes (class values in prediction-column order)")
-    classes = list(context.classes)
-    columns = list(prediction.columns)
-    if len(columns) != len(classes) or not all(
-        str(col).endswith(f"[{c}]") for col, c in zip(columns, classes, strict=True)
-    ):
-        raise ValueError(
-            f"prediction columns {columns} must be one per class, in the order of classes {classes}, "
-            "each named '<prefix>[<class>]'"
-        )
-    _require_columns(target, ["label"], "classification target")
-    unknown = target.index[~target["label"].isin(classes)]
+def _classification_inputs(metric: Metric, output: BaseOutput, target: BaseTarget) -> tuple[np.ndarray, np.ndarray]:
+    """Class scores in the output's class order and labels, both in the output's patient order."""
+    assert isinstance(output, ClassScores), "__call__ checked the output type"
+    labels = _outcomes(output, target, Classification, repr(metric))["label"]
+    classes = list(output.classes)
+    unknown = labels.index[~labels.isin(classes)]
     if len(unknown):
         raise ValueError(f"{len(unknown)} target labels are not in classes {classes} (e.g. ids {unknown[:5].tolist()})")
-    return _aligned_values(prediction, target, columns, np.float64), target["label"].to_numpy(dtype=object)
+    return output.scores.double().numpy(), labels.to_numpy(dtype=object)
 
 
 class AUROC(Metric):
     """Area under the ROC curve of ``positive_class`` against all other classes.
 
-    It is scored by that class's prediction column. With two classes this is the usual binary AUROC.
+    It is scored by that class's score. It only ranks patients, so class scores that are not probabilities, such as
+    ``VoteScores``, are enough. With two classes this is the usual binary AUROC.
     """
 
     higher_is_better = True
+    requires = ClassScores
 
     def __init__(self, positive_class: Hashable):
         self.positive_class = positive_class
 
-    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
+    def score(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
         """The AUROC of ``positive_class`` against all other classes."""
-        scores, labels = _classification_inputs(prediction, target, context)
-
-        # assert is temporary fix to keep mypy quiet
-        # real fix requires rethinking EvalContext
-        assert context.classes is not None, "classification targets always carry classes"
-        classes = list(context.classes)
+        scores, labels = _classification_inputs(self, output, target)
+        assert isinstance(output, ClassScores), "__call__ checked the output type"
+        classes = list(output.classes)
         if self.positive_class not in classes:
             raise ValueError(f"{self!r}: positive_class is not one of classes {classes}")
         positive = labels == self.positive_class
@@ -430,14 +425,16 @@ class AUROC(Metric):
 class BalancedAccuracy(Metric):
     """Mean per-class recall over the classes in the target, predicting each patient's highest-scoring class.
 
-    Ties go to the class listed first in ``context.classes`` (numpy argmax). With two probability columns a patient is
-    predicted ``classes[1]`` only if its probability is above 0.5.
+    Ties go to the class listed first (numpy argmax). With two class probabilities a patient is predicted the second
+    class only if its probability is above 0.5.
     """
 
     higher_is_better = True
+    requires = ClassScores
 
-    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
+    def score(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
         """The balanced accuracy of each patient's highest-scoring class."""
-        scores, labels = _classification_inputs(prediction, target, context)
-        predicted = np.array(context.classes, dtype=object)[scores.argmax(axis=1)]
+        scores, labels = _classification_inputs(self, output, target)
+        assert isinstance(output, ClassScores), "__call__ checked the output type"
+        predicted = np.array(output.classes, dtype=object)[scores.argmax(axis=1)]
         return float(balanced_accuracy_score(labels, predicted))

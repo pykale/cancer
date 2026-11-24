@@ -1,7 +1,7 @@
 """Modality attribution: how much each modality contributes to a fitted pipeline's score.
 
 Reuses :mod:`kalecancer.interpret.attribution`'s conventions: the ``(pipeline, data, metric, ...)`` argument
-order, ``allow_seen``, ``survival_times``, an ``_evaluate`` helper of the same shape, and the same
+order, ``allow_seen``, an ``_evaluate`` helper of the same shape, and the same
 ``metric.higher_is_better`` sign flip (positive always means "this modality helps").
 
 A modality cannot be ablated by dropping it from the dataset: ``Pipeline.predict`` checks, via
@@ -220,33 +220,9 @@ def _coalition_view(data: MultimodalDataset, ablated: frozenset[str]) -> Multimo
     return view.subset(data.ids)
 
 
-def _evaluate(
-    pipeline: Pipeline,
-    view: MultimodalDataset,
-    metric: Metric,
-    *,
-    allow_seen: bool,
-    survival_times: Sequence[float] | None,
-) -> float:
-    """Score ``metric`` on ``view``, forwarding ``survival_times``.
-
-    Mirrors :func:`kalecancer.interpret.attribution._evaluate`: ``Pipeline.evaluate`` already raises when a
-    metric needs ``survival[<time>]`` columns that ``survival_times`` was never given to produce, naming
-    ``survival_times`` but pointing at ``Pipeline.predict``/``evaluate``/``cross_validate`` rather than at this
-    function's own argument, which a caller is more likely to reach for -- so this only adds a pointer to it,
-    without re-implementing the check.
-    """
-    try:
-        score = pipeline.evaluate(view, {"score": metric}, allow_seen=allow_seen, survival_times=survival_times)[
-            "score"
-        ]
-    except ValueError as error:
-        if survival_times is None and "'survival[<time>]'" in str(error):
-            raise ValueError(
-                f"{error}; leave_one_out_ablation and modality_shapley also accept survival_times directly"
-            ) from error
-        raise
-    return float(score)
+def _evaluate(pipeline: Pipeline, view: MultimodalDataset, metric: Metric, *, allow_seen: bool) -> float:
+    """Score ``metric`` on ``view``. A metric that reads survival curves carries its own times."""
+    return float(pipeline.evaluate(view, {"score": metric}, allow_seen=allow_seen)["score"])
 
 
 def leave_one_out_ablation(
@@ -256,7 +232,6 @@ def leave_one_out_ablation(
     *,
     modalities: Sequence[str] | None = None,
     allow_seen: bool = False,
-    survival_times: Sequence[float] | None = None,
 ) -> pd.Series:
     """Mark each modality absent in turn and report the change in the metric.
 
@@ -276,8 +251,6 @@ def leave_one_out_ablation(
         modalities: Which modalities to ablate. ``None`` means every modality the fitted model reads.
         allow_seen: ``Pipeline.evaluate`` refuses patients used to fit ``pipeline`` unless this is set, exactly as
             in ``permutation_importance``.
-        survival_times: Forwarded to ``Pipeline.evaluate``; required for a metric that reads
-            ``survival[<time>]`` columns (``IntegratedBrier``, ``CalibrationError``).
 
     Returns:
         Series indexed by modality name, named ``"drop"``. Its ``.attrs["n_excluded"]`` is how many of
@@ -288,7 +261,7 @@ def leave_one_out_ablation(
         ValueError: If the fitted model has no fusion method, if its fusion method cannot tolerate even one
             modality absent (e.g. ``Concat``; see the module docstring), if the fitted model is a ``LateFusion``
             (not supported yet; see :func:`_require_ablatable`), if ``modalities`` names one the model does not
-            read, or if ``metric`` needs ``survival_times`` and none was given.
+            read.
     """
     names = _resolve_modalities(pipeline, modalities)
     model_modalities = _model_modalities(pipeline)
@@ -300,13 +273,11 @@ def leave_one_out_ablation(
     comparable_ids = _comparable_ids(data, fusion, model_modalities, coalitions)
     base = data.subset(comparable_ids)
 
-    baseline = _evaluate(
-        pipeline, _coalition_view(base, frozenset()), metric, allow_seen=allow_seen, survival_times=survival_times
-    )
+    baseline = _evaluate(pipeline, _coalition_view(base, frozenset()), metric, allow_seen=allow_seen)
     drops = {}
     for name in names:
         view = _coalition_view(base, frozenset({name}))
-        score = _evaluate(pipeline, view, metric, allow_seen=allow_seen, survival_times=survival_times)
+        score = _evaluate(pipeline, view, metric, allow_seen=allow_seen)
         drops[name] = sign * (baseline - score)
 
     result = pd.Series(drops, name="drop")
@@ -322,7 +293,6 @@ def modality_shapley(
     modalities: Sequence[str] | None = None,
     max_modalities: int = 4,
     allow_seen: bool = False,
-    survival_times: Sequence[float] | None = None,
 ) -> pd.Series:
     """Exact Shapley value per modality over all ``2**k`` coalitions.
 
@@ -390,7 +360,6 @@ def modality_shapley(
         max_modalities: Refuses more than ``2**max_modalities`` coalitions. Cost is ``2**k - 1`` calls to
             ``pipeline.evaluate`` for ``k`` modalities.
         allow_seen: As in :func:`leave_one_out_ablation`.
-        survival_times: As in :func:`leave_one_out_ablation`.
 
     Returns:
         Series indexed by modality name, named ``"shapley"``. ``.attrs["n_excluded"]`` is as in
@@ -446,13 +415,11 @@ def modality_shapley(
     scores: dict[frozenset[str], float] = {}
     for present, ablated in zip(present_subsets, ablated_sets, strict=True):
         view = _coalition_view(base, ablated)
-        scores[present] = sign * _evaluate(pipeline, view, metric, allow_seen=allow_seen, survival_times=survival_times)
+        scores[present] = sign * _evaluate(pipeline, view, metric, allow_seen=allow_seen)
 
     if background_scorable:
         view = _coalition_view(base, full)
-        scores[frozenset()] = sign * _evaluate(
-            pipeline, view, metric, allow_seen=allow_seen, survival_times=survival_times
-        )
+        scores[frozenset()] = sign * _evaluate(pipeline, view, metric, allow_seen=allow_seen)
     else:
         loo_drops = (scores[full] - scores[full - {name}] for name in names)
         scores[frozenset()] = scores[full] - sum(loo_drops)

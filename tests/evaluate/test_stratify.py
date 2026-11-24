@@ -1,13 +1,26 @@
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 from sksurv.nonparametric import kaplan_meier_estimator
 
 from kalecancer.evaluate import kaplan_meier, risk_groups
+from kalecancer.loaddata import TimeToEvent
+from kalecancer.model import ClassProbabilities, RiskScore
 
 
 def _ids(n: int, prefix: str = "p") -> list[str]:
     return [f"{prefix}{k:04d}" for k in range(n)]
+
+
+def _risk(prediction: pd.DataFrame) -> RiskScore:
+    """The ``log_hazard`` column as a model's output, undefined where it is NaN."""
+    risk = torch.tensor(prediction["log_hazard"].to_numpy(np.float32))
+    return RiskScore(ids=list(prediction.index), defined=~risk.isnan(), risk=risk)
+
+
+def _tte(frame: pd.DataFrame) -> TimeToEvent:
+    return TimeToEvent(frame["time"], frame["event"])
 
 
 def test_median_split_puts_half_in_each_group():
@@ -15,7 +28,7 @@ def test_median_split_puts_half_in_each_group():
     rng = np.random.default_rng(3)
     prediction = pd.DataFrame({"log_hazard": rng.normal(size=n)}, index=_ids(n))
 
-    group = risk_groups(prediction, n_groups=2)
+    group = risk_groups(_risk(prediction), n_groups=2)
 
     counts = group.value_counts()
     assert counts[0] == 50
@@ -28,7 +41,7 @@ def test_three_and_four_groups_split_evenly(n_groups):
     rng = np.random.default_rng(7)
     prediction = pd.DataFrame({"log_hazard": rng.normal(size=n)}, index=_ids(n))
 
-    group = risk_groups(prediction, n_groups=n_groups)
+    group = risk_groups(_risk(prediction), n_groups=n_groups)
 
     counts = group.value_counts()
     assert len(counts) == n_groups
@@ -40,7 +53,7 @@ def test_labels_name_the_groups_lowest_risk_first():
     rng = np.random.default_rng(8)
     prediction = pd.DataFrame({"log_hazard": rng.normal(size=n)}, index=_ids(n))
 
-    group = risk_groups(prediction, n_groups=2, labels=["low", "high"])
+    group = risk_groups(_risk(prediction), n_groups=2, labels=["low", "high"])
 
     assert group.cat.categories.tolist() == ["low", "high"]
     assert group[prediction["log_hazard"].idxmin()] == "low"
@@ -70,7 +83,7 @@ def test_known_cohort_produces_hand_checkable_km_steps():
     event = np.array([False, True, False, True, False, True, True, True])
     target = pd.DataFrame({"time": time, "event": event}, index=ids)
 
-    table = kaplan_meier(prediction, target, n_groups=2)
+    table = kaplan_meier(_risk(prediction), _tte(target), n_groups=2)
 
     group0 = table[table["group"] == 0].reset_index(drop=True)
     assert group0["time"].tolist() == [0.0, 1.0, 2.0, 4.0]
@@ -103,8 +116,8 @@ def test_kaplan_meier_matches_sksurv_per_risk_group():
     prediction = pd.DataFrame({"log_hazard": log_hazard}, index=ids)
     target = pd.DataFrame({"time": time, "event": event}, index=ids)
 
-    table = kaplan_meier(prediction, target, n_groups=2)
-    group = risk_groups(prediction, n_groups=2).loc[ids]
+    table = kaplan_meier(_risk(prediction), _tte(target), n_groups=2)
+    group = risk_groups(_risk(prediction), n_groups=2).loc[ids]
 
     for name in (0, 1):
         mask = (group == name).to_numpy()
@@ -128,7 +141,7 @@ def test_survival_is_monotonic_non_increasing_within_each_group():
     prediction = pd.DataFrame({"log_hazard": log_hazard}, index=ids)
     target = pd.DataFrame({"time": time, "event": event}, index=ids)
 
-    table = kaplan_meier(prediction, target, n_groups=2)
+    table = kaplan_meier(_risk(prediction), _tte(target), n_groups=2)
 
     for _, curve in table.groupby("group"):
         curve = curve.sort_values("time")
@@ -136,12 +149,12 @@ def test_survival_is_monotonic_non_increasing_within_each_group():
         assert curve["survival"].max() <= 1.0 + 1e-9
 
 
-def test_nan_log_hazard_is_excluded_and_reported():
+def test_undefined_patients_are_excluded_and_reported():
     ids = _ids(10)
     log_hazard = np.array([0.1, 0.2, 0.3, np.nan, 0.5, 0.6, np.nan, 0.8, 0.9, 1.0])
     prediction = pd.DataFrame({"log_hazard": log_hazard}, index=ids)
 
-    group = risk_groups(prediction, n_groups=2)
+    group = risk_groups(_risk(prediction), n_groups=2)
 
     assert group.attrs["n_excluded"] == 2
     assert len(group) == 8
@@ -157,7 +170,7 @@ def test_kaplan_meier_reports_the_same_excluded_count():
         index=ids,
     )
 
-    table = kaplan_meier(prediction, target, n_groups=2)
+    table = kaplan_meier(_risk(prediction), _tte(target), n_groups=2)
 
     assert table.attrs["n_excluded"] == 2
 
@@ -166,21 +179,21 @@ def test_n_groups_below_two_raises():
     prediction = pd.DataFrame({"log_hazard": [0.1, 0.2, 0.3]}, index=_ids(3))
 
     with pytest.raises(ValueError, match="n_groups must be at least 2"):
-        risk_groups(prediction, n_groups=1)
+        risk_groups(_risk(prediction), n_groups=1)
 
 
 def test_non_unique_quantile_cuts_raise():
     prediction = pd.DataFrame({"log_hazard": np.ones(20)}, index=_ids(20))
 
     with pytest.raises(ValueError, match="quantile cuts are not unique"):
-        risk_groups(prediction, n_groups=2)
+        risk_groups(_risk(prediction), n_groups=2)
 
 
 def test_labels_length_mismatch_raises():
     prediction = pd.DataFrame({"log_hazard": np.arange(10.0)}, index=_ids(10))
 
     with pytest.raises(ValueError, match=r"labels must have n_groups=2 entries"):
-        risk_groups(prediction, n_groups=2, labels=["only_one"])
+        risk_groups(_risk(prediction), n_groups=2, labels=["only_one"])
 
 
 def test_kaplan_meier_with_tuple_labels_keeps_the_whole_tuple_per_row():
@@ -197,8 +210,20 @@ def test_kaplan_meier_with_tuple_labels_keeps_the_whole_tuple_per_row():
 
     low, high = ("risk", "low"), ("risk", "high")
 
-    table = kaplan_meier(prediction, target, n_groups=2, labels=[low, high])
+    table = kaplan_meier(_risk(prediction), _tte(target), n_groups=2, labels=[low, high])
 
     # group0's curve has 4 rows (time=0, 1, 2, 4) and group1's has 5 (time=0, 1, 3, 5, 7) -- see
     # test_known_cohort_produces_hand_checkable_km_steps for the hand-worked derivation.
     assert table["group"].tolist() == [low] * 4 + [high] * 5
+
+
+def test_needs_a_risk_score_and_a_time_to_event_target():
+    ids = _ids(4)
+    probabilities = ClassProbabilities(
+        ids=ids, defined=torch.ones(4, dtype=torch.bool), logits=torch.zeros(4, 2), classes=("a", "b")
+    )
+    with pytest.raises(TypeError, match="needs a RiskScore output, got ClassProbabilities"):
+        risk_groups(probabilities)
+    prediction = pd.DataFrame({"log_hazard": [0.1, 0.2, 0.3, 0.4]}, index=ids)
+    with pytest.raises(TypeError, match="needs a TimeToEvent target"):
+        kaplan_meier(_risk(prediction), prediction)  # type: ignore[arg-type]

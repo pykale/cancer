@@ -46,7 +46,6 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
-from kalecancer.evaluate.metrics import _SURVIVAL_COLUMN
 from kalecancer.interpret.attention import attention
 from kalecancer.interpret.attribution import (
     _feature_names,
@@ -66,21 +65,23 @@ from kalecancer.loaddata.dataset import MultimodalDataset
 from kalecancer.loaddata.modalities import BagModality
 from kalecancer.model.encode.base_encoders import AttentionEncoder
 from kalecancer.model.fusion import FusionMethod
+from kalecancer.model.outputs import CoxOutput
 from kalecancer.pipeline.pipeline import Pipeline
 
 logger = logging.getLogger(__name__)
 
 
 def _require_survival_model(pipeline: Pipeline) -> None:
-    """Raise unless ``pipeline`` predicts a ``log_hazard`` -- ``risk`` and the survival curve both need one.
+    """Raise unless ``pipeline``'s model outputs a ``CoxOutput`` -- ``risk`` and the survival curve both need one.
 
-    ``baseline_`` is only ever set for a model with a Cox-style head (see ``Pipeline.fit``); it is already fitted
-    by the time ``patient_report`` runs, so there is no baseline to fit here, only this to check.
+    Its Breslow baseline is fitted when training ends, so by the time ``patient_report`` runs there is no baseline
+    to fit here, only this to check.
     """
-    if pipeline.baseline_ is None:
+    produced = pipeline.model_.output_type
+    if not issubclass(produced, CoxOutput):
         raise ValueError(
-            "patient_report needs a survival model that predicts a log_hazard (a CoxHead); this pipeline's "
-            f"baseline_ is None, meaning it was fitted on a different kind of target ({type(pipeline.target_)})"
+            "patient_report needs a survival model that outputs log-hazards, a CoxOutput (from a CoxEndpoint); "
+            f"this pipeline's model outputs {produced.__name__}"
         )
 
 
@@ -390,7 +391,8 @@ def patient_report(
         data: The full cohort. ``risk_percentile`` is computed against all of it; the modality and feature
             contributions subset to ``patient_ids`` (see the module docstring).
         patient_ids: Which patients to build a report for. Every id must be in ``data``.
-        survival_times: Horizons for the survival curve, forwarded to ``Pipeline.predict``. ``None`` skips it.
+        survival_times: Horizons for the survival curve, from ``Pipeline.predict_survival_function``. ``None`` skips
+            it.
         top_k: Number of top-attended patches to keep per patient with a bag modality.
         n_feature_samples: Permutation-sampling budget for ``feature_contributions``; the same meaning as
             ``feature_shapley``'s ``n_samples``, cheaper here for the reason the module docstring gives.
@@ -432,8 +434,8 @@ def patient_report(
     else:
         attention_unavailable_reason = None
 
-    full_prediction = pipeline.predict(data, survival_times=survival_times)
-    population = full_prediction["log_hazard"]
+    population = pipeline.predict(data)["log_hazard"]
+    survival_curves = None if survival_times is None else pipeline.predict_survival_function(data, survival_times)
 
     requested = data.subset(list(patient_ids))
     modality_contributions = _modality_risk_contributions(pipeline, requested, fusion, model_modalities)
@@ -443,9 +445,6 @@ def patient_report(
     top_patches = _top_patches(
         pipeline, requested, bag_modality if attention_unavailable_reason is None else None, top_k
     )
-
-    survival_columns = {float(m[1]): c for c in full_prediction.columns if (m := _SURVIVAL_COLUMN.fullmatch(str(c)))}
-    times_sorted = sorted(survival_columns)
 
     present_tabular = set(requested.present_ids(tabular_name))
     patients_without_tabular = [pid for pid in patient_ids if pid not in present_tabular]
@@ -468,11 +467,11 @@ def patient_report(
     for pid in patient_ids:
         risk = float(population.loc[pid])
         survival = None
-        if times_sorted:
+        if survival_curves is not None:
             survival = pd.DataFrame(
                 {
-                    "time": times_sorted,
-                    "survival": [float(full_prediction.loc[pid, survival_columns[t]]) for t in times_sorted],
+                    "time": [float(t) for t in survival_curves.columns],
+                    "survival": survival_curves.loc[pid].to_numpy(dtype=float).tolist(),
                 }
             )
         reports.append(

@@ -39,4 +39,4 @@ These documents hold the rules the code relies on. Read the relevant one before 
 
 ## Environment
 
-The dev container has no GPU, so train full cohorts on a GPU machine. The HANCOCK examples need a local copy of the data in `data/hancock/`, which git ignores and which may not be present.
+The HANCOCK examples need a local copy of the data in `data/hancock/`, which git ignores and which may not be present.

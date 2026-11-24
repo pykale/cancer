@@ -15,3 +15,10 @@ Retain KaleCancer's pandas-based `FusionContext` and application checks: fusion 
 Preserve float32 and float64 baseline behaviour. Half-precision means accumulate in float32 before returning the input dtype; half-precision voting returns float32 scores to retain the probability tie-breaker. Treat these as explicit numerical changes, rather than claiming complete dtype parity.
 
 The adapter PR targets `migration/pykale-core`. Adoption requires a released PyKale API and matching dependency metadata before merging. KaleCancer main is updated only when the complete migration is ready.
+
+## Update: endpoint architecture
+
+- **Date:** 2026-11-24
+- **Context:** [ADR 0005](0005-endpoint-architecture.md) (#23) splits fusion into `TensorFusion`, which combines tensors in early and intermediate fusion, and `OutputFusion`, which combines the branches' typed outputs in late fusion. It replaces the pandas `FusionContext` and `check` with hooks that run when their information exists: `output_type`, `check_branches` and `check_widths`.
+
+KaleCancer's `FusionMethod` no longer extends the core base. Core's `FusionMethod.forward` takes and returns tensors, which an `OutputFusion` does not, so extending it would give late fusion methods a contract they break. The delegation of the tensor algorithms stays: `Concat` and `MaskedMean` borrow core's `defined`, and `Concat` its `forward`. `MaskedMean` runs core's `forward` on tensors, `MajorityVote` runs core's `forward` on its branches' probabilities, and the helpers still wrap `stack_present` and `masked_mean`. `validate_inputs = False` stays on the KaleCancer base, because the borrowed operations read it. The numerical behaviour above is unchanged.

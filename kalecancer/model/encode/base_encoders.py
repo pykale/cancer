@@ -24,7 +24,8 @@ class FittedEncoder(nn.Module, ABC):
     """An encoder fitted on the training patients before training starts.
 
     Only the first encoder in a list may be fitted: the inputs of later encoders change as the encoders before them
-    train. The encoder list fits it on the training patients who have the modality (in ``EarlyFusion``, every fused
+    train. In ``EarlyFusion`` the fusion method runs before the first encoder, so it must have no trainable
+    parameters, which ``fit`` checks. The encoder list fits it on the training patients who have the modality (in ``EarlyFusion``, every fused
     modality), and passes the patients' ids to every ``forward``. Fitted state kept in buffers may have any size; an
     unfitted encoder loads a fitted one's state.
     """

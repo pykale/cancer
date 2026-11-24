@@ -525,3 +525,16 @@ def test_bag_modalities_do_not_accept_transforms(cohort):
         data.with_transforms({"wsi": StandardScaler()})
     with pytest.raises(TypeError, match="PatchFeatures does not accept transforms"):
         data.modalities["wsi"].transform_input(data.ids)
+
+
+def test_targets_subset_to_the_same_kind_of_target():
+    ids = pd.Index(["003", "001", "002"])
+    survival = TimeToEvent(pd.Series([3.0, 1.0, 2.0], index=ids), pd.Series([True, False, True], index=ids))
+    part = survival.subset(["002", "001"])
+    assert isinstance(part, TimeToEvent) and list(part.ids) == ["001", "002"]
+    pd.testing.assert_frame_equal(part.frame, survival.frame.loc[["001", "002"]])
+    labels = Classification(pd.Series(["b", "a", "b"], index=ids), classes=["b", "a"])
+    some = labels.subset(["003"])
+    assert isinstance(some, Classification) and some.classes == ["b", "a"] and list(some.ids) == ["003"]
+    with pytest.raises(KeyError, match="unknown ids"):
+        survival.subset(["999"])

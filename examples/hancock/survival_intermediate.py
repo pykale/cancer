@@ -20,9 +20,9 @@ from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
-from kalecancer.evaluate import EvalContext, HarrellC, UnoC, bootstrap_ci
+from kalecancer.evaluate import HarrellC, UnoC, bootstrap_ci
 from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent, Tabular
-from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, TabICLEncoder, Unimodal
+from kalecancer.model import ABMIL, Concat, CoxEndpoint, IntermediateFusion, TabICLEncoder, Unimodal
 from kalecancer.pipeline import EarlyStopping, Pipeline
 
 DATA = Path(__file__).resolve().parents[2] / "data" / "hancock"
@@ -110,7 +110,7 @@ def fused_model() -> IntermediateFusion:
             ],
         },
         fusion=Concat(),
-        head=CoxHead(in_dim=128, ties="efron"),
+        endpoint=CoxEndpoint(torch.nn.Linear(128, 1, bias=False), ties="efron"),
     )
 
 
@@ -118,7 +118,9 @@ def clinical_model() -> Unimodal:
     """The baseline: the same clinical encoders and head, without the slides."""
     # the same seed as fused_model, so the clinical encoders of both models start from the same weights
     torch.manual_seed(0)
-    return Unimodal("clinical", encoders=clinical_encoders(), head=CoxHead(in_dim=64, ties="efron"))
+    return Unimodal(
+        "clinical", encoders=clinical_encoders(), endpoint=CoxEndpoint(torch.nn.Linear(64, 1, bias=False), ties="efron")
+    )
 
 
 def build_pipeline(model: torch.nn.Module) -> Pipeline:
@@ -148,20 +150,22 @@ def main() -> None:
 
     # The same split, validation carve and seed, so the two models differ only in the slides.
     baseline = build_pipeline(clinical_model()).fit(train)
-    prediction, baseline_prediction = pipe.predict(test), baseline.predict(test)
+    output, baseline_output = pipe.predict_output(test), baseline.predict_output(test)
     assert test.target is not None
-    target = test.target[prediction.index]
-    context = EvalContext(train_target=pipe.train_target_, classes=None)
-    baseline_context = EvalContext(train_target=baseline.train_target_, classes=None)
-    print("fused Harrell's C, 95% CI:        ", bootstrap_ci(HarrellC(), prediction, target, context))
+    print("fused Harrell's C, 95% CI:        ", bootstrap_ci(HarrellC(), output, test.target, pipe.train_target_))
     print(
         "clinical-only Harrell's C, 95% CI:",
-        bootstrap_ci(HarrellC(), baseline_prediction, target, baseline_context),
+        bootstrap_ci(HarrellC(), baseline_output, test.target, baseline.train_target_),
     )
     print(
         "gain from the slides, 95% CI:     ",
         bootstrap_ci(
-            HarrellC(), prediction, target, context, baseline=baseline_prediction, baseline_context=baseline_context
+            HarrellC(),
+            output,
+            test.target,
+            pipe.train_target_,
+            baseline=baseline_output,
+            baseline_train_target=baseline.train_target_,
         ),
     )
 

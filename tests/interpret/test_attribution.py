@@ -1,6 +1,6 @@
 """Tests for permutation_importance and feature_shapley.
 
-The fitted pipeline's clinical encoder and Cox head are hand-built, with a learning rate of 0 so training leaves
+The fitted pipeline's clinical encoder and Cox endpoint are hand-built, with a learning rate of 0 so training leaves
 them untouched (as in ``test_pipeline.test_fit_starts_from_the_weights_the_model_was_built_with``): the clinical
 encoder reads only ``age`` (zero weight on ``sex``/``smoking``), and the head reads only the clinical embedding
 (zero weight on the wsi branch). That makes ``log_hazard`` an exact, deterministic function of ``age`` alone --
@@ -22,7 +22,7 @@ from torch import nn
 from kalecancer.evaluate import HarrellC, IntegratedBrier
 from kalecancer.interpret import feature_shapley, permutation_importance
 from kalecancer.loaddata import MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
-from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, MaskedMean
+from kalecancer.model import ABMIL, Concat, CoxEndpoint, IntermediateFusion, MaskedMean
 
 
 def _inner_times(data, quantiles=(0.2, 0.4, 0.6)):
@@ -34,7 +34,7 @@ def informative_model() -> IntermediateFusion:
     """``log_hazard`` is an exact, deterministic function of ``age`` alone.
 
     The clinical encoder reads only the first (scaled ``age``) column of the transformed frame -- ``sex``/
-    ``smoking`` get exactly zero weight. The Cox head then reads only the clinical embedding -- the wsi branch
+    ``smoking`` get exactly zero weight. The Cox endpoint then reads only the clinical embedding -- the wsi branch
     gets exactly zero weight too, so its randomly initialised (and, with ``lr=0``, never trained) weights cannot
     affect which feature the model turns out to rely on.
     """
@@ -42,16 +42,17 @@ def informative_model() -> IntermediateFusion:
     with torch.no_grad():
         clinical_encoder.weight[:] = torch.tensor([[1.0, 0.0, 0.0]])
         clinical_encoder.bias.zero_()
+    head = nn.Linear(2, 1, bias=False)
     model = IntermediateFusion(
         encoders={
             "clinical": [clinical_encoder],
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 1)],
         },
         fusion=Concat(),
-        head=CoxHead(in_dim=2, ties="efron"),
+        endpoint=CoxEndpoint(head, ties="efron"),
     )
     with torch.no_grad():
-        model.head.linear.weight[:] = torch.tensor([[1.0, 0.0]])
+        head.weight[:] = torch.tensor([[1.0, 0.0]])
     return model
 
 
@@ -68,16 +69,17 @@ def masked_mean_model() -> IntermediateFusion:
     with torch.no_grad():
         wsi_final.weight.zero_()
         wsi_final.bias.zero_()
+    head = nn.Linear(2, 1, bias=False)
     model = IntermediateFusion(
         encoders={
             "clinical": [clinical_encoder],
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), wsi_final],
         },
         fusion=MaskedMean(),
-        head=CoxHead(in_dim=2, ties="efron"),
+        endpoint=CoxEndpoint(head, ties="efron"),
     )
     with torch.no_grad():
-        model.head.linear.weight[:] = torch.tensor([[1.0, 0.0]])
+        head.weight[:] = torch.tensor([[1.0, 0.0]])
     return model
 
 
@@ -161,7 +163,7 @@ def tabicl_model(tmp_path_factory, monkeypatch):
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 1)],
         },
         fusion=Concat(),
-        head=CoxHead(in_dim=2, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(2, 1, bias=False), ties="efron"),
     )
 
 
@@ -209,7 +211,7 @@ def integer_columns_model() -> IntermediateFusion:
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 2)],
         },
         fusion=Concat(),
-        head=CoxHead(in_dim=4, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(4, 1, bias=False), ties="efron"),
     )
 
 
@@ -320,20 +322,11 @@ def test_sign_is_flipped_for_a_lower_is_better_metric(fitted):
 
     # IntegratedBrier has higher_is_better=False (lower is better): shuffling the informative feature must still
     # be reported as a POSITIVE drop -- this is the whole reason the sign flip exists.
-    importance = permutation_importance(pipe, test, IntegratedBrier(), n_repeats=5, seed=0, survival_times=times)
+    importance = permutation_importance(pipe, test, IntegratedBrier(times), n_repeats=5, seed=0)
     assert importance.loc["age", "mean"] > 0.0
 
-    shapley = feature_shapley(pipe, test, IntegratedBrier(), n_samples=10, seed=0, survival_times=times)
+    shapley = feature_shapley(pipe, test, IntegratedBrier(times), n_samples=10, seed=0)
     assert shapley["age"] > 0.0
-
-
-def test_a_survival_column_metric_without_survival_times_raises_naming_the_parameter(fitted):
-    pipe, _train, test = fitted
-
-    with pytest.raises(ValueError, match="survival_times"):
-        permutation_importance(pipe, test, IntegratedBrier())
-    with pytest.raises(ValueError, match="survival_times"):
-        feature_shapley(pipe, test, IntegratedBrier())
 
 
 def test_allow_seen_default_false_raises_on_training_patients_allow_seen_true_works(fitted):

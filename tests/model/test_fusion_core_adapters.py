@@ -10,15 +10,12 @@ import pytest
 import torch
 from torch import Tensor, nn
 
-from kalecancer.loaddata import Classification
-from kalecancer.model import Concat, FusionContext, FusionMethod, MajorityVote, MaskedMean
+from kalecancer.model import Concat, FusionMethod, MajorityVote, MaskedMean, TensorFusion
 from kalecancer.model.fusion import _masked_mean, _stack_defined
 
 
-class LearnableMean(FusionMethod):
+class LearnableMean(TensorFusion):
     """Custom extension using the existing KaleCancer helper signatures."""
-
-    stages = frozenset({"intermediate"})
 
     def __init__(self) -> None:
         super().__init__()
@@ -32,16 +29,9 @@ class LearnableMean(FusionMethod):
 
 
 @pytest.mark.parametrize(
-    ("method", "context"),
-    [
-        (Concat(), FusionContext.without_data("intermediate", {"a": 2})),
-        (MaskedMean(), FusionContext.without_data("intermediate", {"a": 2})),
-        (MajorityVote("error"), FusionContext.without_data("late", {"a": 2}, {"a": Classification})),
-    ],
-    ids=["concat", "masked_mean", "majority_vote"],
+    "method", [Concat(), MaskedMean(), MajorityVote("error")], ids=["concat", "masked_mean", "majority_vote"]
 )
-def test_adapters_keep_cancer_context_and_skip_batch_validation(method: FusionMethod, context: FusionContext) -> None:
-    method.check(context)
+def test_adapters_skip_batch_validation(method: FusionMethod) -> None:
     assert isinstance(method, FusionMethod)
     assert not method.validate_inputs
     assert method.defined_rows(pd.DataFrame({"a": [True, False]}, index=["001", "002"])).tolist() == [True, False]
@@ -62,22 +52,11 @@ def test_float16_mean_avoids_reduction_overflow() -> None:
         torch.testing.assert_close(value.grad, torch.full_like(value, 0.5))
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_half_precision_votes_return_float32_scores(dtype: torch.dtype) -> None:
-    values = {"a": torch.tensor([[0.9, 0.1]], dtype=dtype), "b": torch.tensor([[0.3, 0.7]], dtype=dtype)}
-    present = dict.fromkeys(values, torch.tensor([True]))
-    scores = MajorityVote("mean_probability")(values, present)
-    expected = (1 + 0.5 * torch.stack(list(values.values())).float().mean(0)) / 2.5
-    torch.testing.assert_close(scores, expected)
-    assert scores.dtype == torch.float32
-    assert scores.argmax(1).item() == 0
-
-
 def test_custom_extension_keeps_parameters_gradients_and_serialization() -> None:
     method = LearnableMean()
     values = {"a": torch.tensor([[3.0]]), "b": torch.tensor([[float("nan")]])}
     present = {"a": torch.tensor([True]), "b": torch.tensor([False])}
-    method.check(FusionContext.without_data("intermediate", {"a": 1, "b": 1}))
+    method.check_widths({"a": 1, "b": 1})
     method(values, present).sum().backward()
     torch.testing.assert_close(method.scale.grad, torch.tensor(3.0))
     stream = io.BytesIO()

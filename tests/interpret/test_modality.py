@@ -1,6 +1,6 @@
 """Tests for leave_one_out_ablation and modality_shapley.
 
-The fitted pipeline's clinical encoder, wsi encoder and Cox head are all hand-built, with a learning rate of 0 so
+The fitted pipeline's clinical encoder, wsi encoder and Cox endpoint are all hand-built, with a learning rate of 0 so
 training leaves them untouched (as in test_attribution.py): the clinical branch reads only ``age``, the wsi
 branch's final layer is zeroed so its embedding is always the constant zero vector -- no information at all,
 regardless of what ABMIL computes upstream of it -- and the head's own combining weight reads only the clinical
@@ -24,7 +24,7 @@ from kalecancer.evaluate import HarrellC
 from kalecancer.interpret import leave_one_out_ablation, modality_shapley
 from kalecancer.interpret.modality import _absent
 from kalecancer.loaddata import MultimodalDataset, Tabular
-from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, LateFusion, MaskedMean, Unimodal
+from kalecancer.model import ABMIL, Concat, CoxEndpoint, IntermediateFusion, LateFusion, MaskedMean, Unimodal
 from kalecancer.pipeline import Pipeline
 
 
@@ -38,16 +38,17 @@ def masked_mean_model() -> IntermediateFusion:
     with torch.no_grad():
         wsi_final.weight.zero_()
         wsi_final.bias.zero_()
+    head = nn.Linear(2, 1, bias=False)
     model = IntermediateFusion(
         encoders={
             "clinical": [clinical_encoder],
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), wsi_final],
         },
         fusion=MaskedMean(),
-        head=CoxHead(in_dim=2, ties="efron"),
+        endpoint=CoxEndpoint(head, ties="efron"),
     )
     with torch.no_grad():
-        model.head.linear.weight[:] = torch.tensor([[1.0, 0.0]])
+        head.weight[:] = torch.tensor([[1.0, 0.0]])
     return model
 
 
@@ -58,7 +59,7 @@ def concat_model() -> IntermediateFusion:
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 2)],
         },
         fusion=Concat(),
-        head=CoxHead(in_dim=4, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(4, 1, bias=False), ties="efron"),
     )
 
 
@@ -118,7 +119,7 @@ def test_three_modalities_scores_exactly_8_coalitions(
             "demographics": [nn.Linear(1, 2)],
         },
         fusion=MaskedMean(),
-        head=CoxHead(in_dim=2, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(2, 1, bias=False), ties="efron"),
     )
     pipe = pipeline_factory(model).fit(train)
 
@@ -220,15 +221,16 @@ def late_fusion_model() -> LateFusion:
             "clinical_lab": IntermediateFusion(
                 encoders={"clinical": [nn.Linear(3, 4)], "lab": [nn.Linear(2, 4)]},
                 fusion=Concat(),
-                head=CoxHead(in_dim=8, ties="efron"),
+                endpoint=CoxEndpoint(nn.Linear(8, 1, bias=False), ties="efron"),
             ),
             "wsi": Unimodal(
                 "wsi",
                 [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
-                CoxHead(in_dim=4, ties="efron"),
+                CoxEndpoint(nn.Linear(4, 1, bias=False), ties="efron"),
             ),
         },
         fusion=MaskedMean(),
+        endpoint=None,
     )
 
 

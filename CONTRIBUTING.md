@@ -95,7 +95,7 @@ Each kind of component has a guide in `docs/extending/`:
 | a new modality | [modalities.md](docs/extending/modalities.md) | `kalecancer/loaddata/modalities.py` |
 | an encoder | [encoders.md](docs/extending/encoders.md) | `kalecancer/model/encode/` |
 | a fusion method | [fusion.md](docs/extending/fusion.md) | `kalecancer/model/fusion.py` |
-| a new endpoint: a target and its head | [endpoints.md](docs/extending/endpoints.md) | `kalecancer/loaddata/targets.py`, `kalecancer/model/heads.py` |
+| a new endpoint: a target, an endpoint and perhaps an output type | [endpoints.md](docs/extending/endpoints.md) | `kalecancer/loaddata/targets.py`, `kalecancer/model/endpoints.py`, `kalecancer/model/outputs.py` |
 
 Every component also follows the [Conventions](#conventions) below. Read [docs/architecture.md](docs/architecture.md) to see how the parts fit together, and [docs/adr/](docs/adr/) for the reasoning behind the current design.
 

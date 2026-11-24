@@ -1,4 +1,4 @@
-"""Evaluate: metrics on prediction frames, bootstrap intervals, and cross-validation over patients."""
+"""Evaluate: metrics on typed model outputs, bootstrap intervals, and cross-validation over patients."""
 
 from kalecancer.evaluate.bootstrap import BootstrapCI, bootstrap_ci
 from kalecancer.evaluate.calibration import CalibrationError, calibration_table
@@ -6,7 +6,6 @@ from kalecancer.evaluate.cross_validation import CVResult, cross_validate
 from kalecancer.evaluate.metrics import (
     AUROC,
     BalancedAccuracy,
-    EvalContext,
     HarrellC,
     IntegratedBrier,
     LogRank,
@@ -22,7 +21,6 @@ __all__ = [
     "BootstrapCI",
     "CVResult",
     "CalibrationError",
-    "EvalContext",
     "HarrellC",
     "IntegratedBrier",
     "LogRank",

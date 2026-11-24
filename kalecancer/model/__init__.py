@@ -1,24 +1,53 @@
-"""Model: encoders, fusion methods, prediction heads, and the fusion models that wire them together."""
+"""Model: encoders, fusion methods, endpoints, typed outputs, and the fusion models that wire them together."""
 
 from kalecancer.model.baseline import BreslowBaseline
 from kalecancer.model.encode.base_encoders import AttentionEncoder, FittedEncoder
 from kalecancer.model.encode.encoder_list import EncoderList
 from kalecancer.model.encode.encoders import ABMIL, MLP
-from kalecancer.model.fusion import Concat, FusionContext, FusionMethod, MajorityVote, MaskedMean
-from kalecancer.model.heads import ClassificationHead, CoxHead, LinearClassifier
-from kalecancer.model.models import EarlyFusion, IntermediateFusion, LateFusion, ModelOutput, Unimodal
+from kalecancer.model.endpoints import BaseEndpoint, ClassificationEndpoint, CoxEndpoint
+from kalecancer.model.fusion import (
+    Concat,
+    FusionMethod,
+    MajorityVote,
+    MaskedMean,
+    OutputFusion,
+    TensorFusion,
+)
+from kalecancer.model.heads import LinearClassifier
+from kalecancer.model.models import (
+    BaseModel,
+    EarlyFusion,
+    IntermediateFusion,
+    LateFusion,
+    SingleEndpointModel,
+    Unimodal,
+)
+from kalecancer.model.outputs import (
+    BaseOutput,
+    ClassProbabilities,
+    ClassScores,
+    CoxOutput,
+    RiskScore,
+    SurvivalFunction,
+    VoteScores,
+)
 
 __all__ = [
     "ABMIL",
     "MLP",
     "AttentionEncoder",
+    "BaseEndpoint",
+    "BaseModel",
+    "BaseOutput",
     "BreslowBaseline",
-    "ClassificationHead",
+    "ClassProbabilities",
+    "ClassScores",
+    "ClassificationEndpoint",
     "Concat",
+    "CoxEndpoint",
+    "CoxOutput",
     "EncoderList",
-    "CoxHead",
     "EarlyFusion",
-    "FusionContext",
     "FusionMethod",
     "FittedEncoder",
     "IntermediateFusion",
@@ -26,8 +55,13 @@ __all__ = [
     "LinearClassifier",
     "MajorityVote",
     "MaskedMean",
-    "ModelOutput",
+    "OutputFusion",
+    "RiskScore",
+    "SingleEndpointModel",
+    "SurvivalFunction",
+    "TensorFusion",
     "Unimodal",
+    "VoteScores",
 ]
 
 

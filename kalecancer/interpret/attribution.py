@@ -127,33 +127,9 @@ def _feature_names(frame: pd.DataFrame, feature_names: Sequence[str] | None) -> 
     return list(feature_names)
 
 
-def _evaluate(
-    pipeline: Pipeline,
-    view: MultimodalDataset,
-    metric: Metric,
-    *,
-    allow_seen: bool,
-    survival_times: Sequence[float] | None,
-) -> float:
-    """Score ``metric`` on ``view``, forwarding ``survival_times``.
-
-    ``Pipeline.evaluate`` already raises when a metric needs ``survival[<time>]`` columns (``IntegratedBrier``,
-    ``CalibrationError``) that ``survival_times`` was never given to produce; its own message names
-    ``survival_times``, but points at ``Pipeline.predict``/``evaluate``/``cross_validate`` -- not at this
-    function's own ``survival_times`` argument, which a caller of ``permutation_importance``/``feature_shapley``
-    is more likely to reach for. Rather than re-implementing that check, this only adds a pointer to it.
-    """
-    try:
-        score = pipeline.evaluate(view, {"score": metric}, allow_seen=allow_seen, survival_times=survival_times)[
-            "score"
-        ]
-    except ValueError as error:
-        if survival_times is None and "'survival[<time>]'" in str(error):
-            raise ValueError(
-                f"{error}; permutation_importance and feature_shapley also accept survival_times directly"
-            ) from error
-        raise
-    return float(score)
+def _evaluate(pipeline: Pipeline, view: MultimodalDataset, metric: Metric, *, allow_seen: bool) -> float:
+    """Score ``metric`` on ``view``. A metric that reads survival curves carries its own times."""
+    return float(pipeline.evaluate(view, {"score": metric}, allow_seen=allow_seen)["score"])
 
 
 def _perturbed_view(
@@ -200,7 +176,6 @@ def permutation_importance(
     n_repeats: int = 10,
     seed: int = 0,
     allow_seen: bool = False,
-    survival_times: Sequence[float] | None = None,
 ) -> pd.DataFrame:
     """Shuffle each clinical feature in turn, among the evaluated patients, and measure the metric drop.
 
@@ -224,9 +199,6 @@ def permutation_importance(
         allow_seen: ``Pipeline.evaluate`` refuses patients used to fit ``pipeline`` unless this is set. Default
             ``False``, explicit here as in ``evaluate`` itself: silently defaulting to ``True`` would make it easy
             to read importance off of patients the model already memorised, overstating every feature at once.
-        survival_times: Forwarded to ``Pipeline.evaluate``. Required for a metric that reads
-            ``survival[<time>]`` columns -- ``IntegratedBrier`` and ``CalibrationError`` -- since neither can
-            otherwise be driven through this function; irrelevant to a ranking metric like ``HarrellC``.
 
     Returns:
         DataFrame indexed by feature name, columns ``mean`` and ``std`` (of the signed drop, over the
@@ -237,9 +209,8 @@ def permutation_importance(
         perturbed, since there is no value of theirs to shuffle.
 
     Raises:
-        ValueError: Under the conditions of :func:`_resolve_tabular_modality` and :func:`_feature_names`, if
-            ``metric`` needs ``survival_times`` and none was given, or if ``name``'s fitted encoder is a
-            ``TabICLEncoder`` (see :func:`_require_no_tabicl`).
+        ValueError: Under the conditions of :func:`_resolve_tabular_modality` and :func:`_feature_names`, or if
+            ``name``'s fitted encoder is a ``TabICLEncoder`` (see :func:`_require_no_tabicl`).
     """
     name, source = _resolve_tabular_modality(data, modality)
     _require_no_tabicl(pipeline, name)
@@ -248,7 +219,7 @@ def permutation_importance(
     features = _feature_names(frame, feature_names)
     sign = 1.0 if metric.higher_is_better else -1.0
 
-    baseline = _evaluate(pipeline, data, metric, allow_seen=allow_seen, survival_times=survival_times)
+    baseline = _evaluate(pipeline, data, metric, allow_seen=allow_seen)
     rng = np.random.default_rng(seed)
     rows: dict[str, dict[str, float]] = {}
     for feature in features:
@@ -257,7 +228,7 @@ def permutation_importance(
         for repeat in range(n_repeats):
             shuffled = pd.Series(rng.permutation(values), index=frame.index)
             view = _perturbed_view(data, name, frame, {feature: shuffled})
-            score = _evaluate(pipeline, view, metric, allow_seen=allow_seen, survival_times=survival_times)
+            score = _evaluate(pipeline, view, metric, allow_seen=allow_seen)
             drops[repeat] = sign * (baseline - score)
         rows[feature] = {"mean": float(drops.mean()), "std": float(drops.std()), "baseline": baseline}
     result = pd.DataFrame.from_dict(rows, orient="index")[["mean", "std", "baseline"]]
@@ -275,7 +246,6 @@ def feature_shapley(
     n_samples: int = 50,
     seed: int = 0,
     allow_seen: bool = False,
-    survival_times: Sequence[float] | None = None,
 ) -> pd.Series:
     """Sampling-based Shapley values of each clinical feature's contribution to ``metric``.
 
@@ -311,8 +281,6 @@ def feature_shapley(
         seed: Seed for the resampling and orderings. A different seed changes every value but not which feature
             ranks highest.
         allow_seen: As in :func:`permutation_importance`.
-        survival_times: As in :func:`permutation_importance` -- required for ``IntegratedBrier`` or
-            ``CalibrationError``.
 
     Returns:
         Series indexed by feature name, named ``"shapley"``. ``.attrs["n_excluded"]`` is how many of ``data``'s
@@ -320,8 +288,8 @@ def feature_shapley(
         perturbed.
 
     Raises:
-        ValueError: Under the conditions of :func:`_resolve_tabular_modality` and :func:`_feature_names`, if
-            ``metric`` needs ``survival_times`` and none was given, or if ``name``'s fitted encoder is a
+        ValueError: Under the conditions of :func:`_resolve_tabular_modality` and :func:`_feature_names`, or if
+            ``name``'s fitted encoder is a
             ``TabICLEncoder`` (see :func:`_require_no_tabicl`).
     """
     name, source = _resolve_tabular_modality(data, modality)
@@ -342,11 +310,11 @@ def feature_shapley(
         order = [features[i] for i in rng.permutation(len(features))]
         still_shuffled = dict(background)
         view = _perturbed_view(data, name, frame, still_shuffled)
-        previous = _evaluate(pipeline, view, metric, allow_seen=allow_seen, survival_times=survival_times)
+        previous = _evaluate(pipeline, view, metric, allow_seen=allow_seen)
         for feature in order:
             del still_shuffled[feature]
             view = _perturbed_view(data, name, frame, still_shuffled)
-            current = _evaluate(pipeline, view, metric, allow_seen=allow_seen, survival_times=survival_times)
+            current = _evaluate(pipeline, view, metric, allow_seen=allow_seen)
             contributions[feature][sample] = sign * (current - previous)
             previous = current
         if (sample + 1) % log_every == 0 or sample + 1 == n_samples:

@@ -49,6 +49,7 @@ A bag also implements `instances(id)`: a DataFrame with one row per instance, **
 ```python
 class NpyBags(BagModality):
     ...  # __init__ and _load as above, with _load returning an (N_i, d) tensor
+
     def _view(self, ids: pd.Index) -> pd.DataFrame:
         frames = []
         for pid in ids:
