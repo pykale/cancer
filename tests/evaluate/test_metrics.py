@@ -355,7 +355,13 @@ def test_integrated_brier_guards(survival):
     for times in ([20.0], [20.0, 20.0], [30.0, 20.0]):
         with pytest.raises(ValueError, match="at least two strictly increasing times"):
             IntegratedBrier(times)
+    # NaN slips past the strictly-increasing check (comparisons with NaN are False) and negative times
+    # are strictly increasing, so both need their own check -- as CalibrationError already does.
+    for times in ([float("nan"), 1.0], [1.0, float("inf")], [-1.0, 1.0]):
+        with pytest.raises(ValueError, match="at least two strictly increasing times"):
+            IntegratedBrier(times)
     assert IntegratedBrier([5.0, 20.0]).times == [5.0, 20.0]
+    assert IntegratedBrier([0.0, 20.0]).times == [0.0, 20.0]
     output = _with_baseline(train, prediction)
     first, last = float(test["time"].min()), float(test["time"].max())
     with pytest.raises(ValueError, match="within the follow-up of the target"):
