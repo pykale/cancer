@@ -151,6 +151,12 @@ def _dump(value: Any, path: str) -> Any:
         return {key: _dump(item, f"{path}.{key}") for key, item in value.items()}
     if isinstance(value, functools.partial):
         return _dump_partial(value, path)
+    if isinstance(value, torch.Tensor):
+        # a tensor is not rebuilt from attributes named after its constructor's parameters, so
+        # _dump_object would keep only its class and silently drop the values
+        raise TypeError(
+            f"{path}: cannot dump a tensor; pass a plain list or number instead, or build this component in code"
+        )
     return _dump_object(value, path)
 
 

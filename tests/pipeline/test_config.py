@@ -13,7 +13,7 @@ from torch import nn
 
 from kalecancer.evaluate import HarrellC, UnoC
 from kalecancer.loaddata import MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
-from kalecancer.model import ABMIL, Concat, CoxEndpoint, IntermediateFusion
+from kalecancer.model import ABMIL, ClassificationEndpoint, Concat, CoxEndpoint, IntermediateFusion
 from kalecancer.pipeline import EarlyStopping, Pipeline, dump_config, load_pipeline
 from kalecancer.prepdata import ColumnGroup, TableTransform
 
@@ -136,4 +136,15 @@ def test_components_must_store_their_arguments():
         endpoint=CoxEndpoint(nn.Linear(8, 1, bias=False), "efron"),
     )
     with pytest.raises(TypeError, match="does not store its argument 'factor'"):
+        dump_config(pipe)
+
+
+def test_tensor_arguments_raise_instead_of_being_dropped():
+    pipe = build_pipeline()
+    pipe.model = IntermediateFusion(
+        encoders={"clinical": [nn.Linear(3, 4)], "wsi": [ABMIL(16, 4, 4, 0.0)]},
+        fusion=Concat(),
+        endpoint=ClassificationEndpoint(nn.Linear(8, 2), nn.CrossEntropyLoss(weight=torch.tensor([1.0, 3.0]))),
+    )
+    with pytest.raises(TypeError, match=r"pipeline\.model\.endpoint\.loss_fn\.weight: cannot dump a tensor"):
         dump_config(pipe)
