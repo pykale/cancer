@@ -14,23 +14,10 @@ from collections.abc import Sequence
 import numpy as np
 import pandas as pd
 
-from kalecancer.evaluate.metrics import Metric, _defined, _event_time, _outcomes, _quantile_groups
+from kalecancer.evaluate.metrics import Metric, _check_times, _defined, _event_time, _outcomes, _quantile_groups
 from kalecancer.evaluate.stratify import _km_survival_at
 from kalecancer.loaddata.targets import BaseTarget, TimeToEvent
 from kalecancer.model.outputs import BaseOutput, SurvivalFunction
-
-
-def _check_times(times: Sequence[float], what: str) -> list[float]:
-    """``times`` as floats, after checking there is at least one and they strictly increase."""
-    checked = [float(t) for t in times]
-    if (
-        not checked
-        or not np.isfinite(checked).all()
-        or any(t < 0 for t in checked)
-        or any(b <= a for a, b in zip(checked, checked[1:], strict=False))
-    ):
-        raise ValueError(f"{what} needs finite times >= 0, strictly increasing, got {times!r}")
-    return checked
 
 
 def calibration_table(
@@ -129,7 +116,7 @@ class CalibrationError(Metric):
     requires = SurvivalFunction
 
     def __init__(self, times: Sequence[float], n_bins: int = 5):
-        _check_times(times, "CalibrationError")
+        _check_times(times, "CalibrationError", minimum=1)
         self.times = list(times)
         self.n_bins = n_bins
 
