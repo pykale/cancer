@@ -119,6 +119,21 @@ def _defined(value: float, reason: str) -> float:
     return value
 
 
+def _check_times(times: Sequence[float], what: str, minimum: int = 1) -> list[float]:
+    """``times`` as floats, after checking there are at least ``minimum`` and they strictly increase."""
+    checked = [float(t) for t in times]
+    if (
+        len(checked) < minimum
+        or not np.isfinite(checked).all()
+        or any(t < 0 for t in checked)
+        or any(b <= a for a, b in zip(checked, checked[1:], strict=False))
+    ):
+        raise ValueError(
+            f"{what} needs at least {minimum} strictly increasing times that are finite and >= 0, got {times!r}"
+        )
+    return checked
+
+
 def _survival_inputs(metric: Metric, output: BaseOutput, target: BaseTarget) -> tuple[torch.Tensor, ...]:
     assert isinstance(output, RiskScore), "__call__ checked the output type"
     event, time = _event_time(_outcomes(output, target, TimeToEvent, repr(metric)))
@@ -234,16 +249,14 @@ class IntegratedBrier(Metric):
     follow-up: min target time <= first time and last time < max target time.
 
     Args:
-        times: At least two strictly increasing times.
+        times: At least two strictly increasing times, each finite and >= 0.
     """
 
     higher_is_better = False
     requires = SurvivalFunction
 
     def __init__(self, times: Sequence[float]):
-        checked = [float(t) for t in times]
-        if len(checked) < 2 or any(b <= a for a, b in zip(checked, checked[1:], strict=False)):
-            raise ValueError(f"IntegratedBrier needs at least two strictly increasing times, got {times!r}")
+        _check_times(times, "IntegratedBrier", minimum=2)
         self.times = list(times)
 
     def score(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
