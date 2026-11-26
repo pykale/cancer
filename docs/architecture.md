@@ -105,8 +105,10 @@ intermediate = IntermediateFusion(
     endpoint=CoxEndpoint(nn.Linear(128, 1, bias=False), ties="efron"),
 )
 
+
 def classifier(d):
     return ClassificationEndpoint(nn.Linear(d, 2), nn.CrossEntropyLoss())
+
 
 late = LateFusion(
     branches={
