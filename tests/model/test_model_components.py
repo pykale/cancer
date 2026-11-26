@@ -5,20 +5,25 @@ import pandas as pd
 import pytest
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from kalecancer.loaddata import Classification, TimeToEvent
 from kalecancer.model import (
     ABMIL,
     MLP,
-    ClassificationHead,
+    ClassificationEndpoint,
+    ClassProbabilities,
     Concat,
-    CoxHead,
+    CoxEndpoint,
+    CoxOutput,
     EncoderList,
     FittedEncoder,
-    FusionContext,
-    FusionMethod,
     MajorityVote,
     MaskedMean,
+    OutputFusion,
+    RiskScore,
+    TensorFusion,
+    VoteScores,
 )
 
 TARGET_IDS = pd.Index(["001", "002", "003"])
@@ -174,7 +179,7 @@ def test_encoder_list_output_must_be_one_floating_point_row_per_patient():
         EncoderList([], "clinical")(torch.ones(4, 2, dtype=torch.long), IDS)
 
 
-# ---------------------------------------------------------------- Cox head
+# ---------------------------------------------------------------- Cox endpoint
 
 
 def reference_cox_nll(log_hazard, time, event, ties):
@@ -194,6 +199,15 @@ def reference_cox_nll(log_hazard, time, event, ties):
     return total
 
 
+def cox_output(log_hazard):
+    log_hazard = torch.as_tensor(log_hazard, dtype=torch.float32).reshape(-1)
+    return CoxOutput(
+        ids=[str(k) for k in range(len(log_hazard))],
+        defined=torch.ones(len(log_hazard), dtype=torch.bool),
+        risk=log_hazard,
+    )
+
+
 @pytest.mark.parametrize("ties", ["efron", "breslow"])
 def test_cox_loss_matches_reference_with_ties(ties):
     rng = np.random.default_rng(0)
@@ -201,74 +215,90 @@ def test_cox_loss_matches_reference_with_ties(ties):
     time = rng.integers(1, 12, n).astype(np.float64)
     event = rng.random(n) < 0.6
     log_hazard = rng.normal(size=n)
-    head = CoxHead(in_dim=1, ties=ties)
-    loss = head.loss(
-        torch.tensor(log_hazard, dtype=torch.float32).unsqueeze(1),
-        {"time": torch.tensor(time, dtype=torch.float32), "event": torch.tensor(event)},
+    endpoint = CoxEndpoint(nn.Linear(1, 1, bias=False), ties=ties)
+    loss = endpoint.loss(
+        cox_output(log_hazard), {"time": torch.tensor(time, dtype=torch.float32), "event": torch.tensor(event)}
     )
     expected = reference_cox_nll(log_hazard, time, event, ties) / event.sum()
     assert loss.item() == pytest.approx(expected, rel=1e-5)
 
 
 def test_cox_loss_is_none_without_a_comparable_event():
-    head = CoxHead(in_dim=1, ties="efron")
-    output = torch.randn(4, 1)
+    endpoint = CoxEndpoint(nn.Linear(1, 1, bias=False), "efron")
+    output = cox_output(torch.randn(4))
     all_censored = {"time": torch.tensor([1.0, 2.0, 3.0, 4.0]), "event": torch.zeros(4, dtype=torch.bool)}
     only_last_dies = {"time": torch.tensor([1.0, 2.0, 3.0, 4.0]), "event": torch.tensor([False, False, False, True])}
-    assert head.loss(output, all_censored) is None
-    assert head.loss(output, only_last_dies) is None
-    assert head.loss(output[:1], {"time": torch.tensor([1.0]), "event": torch.tensor([True])}) is None
+    assert endpoint.loss(output, all_censored) is None
+    assert endpoint.loss(output, only_last_dies) is None
+    one = {"time": torch.tensor([1.0]), "event": torch.tensor([True])}
+    assert endpoint.loss(output.select(torch.tensor([0])), one) is None
 
 
 def test_cox_loss_requires_bool_events_and_finite_values():
-    head = CoxHead(in_dim=1, ties="efron")
+    endpoint = CoxEndpoint(nn.Linear(1, 1, bias=False), "efron")
     target = {"time": torch.tensor([1.0, 2.0]), "event": torch.tensor([1, 0])}
     with pytest.raises(TypeError, match="bool"):
-        head.loss(torch.randn(2, 1), target)
-    diverged = torch.tensor([[float("nan")], [0.0]])
+        endpoint.loss(cox_output(torch.randn(2)), target)
+    diverged = cox_output([float("nan"), 0.0])
     with pytest.raises(FloatingPointError):
-        head.loss(diverged, {"time": torch.tensor([1.0, 2.0]), "event": torch.tensor([True, True])})
+        endpoint.loss(diverged, {"time": torch.tensor([1.0, 2.0]), "event": torch.tensor([True, True])})
 
 
 def test_cox_loss_is_computed_in_float32_under_autocast():
     torch.manual_seed(0)
-    head = CoxHead(in_dim=3, ties="efron")
+    endpoint = CoxEndpoint(nn.Linear(3, 1, bias=False), "efron")
     z = torch.randn(32, 3) * 8
     target = {"time": torch.rand(32) * 100 + 1, "event": torch.rand(32) < 0.5}
-    reference = head.loss(head(z), target)
+    ids, everyone = [str(k) for k in range(32)], torch.ones(32, dtype=torch.bool)
+    reference = endpoint.loss(endpoint.to_output(endpoint(z), ids, everyone), target)
     with torch.autocast("cpu", dtype=torch.bfloat16):
-        mixed = head.loss(head(z), target)
+        mixed = endpoint.loss(endpoint.to_output(endpoint(z), ids, everyone), target)
     assert mixed.dtype == torch.float32
     assert mixed.item() == pytest.approx(reference.item(), rel=1e-4)
 
 
-def test_cox_head_checks_target_type():
+def test_cox_endpoint_checks_target_type_and_builds_cox_outputs():
     class Subclassed(TimeToEvent):
         pass
 
-    head = CoxHead(in_dim=4, ties="efron")
-    head.check_target(SURVIVAL)
-    head.check_target(Subclassed(SURVIVAL.time, SURVIVAL.event))
+    endpoint = CoxEndpoint(nn.Linear(4, 1, bias=False), "efron")
+    endpoint.check_target(SURVIVAL)
+    endpoint.check_target(Subclassed(SURVIVAL.time, SURVIVAL.event))
     with pytest.raises(TypeError, match="time-to-event"):
-        head.check_target(BINARY)
-    assert head.columns(SURVIVAL) == ["log_hazard"]
-    assert head.linear.bias is None
+        endpoint.check_target(BINARY)
+    with pytest.raises(ValueError, match="ties"):
+        CoxEndpoint(nn.Linear(4, 1, bias=False), "exact")
+    output = endpoint.to_output(endpoint(torch.randn(3, 4)), list(TARGET_IDS), torch.ones(3, dtype=torch.bool))
+    assert isinstance(output, CoxOutput) and output.risk.shape == (3,)
+    assert list(output.detach_cpu().frame().columns) == ["log_hazard"]
+    assert endpoint.output_type is CoxOutput and not endpoint.decomposable_loss
 
 
-# ---------------------------------------------------------------- classification head
+# ---------------------------------------------------------------- classification endpoint
 
 
-def test_classification_head_contract():
-    head = ClassificationHead(in_dim=4, n_classes=2)
-    logits = head(torch.randn(5, 4))
-    labels = torch.tensor([0, 1, 1, 0, 1])
-    assert head.loss(logits, {"label": labels}).item() == pytest.approx(F.cross_entropy(logits, labels).item())
-    assert head.predict(logits).sum(dim=1).allclose(torch.ones(5))
-    assert head.columns(BINARY) == ["probability[low]", "probability[high]"]
-    with pytest.raises(ValueError, match="n_classes=2"):
-        head.check_target(Classification(pd.Series(["a", "b", "c"], index=TARGET_IDS), classes=["a", "b", "c"]))
+def test_classification_endpoint_contract():
+    endpoint = ClassificationEndpoint(nn.Linear(4, 2), nn.CrossEntropyLoss())
     with pytest.raises(TypeError, match="classification target"):
-        head.check_target(SURVIVAL)
+        endpoint.check_target(SURVIVAL)
+    endpoint.check_target(BINARY)
+    endpoint.bind(BINARY)
+    ids = [str(k) for k in range(5)]
+    output = endpoint.to_output(endpoint(torch.randn(5, 4)), ids, torch.ones(5, dtype=torch.bool))
+    labels = torch.tensor([0, 1, 1, 0, 1])
+    loss = endpoint.loss(output, {"label": labels})
+    assert loss.item() == pytest.approx(F.cross_entropy(output.logits, labels).item())
+    assert output.probabilities.sum(dim=1).allclose(torch.ones(5))
+    assert list(output.detach_cpu().frame().columns) == ["probability[low]", "probability[high]"]
+    assert endpoint.output_type is ClassProbabilities
+
+
+def test_classification_endpoint_takes_any_torch_loss_and_declares_one_column_per_class():
+    endpoint = ClassificationEndpoint(nn.Linear(4, 2), nn.CrossEntropyLoss(label_smoothing=0.1), decomposable_loss=True)
+    endpoint.bind(BINARY)
+    assert endpoint.out_dim == 2 and CoxEndpoint(nn.Linear(4, 1, bias=False), "efron").out_dim == 1
+    assert endpoint.decomposable_loss
+    assert not ClassificationEndpoint(nn.Linear(4, 2), nn.CrossEntropyLoss()).decomposable_loss
 
 
 # ---------------------------------------------------------------- fusion methods
@@ -277,11 +307,6 @@ def test_classification_head_contract():
 def scatter_nan(values: torch.Tensor, present: torch.Tensor) -> torch.Tensor:
     full = values.new_full((len(present), values.shape[1]), float("nan"))
     return full.index_put((present.nonzero().squeeze(1),), values)
-
-
-def late_context(covered, kinds, width=1):
-    present = pd.DataFrame(covered)
-    return FusionContext("late", present, pd.Series(True, index=present.index), dict.fromkeys(present, width), kinds)
 
 
 def test_concat_defines_only_patients_with_every_input():
@@ -296,43 +321,32 @@ def test_concat_defines_only_patients_with_every_input():
     ("method", "branch", "failing"),
     [(Concat, False, 2), (Concat, True, 1), (MaskedMean, False, 1), (MaskedMean, True, 0)],
 )
-def test_fusion_check_requires_the_patients_the_model_must_cover(method, branch, failing):
+def test_fusion_methods_define_the_patients_a_model_can_cover(method, branch, failing):
     present = pd.DataFrame({"clinical": [True, True, False], "wsi": [True, False, False]}, index=["001", "002", "003"])
     # a LateFusion branch must cover only the patients with some of its modalities
     required = present.any(axis=1) if branch else pd.Series(True, index=present.index)
-    context = FusionContext("intermediate", present, required, {"clinical": 4, "wsi": 4})
-    if failing:
-        with pytest.raises(ValueError, match=f"cannot combine {failing} patients"):
-            method().check(context)
-    else:
-        method().check(context)
+    defined = method().defined_rows(present)
+    assert defined.index.equals(present.index)
+    assert int((required & ~defined).sum()) == failing
 
 
-def test_fusion_methods_reject_stages_they_do_not_support():
-    classification = {"a": Classification, "b": Classification}
-    with pytest.raises(TypeError, match="Concat is for early or intermediate fusion, not late fusion"):
-        Concat().check(FusionContext.without_data("late", {"a": 2, "b": 2}, classification))
-    with pytest.raises(TypeError, match="MajorityVote is for late fusion, not intermediate fusion"):
-        MajorityVote(tie_break="error").check(FusionContext.without_data("intermediate", {"a": 2, "b": 2}))
-    MaskedMean().check(FusionContext.without_data("early", {"a": None, "b": None}))
-    MaskedMean().check(FusionContext.without_data("late", {"a": 2, "b": 2}, classification))
+def test_fusion_methods_declare_their_stages_by_the_interfaces_they_implement():
+    classification = {"a": ClassProbabilities, "b": ClassProbabilities}
+    assert isinstance(Concat(), TensorFusion) and not isinstance(Concat(), OutputFusion)
+    vote = MajorityVote(tie_break="error")
+    assert isinstance(vote, OutputFusion) and not isinstance(vote, TensorFusion)
+    assert isinstance(MaskedMean(), TensorFusion) and isinstance(MaskedMean(), OutputFusion)
+    MaskedMean().check_widths({"a": 2, "b": 2})
+    assert MaskedMean().output_type(classification) is ClassProbabilities
 
 
 def test_fusion_method_subclasses_must_implement_defined():
-    class Incomplete(FusionMethod):
-        stages = frozenset({"intermediate"})
-
+    class Incomplete(TensorFusion):
         def forward(self, values, present):
             return values
 
     with pytest.raises(TypeError, match=r"abstract method.*defined"):
         Incomplete()
-
-
-def test_fusion_context_rejects_required_patients_indexed_unlike_present():
-    present = pd.DataFrame({"a": [True, False]}, index=["001", "002"])
-    with pytest.raises(ValueError, match="indexed like present"):
-        FusionContext("intermediate", present, pd.Series(True, index=["001"]), {"a": 2})
 
 
 def test_masked_mean_averages_present_rows_with_finite_gradients():
@@ -349,30 +363,41 @@ def test_masked_mean_averages_present_rows_with_finite_gradients():
     fused.sum().backward()
     assert torch.isfinite(project.weight.grad).all()
     with pytest.raises(ValueError, match="one width"):
-        MaskedMean().check(FusionContext.without_data("intermediate", {"a": 2, "b": 3}))
+        MaskedMean().check_widths({"a": 2, "b": 3})
 
 
-def test_masked_mean_in_late_fusion_rejects_cox_heads_with_missing_branches():
-    class Subclassed(TimeToEvent):
-        pass
-
-    cox = {"a": TimeToEvent, "b": TimeToEvent}
-    MaskedMean().check(late_context({"a": [True, True], "b": [True, True]}, cox))
+def test_masked_mean_in_late_fusion_rejects_relative_risks_with_missing_branches():
+    cox = {"a": CoxOutput, "b": CoxOutput}
+    complete = pd.DataFrame({"a": [True, True], "b": [True, True]})
+    incomplete = pd.DataFrame({"a": [True, True], "b": [True, False]})
+    MaskedMean().check_branches(complete, cox)
     with pytest.raises(ValueError, match="arbitrary offset"):
-        MaskedMean().check(late_context({"a": [True, True], "b": [True, False]}, cox))
+        MaskedMean().check_branches(incomplete, cox)
     with pytest.raises(ValueError, match="arbitrary offset"):
-        MaskedMean().check(late_context({"a": [True, True], "b": [True, False]}, dict.fromkeys(cox, Subclassed)))
-    classification = {"a": Classification, "b": Classification}
-    MaskedMean().check(late_context({"a": [True, True], "b": [True, False]}, classification, width=2))
-    with pytest.raises(TypeError, match="one kind"):
-        MaskedMean().check(late_context({"a": [True], "b": [True]}, {"a": TimeToEvent, "b": Classification}))
+        MaskedMean().check_branches(incomplete, dict.fromkeys(cox, RiskScore))
+    MaskedMean().check_branches(incomplete, {"a": ClassProbabilities, "b": ClassProbabilities})
+    assert MaskedMean().output_type(cox) is RiskScore
+    with pytest.raises(TypeError, match="one output type"):
+        MaskedMean().output_type({"a": CoxOutput, "b": ClassProbabilities})
+
+
+def probabilities(p):
+    """Class probabilities ``p`` as a branch output: their logs are logits whose softmax is ``p``."""
+    return ClassProbabilities(
+        ids=[str(k) for k in range(len(p))],
+        defined=torch.ones(len(p), dtype=torch.bool),
+        logits=p.log(),
+        classes=(0, 1),
+    )
 
 
 def test_majority_vote_breaks_ties_by_mean_probability():
-    p_a = torch.tensor([[0.9, 0.1], [0.6, 0.4], [0.2, 0.8]])
-    p_b = torch.tensor([[0.3, 0.7], [0.4, 0.6], [0.1, 0.9]])
+    p_a = probabilities(torch.tensor([[0.9, 0.1], [0.6, 0.4], [0.2, 0.8]]))
+    p_b = probabilities(torch.tensor([[0.3, 0.7], [0.4, 0.6], [0.1, 0.9]]))
     defined = {"a": torch.ones(3, dtype=torch.bool), "b": torch.ones(3, dtype=torch.bool)}
-    scores = MajorityVote(tie_break="mean_probability")({"a": p_a, "b": p_b}, defined)
+    voted = MajorityVote(tie_break="mean_probability")({"a": p_a, "b": p_b}, defined)
+    assert type(voted) is VoteScores and voted.classes == (0, 1) and voted.ids == p_a.ids
+    scores = voted.scores
     torch.testing.assert_close(scores.sum(dim=1), torch.ones(3))
     # patient 0: tie, mean probability favours class 0 (0.6 vs 0.4); patient 1: tie, mean 0.5/0.5 is exact
     assert scores[0].argmax().item() == 0
@@ -381,18 +406,18 @@ def test_majority_vote_breaks_ties_by_mean_probability():
         MajorityVote(tie_break="error")({"a": p_a, "b": p_b}, defined)
 
 
-def test_majority_vote_uses_only_defined_branches_and_needs_classification_heads():
-    p_a = torch.tensor([[0.9, 0.1]])
-    p_b = torch.tensor([[float("nan"), float("nan")]])
+def test_majority_vote_uses_only_defined_branches_and_needs_class_probabilities():
+    p_a = probabilities(torch.tensor([[0.9, 0.1]]))
+    p_b = probabilities(torch.tensor([[float("nan"), float("nan")]]))
     defined = {"a": torch.tensor([True]), "b": torch.tensor([False])}
-    scores = MajorityVote(tie_break="error")({"a": p_a, "b": p_b}, defined)
+    scores = MajorityVote(tie_break="error")({"a": p_a, "b": p_b}, defined).scores
     assert scores[0].argmax().item() == 0 and torch.isfinite(scores).all()
 
-    class Subclassed(Classification):
+    class Subclassed(ClassProbabilities):
         pass
 
     vote = MajorityVote(tie_break="error")
-    vote.check(late_context({"a": [True], "b": [True]}, {"a": Classification, "b": Subclassed}, width=2))
-    for kinds in ({"a": TimeToEvent, "b": TimeToEvent}, {"a": Classification, "b": None}):
-        with pytest.raises(TypeError, match="classification heads"):
-            vote.check(late_context({"a": [True], "b": [True]}, kinds, width=2))
+    assert vote.output_type({"a": ClassProbabilities, "b": Subclassed}) is VoteScores
+    for kinds in ({"a": CoxOutput, "b": CoxOutput}, {"a": ClassProbabilities, "b": VoteScores}):
+        with pytest.raises(TypeError, match="class probabilities"):
+            vote.output_type(kinds)

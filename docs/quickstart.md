@@ -6,24 +6,17 @@ Install with `uv sync --all-extras`, then run an example from the repository roo
 uv run python examples/<dir>/<script>.py
 ```
 
-Each example is a standalone script. Start with the synthetic one, then read a HANCOCK script to see the same
-`Pipeline` on real data. For how the pieces fit together, see [architecture.md](architecture.md).
+Each example is a standalone script. Start with the synthetic one, then read a HANCOCK script to see the same `Pipeline` on real data. For how the pieces fit together, see [architecture.md](architecture.md).
 
 ## Synthetic
 
-[examples/synthetic/synthetic.py](../examples/synthetic/survival.py) is the smallest end-to-end
-run. It generates a cohort of a clinical table, patch features and censored survival times, and trains an
-intermediate-fusion Cox model. It runs on CPU in under a minute and downloads nothing. The notebook
-[survival.ipynb](../examples/synthetic/survival.ipynb) is the same example.
+[examples/synthetic/synthetic.py](../examples/synthetic/survival.py) is the smallest end-to-end run. It generates a cohort of a clinical table, patch features and censored survival times, and trains an intermediate-fusion Cox model. It runs on CPU in under a minute and downloads nothing. The notebook [survival.ipynb](../examples/synthetic/survival.ipynb) is the same example.
 
 ## HANCOCK
 
-These need a local copy of the HANCOCK data in `data/hancock/`, which git ignores. Full cohorts should be trained on a
-GPU machine; the scripts fall back to CPU when no GPU is found. Each one takes a published split (`in`, `out` or
-`Oropharynx`) from `SPLIT_NAME` at the top of the file.
+These need a local copy of the HANCOCK data in `data/hancock/`, which git ignores. Full cohorts should be trained on a GPU machine; the scripts fall back to CPU when no GPU is found. Each one takes a published split (`in`, `out` or `Oropharynx`) from `SPLIT_NAME` at the top of the file.
 
-All four use a clinical table (encoded by TabICL) and primary-tumour patch features (attention MIL), and require
-patients to have both.
+All four use a clinical table (encoded by TabICL) and primary-tumour patch features (attention MIL), and require patients to have both.
 
 | Script | Task | Fusion | What it shows |
 | --- | --- | --- | --- |
@@ -37,5 +30,4 @@ Choosing between them:
 - **Learning the API:** the synthetic example, then `survival_intermediate.py`.
 - **Configuring without code:** `from_config.py`.
 - **A more reliable estimate than one split:** `cross_validation.py`.
-- **A different endpoint or fusion:** `classification_late.py`. It changes the target, head and fusion, and the
-  `Pipeline` stays the same.
+- **A different endpoint or fusion:** `classification_late.py`. It changes the target, head and fusion, and the `Pipeline` stays the same.

@@ -13,7 +13,7 @@ from torch import nn
 
 from kalecancer.evaluate import HarrellC, UnoC
 from kalecancer.loaddata import MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
-from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion
+from kalecancer.model import ABMIL, Concat, CoxEndpoint, IntermediateFusion
 from kalecancer.pipeline import EarlyStopping, Pipeline, dump_config, load_pipeline
 from kalecancer.prepdata import ColumnGroup, TableTransform
 
@@ -25,7 +25,7 @@ def build_pipeline(metric=None):
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
         },
         fusion=Concat(),
-        head=CoxHead(in_dim=8, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(8, 1, bias=False), "efron"),
     )
     transform = TableTransform(
         groups={
@@ -64,7 +64,9 @@ def same(a, b):
 def test_dump_load_dump_is_a_fixed_point():
     first = dump_config(build_pipeline(metric=UnoC(tau=500.0)))
     assert first["class_path"] == "kalecancer.pipeline.Pipeline"
-    assert first["init_args"]["model"]["init_args"]["head"]["init_args"] == {"in_dim": 8, "ties": "efron"}
+    endpoint = first["init_args"]["model"]["init_args"]["endpoint"]
+    assert endpoint["class_path"] == "kalecancer.model.CoxEndpoint" and endpoint["init_args"]["ties"] == "efron"
+    assert endpoint["init_args"]["head"]["init_args"] == {"in_features": 8, "out_features": 1, "bias": False}
     assert first["init_args"]["optimizer"]["init_args"]["lr"] == 1e-2
     second = dump_config(load_pipeline(first))
     assert same(first, second)
@@ -107,7 +109,7 @@ def config_with(change):
     "change",
     [
         lambda c: c.update(batchsize=8),
-        lambda c: c["model"]["init_args"]["head"]["init_args"].update(ties="efronn"),
+        lambda c: c["model"]["init_args"]["endpoint"]["init_args"].update(ties="efronn"),
         lambda c: c["transforms"]["clinical"]["init_args"]["groups"]["numeric"]["init_args"]["steps"][0].update(
             init_args={"with_meen": False}
         ),
@@ -131,7 +133,7 @@ def test_components_must_store_their_arguments():
     pipe.model = IntermediateFusion(
         encoders={"clinical": [Scale(2.0), nn.Linear(3, 4)], "wsi": [ABMIL(16, 4, 4, 0.0)]},
         fusion=Concat(),
-        head=CoxHead(in_dim=8, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(8, 1, bias=False), "efron"),
     )
     with pytest.raises(TypeError, match="does not store its argument 'factor'"):
         dump_config(pipe)

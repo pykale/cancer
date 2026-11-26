@@ -16,13 +16,13 @@ from typing import TYPE_CHECKING, Any
 
 import lightning.pytorch as L
 import numpy as np
-import pandas as pd
 import torch
 from lightning.pytorch.callbacks import EarlyStopping as _LightningEarlyStopping
 from torch import Tensor, nn
 
-from kalecancer.evaluate.metrics import EvalContext, Metric
-from kalecancer.model.models import ModelOutput
+from kalecancer.evaluate.metrics import Metric
+from kalecancer.loaddata.targets import BaseTarget
+from kalecancer.model.outputs import BaseOutput
 
 if TYPE_CHECKING:
     from kalecancer.pipeline.pipeline import EarlyStopping
@@ -45,24 +45,6 @@ def _parameter_groups(model: nn.Module, overrides: Mapping[str, Mapping[str, flo
         groups.append({"params": params, **options})
     rest = [p for _, p in named if id(p) not in claimed]
     return ([{"params": rest}] if rest else []) + groups
-
-
-def _to_cpu(output: ModelOutput) -> ModelOutput:
-    return ModelOutput(
-        output=output.output.detach().float().cpu(),
-        prediction=output.prediction.detach().float().cpu(),
-        defined=output.defined.detach().cpu(),
-        branches={name: _to_cpu(branch) for name, branch in output.branches.items()},
-    )
-
-
-def _concatenate(outputs: list[ModelOutput]) -> ModelOutput:
-    return ModelOutput(
-        output=torch.cat([o.output for o in outputs]),
-        prediction=torch.cat([o.prediction for o in outputs]),
-        defined=torch.cat([o.defined for o in outputs]),
-        branches={name: _concatenate([o.branches[name] for o in outputs]) for name in outputs[0].branches},
-    )
 
 
 def _record_non_finite(found: dict[str, set[str]], batch: dict) -> None:
@@ -90,9 +72,8 @@ class _TrainingModule(L.LightningModule):
         optimizer: Callable,
         param_groups: Mapping | None,
         monitor: Metric | str | None,
-        validation_target: pd.DataFrame | None,
-        context: EvalContext,
-        columns: list[str],
+        validation_target: BaseTarget | None,
+        train_target: BaseTarget,
     ):
         super().__init__()
         self.model = model
@@ -100,8 +81,7 @@ class _TrainingModule(L.LightningModule):
         self.param_groups = param_groups
         self.monitor = monitor
         self.validation_target = validation_target
-        self.context = context
-        self.columns = columns
+        self.train_target = train_target
         self.history: list[dict] = []
         self.optimizer_steps = 0
         self._has_loss = False
@@ -130,20 +110,20 @@ class _TrainingModule(L.LightningModule):
 
     def validation_step(self, batch: dict, batch_index: int) -> None:
         _record_non_finite(self.non_finite, batch)
-        target = {key: value.detach().cpu() for key, value in batch["target"].items()}
-        self._validation.append((batch["ids"], _to_cpu(self.model(batch)), target))
+        # kept on the model's device until the epoch's loss is computed, since the loss can hold tensors there, such as
+        # the class weights of a weighted nn.CrossEntropyLoss
+        self._validation.append((self.model(batch), batch["target"]))
 
     def on_validation_epoch_end(self) -> None:
-        ids = [pid for batch_ids, _, _ in self._validation for pid in batch_ids]
-        output = _concatenate([out for _, out, _ in self._validation])
-        target = {key: torch.cat([t[key] for _, _, t in self._validation]) for key in self._validation[0][2]}
+        output = BaseOutput.cat([out for out, _ in self._validation])
+        target = {key: torch.cat([t[key] for _, t in self._validation]) for key in self._validation[0][1]}
         self._validation.clear()
         losses = self.model.loss(output, target)
         row = {"val_loss": float(losses["loss"]) if losses is not None else float("nan")}
         if isinstance(self.monitor, Metric):
             assert self.validation_target is not None, "a Metric monitor needs a validation target"
-            prediction = pd.DataFrame(output.prediction.numpy(), index=pd.Index(ids, name="id"), columns=self.columns)
-            row["val_metric"] = float(self.monitor(prediction, self.validation_target.loc[ids], self.context))
+            output = output.detach_cpu()
+            row["val_metric"] = float(self.monitor(output, self.validation_target, self.train_target))
         if self.monitor is not None:
             self.log("monitor", row["val_loss"] if self.monitor == "loss" else row["val_metric"])
         self._last_validation = row

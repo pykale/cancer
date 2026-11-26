@@ -1,113 +1,80 @@
 """Fusion methods: how early, intermediate and late fusion combine their inputs.
 
-A fusion method combines named inputs that a patient may lack: modality vectors in ``EarlyFusion`` and
-``IntermediateFusion``, and branch outputs in ``LateFusion``. Each method owns the rules for when it can be used. A
-model describes the experiment in a ``FusionContext`` and calls ``check`` with it, once when the model is built and
-again for each dataset. Models never test for a particular method, so adding one needs no change to ``models.py``.
+A fusion method combines named inputs that a patient may lack. A ``TensorFusion`` combines ``(n, d)`` tensors (raw
+inputs or embeddings) in ``EarlyFusion`` and ``IntermediateFusion``; an ``OutputFusion`` combines the branches' typed
+outputs in ``LateFusion``. A method that does both, such as ``MaskedMean``, subclasses both. Models test only which of
+the two interfaces a method has, never for a particular method, so adding one needs no change to ``models.py``.
 
-``defined`` says which patients a method can combine. Models use the same answer in ``check`` and in ``forward``, so
-the two cannot disagree, and ``forward`` only ever receives rows it accepts.
+``defined`` says which patients a method can combine. Models use the same answer to check a dataset and in
+``forward``, so the two cannot disagree, and ``forward`` only ever receives rows it accepts. Each other rule has its own
+hook, called when the information it needs first exists (ADR 0005 §7): ``OutputFusion.output_type`` when the model is
+built, ``OutputFusion.check_branches`` for each dataset, and ``TensorFusion.check_widths`` in the dry run. A trainable
+late fusion method may add a regulariser of its own with ``OutputFusion.loss``, which ``LateFusion`` adds to its loss.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from dataclasses import dataclass, field
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, cast, overload
 
 import pandas as pd
 import torch
-import torch.nn.functional as F
+from kale.embed.multimodal_fusion import MajorityVote as _KaleMajorityVote
+from kale.embed.multimodal_fusion import MaskedMean as _KaleMaskedMean
+from kale.embed.multimodal_fusion import NamedInputConcat as _KaleNamedInputConcat
+from kale.embed.multimodal_fusion import masked_mean as _kale_masked_mean
+from kale.embed.multimodal_fusion import stack_present as _kale_stack_present
 from torch import Tensor, nn
 
-from kalecancer.loaddata.targets import BaseTarget, Classification, TimeToEvent
-
-Stage = Literal["early", "intermediate", "late"]
-_STAGES: tuple[Stage, ...] = ("early", "intermediate", "late")
+from kalecancer.model.outputs import BaseOutput, ClassProbabilities, OutputT, RiskScore, VoteScores
 
 
-@dataclass(frozen=True)
-class FusionContext:
-    """What a fusion method may use to decide whether it can be fitted.
-
-    The model builds it from the dataset and from itself, so methods never see the dataset.
-
-    Args:
-        stage: Which kind of model combines the inputs.
-        present: One row per patient and one bool column per input, ``True`` where the patient has it. The inputs are
-            modalities in early and intermediate fusion, and branches in late fusion.
-        required: Patients who must get a combined value, indexed like ``present``. Every patient, except in a
-            ``LateFusion`` branch, where only the patients with at least one of the branch's modalities.
-        widths: Width of each input, ``None`` where it is not known yet.
-        head_kinds: In late fusion, the ``target_type`` of each branch head. Empty otherwise.
-    """
-
-    stage: Stage
-    present: pd.DataFrame
-    required: pd.Series
-    widths: Mapping[str, int | None]
-    head_kinds: Mapping[str, type[BaseTarget] | None] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        """Reject a context whose ``required`` or ``widths`` do not line up with ``present``."""
-        if not self.required.index.equals(self.present.index) or set(self.widths) != set(self.present.columns):
-            raise ValueError("FusionContext: required must be indexed like present, and widths keyed like its columns")
-
-    @classmethod
-    def without_data(
-        cls,
-        stage: Stage,
-        widths: Mapping[str, int | None],
-        head_kinds: Mapping[str, type[BaseTarget] | None] | None = None,
-    ) -> FusionContext:
-        """A context with no patients, for the checks a model can run when it is built."""
-        present = pd.DataFrame({name: pd.Series(dtype=bool) for name in widths})
-        required = pd.Series(dtype=bool, index=present.index)
-        return cls(stage, present, required, dict(widths), dict(head_kinds or {}))
-
-
-def _check_one_width(method: FusionMethod, widths: Mapping[str, int | None]) -> None:
-    """Raise if the known ``widths`` are not all equal."""
-    known = {name: width for name, width in widths.items() if width is not None}
-    if len(set(known.values())) > 1:
-        raise ValueError(f"{type(method).__name__} needs inputs of one width, got {known}")
-
-
-def _heads_predict(context: FusionContext, target_type: type[BaseTarget]) -> bool:
-    """Whether every branch head in ``context`` predicts ``target_type`` or a subclass of it."""
-    kinds = context.head_kinds.values()
-    return bool(kinds) and all(kind is not None and issubclass(kind, target_type) for kind in kinds)
+def _check_one_width(method: FusionMethod, widths: Mapping[str, int]) -> None:
+    """Raise if ``widths`` are not all equal."""
+    if len(set(widths.values())) > 1:
+        raise ValueError(f"{type(method).__name__} needs inputs of one width, got {dict(widths)}")
 
 
 def _stack_defined(values: Mapping[str, Tensor], defined: Mapping[str, Tensor]) -> tuple[Tensor, Tensor]:
-    """Stack the inputs into ``(n_inputs, n, d)`` values and an ``(n_inputs, n)`` presence mask."""
-    stacked = torch.stack([values[name] for name in values])
-    mask = torch.stack([defined[name] for name in values])
-    return stacked, mask
+    """Stack named inputs and match their presence masks by name.
+
+    Args:
+        values: Floating ``(n, d)`` tensors in input order. Entirely absent inputs may be omitted.
+        defined: Boolean ``(n,)`` masks keyed by input name.
+
+    Returns:
+        Values shaped ``(n_inputs, n, d)`` and boolean masks shaped ``(n_inputs, n)``.
+    """
+    # preserve the helper used by existing custom fusion methods
+    return _kale_stack_present(values, defined)
 
 
 def _masked_mean(stacked: Tensor, mask: Tensor) -> Tensor:
-    """Mean of each row over the inputs it has; 0 for a row that has none."""
-    # where() rather than multiplication: absent rows hold NaN, and NaN * 0 is NaN
-    filled = torch.where(mask.unsqueeze(-1), stacked, torch.zeros((), dtype=stacked.dtype, device=stacked.device))
-    count = mask.sum(dim=0).clamp(min=1).unsqueeze(-1).to(stacked.dtype)
-    return filled.sum(dim=0) / count
+    """Average available inputs without propagating absent NaNs.
+
+    Args:
+        stacked: Floating values shaped ``(n_inputs, n, d)``.
+        mask: Boolean availability shaped ``(n_inputs, n)``.
+
+    Returns:
+        Means shaped ``(n, d)`` with the input dtype and device; zero for rows with no inputs.
+        Absent entries have zero gradient. Half-precision inputs accumulate in float32.
+    """
+    return _kale_masked_mean(stacked, mask)
 
 
 class FusionMethod(nn.Module, ABC):
-    """Combines named ``(n, d)`` inputs, which a patient may lack, into one ``(n, d')`` tensor.
+    """What every fusion method shares: which patients it can combine.
 
-    Subclasses set ``stages`` and implement ``defined`` and ``forward``. To add rules, override
-    ``check`` and call ``super().check(context)`` first.
-
-    In late fusion, ``input_space`` is what the method receives from each branch. With ``"output"`` it receives the raw
-    head outputs (logits or log-hazards), and the first branch's head turns the result into a prediction. With
-    ``"prediction"`` it receives the heads' predictions, its result is the prediction, and it implements ``columns``.
+    A method fuses tensors (``TensorFusion``, in early and intermediate fusion), typed outputs (``OutputFusion``, in late
+    fusion), or both, and subclasses those rather than this class: no model takes a bare ``FusionMethod``. The model
+    checks that every patient it must predict for is ``defined``, so a method cannot skip that rule.
     """
 
-    stages: ClassVar[frozenset[Stage]]
-    input_space: ClassVar[Literal["output", "prediction"]] = "output"
+    # the PyKale operations that methods borrow read this; models validate in the dry run and pass ``forward`` only
+    # defined rows, so skip PyKale's per-batch checks
+    validate_inputs: ClassVar[bool] = False
 
     @abstractmethod
     def defined(self, present: Tensor) -> Tensor:
@@ -124,145 +91,212 @@ class FusionMethod(nn.Module, ABC):
         """``defined`` for a presence table with one row per patient, as a bool Series indexed like it."""
         return pd.Series(self.defined(torch.tensor(present.to_numpy(dtype=bool))).numpy(), index=present.index)
 
-    def check(self, context: FusionContext) -> None:
-        """Raise if this method cannot be fitted in ``context``.
 
-        By default, the method must support ``context.stage``, and every required patient must be defined.
+class TensorFusion(FusionMethod):
+    """Combines ``(n, d)`` tensors, raw inputs in ``EarlyFusion`` or embeddings in ``IntermediateFusion``."""
+
+    def check_widths(self, widths: Mapping[str, int]) -> None:
+        """Raise if inputs of these widths cannot be combined. Called in the dry run; accepts any widths by default.
+
+        Args:
+            widths: The width of each input that the dry run's patients have.
         """
-        name = type(self).__name__
-        if context.stage not in self.stages:
-            allowed = " or ".join(stage for stage in _STAGES if stage in self.stages)
-            raise TypeError(f"{name} is for {allowed} fusion, not {context.stage} fusion")
-        present = context.present
-        lacking = context.required & ~self.defined_rows(present)
-        if lacking.any():
-            counts = {col: int((lacking & ~present[col]).sum()) for col in present.columns}
-            inputs, advice = (
-                ("branches", "each patient needs the modalities of at least one branch")
-                if context.stage == "late"
-                else (
-                    "modalities",
-                    "add the modalities to required_modalities, or use a fusion method that accepts patients who "
-                    "lack some",
-                )
-            )
-            raise ValueError(
-                f"{name} cannot combine {int(lacking.sum())} patients "
-                f"(how many of them lack each of the {inputs}: {counts}); {advice}"
-            )
 
     @abstractmethod
     def forward(self, values: Mapping[str, Tensor], present: Mapping[str, Tensor]) -> Tensor:
         """Combine the rows that ``defined`` accepts.
 
         Args:
-            values: ``(n, d)`` tensor for each input, with NaN in rows that lack it. An input that no row has may be
-                left out.
+            values: An ``(n, d)`` tensor for each input, with NaN in rows that lack it. An input that no row has may
+                be left out.
             present: ``(n,)`` bool for every input, ``True`` where the row has it.
+
+        Returns:
+            A floating ``(n, d')`` tensor on the input device.
         """
 
 
-class Concat(FusionMethod):
+class OutputFusion(FusionMethod):
+    """Combines the branches' typed outputs in ``LateFusion`` into one typed output, of the type ``output_type`` says."""
+
+    @abstractmethod
+    def output_type(self, input_types: Mapping[str, type[BaseOutput]]) -> type[BaseOutput]:
+        """The type of output this method makes from branch outputs of ``input_types``.
+
+        Raises:
+            TypeError: If it cannot fuse those types.
+        """
+
+    def check_branches(self, present: pd.DataFrame, input_types: Mapping[str, type[BaseOutput]]) -> None:
+        """Raise if branch outputs of ``input_types`` cannot be fused for these patients. Accepts any by default.
+
+        Called for each dataset, after the model has checked that every patient has a branch.
+
+        Args:
+            present: One row per patient and one bool column per branch, ``True`` where the branch predicts.
+            input_types: Each branch's output type, which ``output_type`` accepted when the model was built.
+        """
+
+    def loss(self, output: BaseOutput, target: Mapping[str, Tensor]) -> Tensor | None:
+        """A regulariser of the method's own, which ``LateFusion`` adds to its loss. ``None``, the default, adds nothing.
+
+        For trainable methods to regularise themselves (ADR 0005 §5); ``LateFusion`` reports it as ``loss/regulariser``,
+        unweighted, so the method applies its own weight. ``LateFusion`` calls it whenever one of its
+        other losses has a signal. Early and intermediate fusion never call it, because their output comes from the
+        head, not from the method, so a method that is also a ``TensorFusion`` adds its term in late fusion only. The
+        term must come from ``output``, ``target`` and the method's parameters, never from state kept during
+        ``forward``: validation computes its loss once, on the outputs of every batch joined together.
+
+        Args:
+            output: The fused output for the patients the model defines. Its ``branches`` hold the branch outputs.
+            target: The target tensors of the same patients.
+        """
+        return None
+
+    @property
+    def decomposable_loss(self) -> bool:
+        """Whether ``loss`` doesn't depend on how patients are grouped into batches, so gradients can be accumulated.
+
+        ``True`` for a method that adds no loss. A method that overrides ``loss`` is ``False`` unless it overrides
+        this too: a wrong ``True`` gives silently wrong gradients, while a wrong ``False`` only refuses accumulation.
+        """
+        return type(self).loss is OutputFusion.loss
+
+    @abstractmethod
+    def forward(self, values: Mapping[str, BaseOutput], present: Mapping[str, Tensor]) -> BaseOutput:
+        """Combine the rows that ``defined`` accepts.
+
+        Args:
+            values: Each branch's output, with NaN in rows the branch does not predict. A branch that predicts no row
+                may be left out.
+            present: ``(n,)`` bool for every branch, ``True`` where the branch predicts the row.
+
+        Returns:
+            An output of ``output_type`` for the same rows, all of them defined.
+        """
+
+
+def _as(outputs: Mapping[str, BaseOutput], kind: type[OutputT]) -> dict[str, OutputT]:
+    """``outputs``, each of which the method's ``output_type`` has already checked is a ``kind``."""
+    assert all(isinstance(out, kind) for out in outputs.values()), f"check accepts only {kind.__name__} branches"
+    return cast(dict[str, OutputT], dict(outputs))
+
+
+class Concat(TensorFusion):
     """Concatenate the inputs. Every patient must have every input.
 
-    Not for late fusion: concatenated branch outputs are not a prediction, and no head follows late fusion.
+    Not for late fusion: concatenated branch outputs are not a prediction.
     """
 
-    stages = frozenset({"early", "intermediate"})
-
-    def defined(self, present: Tensor) -> Tensor:
-        """The patients who have every input."""
-        return present.all(dim=1)
-
-    def forward(self, values: Mapping[str, Tensor], present: Mapping[str, Tensor]) -> Tensor:
-        """Concatenate the inputs along the feature dimension, in input order."""
-        return torch.cat([values[name] for name in values], dim=-1)
+    # borrow PyKale's stateless operations, which pass raw NaN cells through to encoders that handle them
+    defined = _KaleNamedInputConcat.defined
+    forward = _KaleNamedInputConcat.forward
 
 
-class MaskedMean(FusionMethod):
-    """Mean of equal-width inputs over the ones each patient has.
+class MaskedMean(TensorFusion, OutputFusion):
+    """Mean of equal-width inputs over the ones each patient has, in any stage.
 
-    In late fusion the inputs are the branch head outputs (logits or log-hazards).
+    In late fusion it averages the branches' risk scores, giving a ``RiskScore``, or their logits, giving
+    ``ClassProbabilities``. An average of Cox log-hazards is a ``RiskScore`` with no baseline, because each branch's
+    baseline belongs to its own log-hazards; a fused endpoint such as ``CoxEndpoint`` fits one for it. Averaging logits
+    rather than probabilities takes the normalised geometric mean of the branches' probabilities. Float16 and bfloat16
+    inputs accumulate in float32 before returning the input dtype.
     """
 
-    stages = frozenset({"early", "intermediate", "late"})
+    defined = _KaleMaskedMean.defined
 
-    def defined(self, present: Tensor) -> Tensor:
-        """The patients who have at least one input."""
-        return present.any(dim=1)
+    def check_widths(self, widths: Mapping[str, int]) -> None:
+        """Inputs must have one width."""
+        _check_one_width(self, widths)
 
-    def check(self, context: FusionContext) -> None:
-        """Also needs inputs of one width and, in late fusion, heads of one kind.
-
-        Cox heads also need every branch for every patient.
-        """
-        super().check(context)
-        kinds = set(context.head_kinds.values())
-        if len(kinds) > 1:
-            raise TypeError(f"MaskedMean needs branch heads of one kind, got {kinds}")
-        _check_one_width(self, context.widths)
-        incomplete = int((~context.present.all(axis=1)).sum())
-
-        # NOTE: this checks for TimeToEvent heads, but the issue is with Cox heads
-        # specifically. This will need fixing if another TimeToEvent head is added
-        # that does not have an issue with averaging over branches.
-        if _heads_predict(context, TimeToEvent) and incomplete:
+    def check_branches(self, present: pd.DataFrame, input_types: Mapping[str, type[BaseOutput]]) -> None:
+        """Outputs that are not comparable across models, such as risk scores, need every branch for every patient."""
+        incomplete = int((~present.all(axis=1)).sum())
+        relative = sorted(kind.__name__ for kind in input_types.values() if not kind.comparable_across_models)
+        if relative and incomplete:
             raise ValueError(
-                f"MaskedMean over Cox Head needs every patient to have every branch, but {incomplete} do not: each "
-                "branch's log-hazard has an arbitrary offset, so averaging different subsets of branches would "
-                "reorder patients"
+                f"MaskedMean over {relative[0]} needs every patient to have every branch, but {incomplete} do not: each "
+                "branch's output has an arbitrary offset, so averaging different subsets of branches would reorder "
+                "patients"
             )
 
-    def forward(self, values: Mapping[str, Tensor], present: Mapping[str, Tensor]) -> Tensor:
-        """Average each row over the inputs it has."""
-        return _masked_mean(*_stack_defined(values, present))
+    def output_type(self, input_types: Mapping[str, type[BaseOutput]]) -> type[BaseOutput]:
+        """``RiskScore`` from risk scores, such as Cox outputs, and ``ClassProbabilities`` from class probabilities."""
+        kinds = set(input_types.values())
+        for family in (RiskScore, ClassProbabilities):
+            if kinds and all(issubclass(kind, family) for kind in kinds):
+                return family
+        raise TypeError(
+            "MaskedMean needs branches of one output type that it can average, risk scores or class probabilities, "
+            f"got {sorted(kind.__name__ for kind in kinds)}"
+        )
+
+    @overload
+    def forward(self, values: Mapping[str, Tensor], present: Mapping[str, Tensor]) -> Tensor: ...
+
+    @overload
+    def forward(self, values: Mapping[str, BaseOutput], present: Mapping[str, Tensor]) -> BaseOutput: ...
+
+    def forward(
+        self, values: Mapping[str, Tensor] | Mapping[str, BaseOutput], present: Mapping[str, Tensor]
+    ) -> Tensor | BaseOutput:
+        """Average each row over the inputs it has: tensors, or the risk scores or logits of branch outputs."""
+        first = next(iter(values.values()), None)
+        if first is None:
+            raise ValueError("MaskedMean needs at least one input")
+        if isinstance(first, Tensor):
+            return _KaleMaskedMean.forward(self, cast(Mapping[str, Tensor], values), present)  # type: ignore[arg-type]
+        return self._average_outputs(cast(Mapping[str, BaseOutput], values), present)
+
+    def _average_outputs(self, outputs: Mapping[str, BaseOutput], present: Mapping[str, Tensor]) -> BaseOutput:
+        first = next(iter(outputs.values()))
+        if isinstance(first, RiskScore):
+            risks = {name: out.risk.unsqueeze(-1) for name, out in _as(outputs, RiskScore).items()}
+            mean = _masked_mean(*_stack_defined(risks, present)).squeeze(-1)
+            return RiskScore(ids=first.ids, defined=_everyone(first, mean), risk=mean)
+        if isinstance(first, ClassProbabilities):
+            logits = {name: out.logits for name, out in _as(outputs, ClassProbabilities).items()}
+            mean = _masked_mean(*_stack_defined(logits, present))
+            return ClassProbabilities(ids=first.ids, defined=_everyone(first, mean), logits=mean, classes=first.classes)
+        raise AssertionError(f"check refuses {type(first).__name__} branches")
 
 
-class MajorityVote(FusionMethod):
+def _everyone(like: BaseOutput, values: Tensor) -> Tensor:
+    """A ``defined`` mask that is ``True`` for every row of ``like``, on the device of ``values``."""
+    return torch.ones(len(like.ids), dtype=torch.bool, device=values.device)
+
+
+class MajorityVote(OutputFusion):
     """Each branch votes for its most probable class.
 
     Scores are ``(votes_c + 0.5 * mean_probability_c) / (n_branches + 0.5)``: they sum to 1, their argmax is the
     majority class, and ties between classes with equal votes are broken by mean probability. The probability
     term can never outweigh a whole vote.
+    Scores are not calibrated probabilities. float32 and float64 inputs retain their dtype.
 
     Args:
         tie_break: ``"mean_probability"`` breaks ties as above. ``"error"`` raises when a patient's votes are tied.
     """
 
-    stages = frozenset({"late"})
-    input_space = "prediction"
-
-    def __init__(self, tie_break: Literal["mean_probability", "error"]):
+    def __init__(self, tie_break: Literal["mean_probability", "error"]) -> None:
         super().__init__()
         if tie_break not in ("mean_probability", "error"):
             raise ValueError(f"tie_break must be 'mean_probability' or 'error', got {tie_break!r}")
         self.tie_break = tie_break
 
-    def defined(self, present: Tensor) -> Tensor:
-        """The patients who have at least one input."""
-        return present.any(dim=1)
+    defined = _KaleMajorityVote.defined
 
-    def check(self, context: FusionContext) -> None:
-        """Also needs classification heads with one output width."""
-        super().check(context)
-        if not _heads_predict(context, Classification):
-            raise TypeError(f"MajorityVote needs classification heads, got {set(context.head_kinds.values())}")
-        _check_one_width(self, context.widths)
+    def output_type(self, input_types: Mapping[str, type[BaseOutput]]) -> type[BaseOutput]:
+        """``VoteScores``: vote scores are not probabilities. The branches must output class probabilities."""
+        if not (input_types and all(issubclass(kind, ClassProbabilities) for kind in input_types.values())):
+            kinds = sorted(k.__name__ for k in input_types.values())
+            raise TypeError(f"MajorityVote needs branches that output class probabilities, got {kinds}")
+        return VoteScores
 
-    def columns(self, target: Classification) -> list[str]:
-        """One vote-score column per class."""
-        return [f"vote_score[{c}]" for c in target.classes]
-
-    def forward(self, values: Mapping[str, Tensor], present: Mapping[str, Tensor]) -> Tensor:
+    def forward(self, values: Mapping[str, BaseOutput], present: Mapping[str, Tensor]) -> VoteScores:
         """Score each class from the votes of the branches each row has; with ``tie_break="error"``, raise on a tie."""
-        stacked, mask = _stack_defined(values, present)
-        n_classes = stacked.shape[-1]
-        choice = torch.nan_to_num(stacked, nan=-1.0).argmax(dim=-1)
-        votes = (F.one_hot(choice, n_classes).to(stacked.dtype) * mask.unsqueeze(-1)).sum(dim=0)
-        n_branches = mask.sum(dim=0).to(stacked.dtype).unsqueeze(-1)
-        if self.tie_break == "error":
-            top = votes.max(dim=-1, keepdim=True).values
-            tied = ((votes == top).sum(dim=-1) > 1) & (n_branches.squeeze(-1) > 0)
-            if bool(tied.any()):
-                raise ValueError(f"MajorityVote: {int(tied.sum())} patients have tied votes and tie_break='error'")
-        return (votes + 0.5 * _masked_mean(stacked, mask)) / (n_branches + 0.5)
+        branches = _as(values, ClassProbabilities)
+        first = next(iter(branches.values()))
+        probabilities = {name: out.probabilities for name, out in branches.items()}
+        scores = _KaleMajorityVote.forward(self, probabilities, present)  # type: ignore[arg-type]
+        return VoteScores(ids=first.ids, defined=_everyone(first, scores), votes=scores, classes=first.classes)

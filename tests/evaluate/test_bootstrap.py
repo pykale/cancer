@@ -3,13 +3,27 @@ import warnings
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 from sksurv.metrics import concordance_index_censored
 
-from kalecancer.evaluate import AUROC, BootstrapCI, EvalContext, HarrellC, bootstrap_ci
+from kalecancer.evaluate import AUROC, BootstrapCI, HarrellC, bootstrap_ci
+from kalecancer.loaddata import Classification, TimeToEvent
+from kalecancer.model import ClassProbabilities, CoxOutput
 
 
 def _ids(n: int) -> pd.Index:
     return pd.Index([f"p{k:04d}" for k in range(n)])
+
+
+def _risk(log_hazard: pd.Series) -> CoxOutput:
+    defined = torch.ones(len(log_hazard), dtype=torch.bool)
+    return CoxOutput(ids=list(log_hazard.index), defined=defined, risk=torch.tensor(log_hazard.to_numpy()))
+
+
+def _probabilities(ids, score) -> ClassProbabilities:
+    p = torch.tensor(np.stack([1 - score, score], axis=1), dtype=torch.float32)
+    defined = torch.ones(len(ids), dtype=torch.bool)
+    return ClassProbabilities(ids=list(ids), defined=defined, logits=p.clamp(min=1e-6).log(), classes=("no", "yes"))
 
 
 @pytest.fixture
@@ -18,27 +32,28 @@ def survival():
     n = 120
     time = rng.integers(1, 60, n).astype(np.float32)
     event = rng.random(n) < 0.6
-    target = pd.DataFrame({"time": time, "event": event}, index=_ids(n))
+    frame = pd.DataFrame({"time": time, "event": event}, index=_ids(n))
     # A strong model and a weak one, rounded so that risks tie.
     strong = np.round(-time / 10 + rng.normal(0, 0.5, n), 1).astype(np.float32)
     weak = np.round(-time / 10 + rng.normal(0, 4.0, n), 1).astype(np.float32)
-    # Rows in a different order from the target, which bootstrap_ci must align by id.
+    # Patients in a different order from the target, which bootstrap_ci must align by id.
     order = rng.permutation(n)
-    strong = pd.DataFrame({"log_hazard": strong}, index=target.index)
-    weak = pd.DataFrame({"log_hazard": weak}, index=target.index)
-    return target, strong.iloc[order], weak.iloc[order], EvalContext(train_target=target, classes=None)
+    strong = pd.Series(strong, index=frame.index).iloc[order]
+    weak = pd.Series(weak, index=frame.index).iloc[order]
+    target = TimeToEvent(frame["time"], frame["event"])
+    return target, _risk(strong), _risk(weak), target
 
 
 def test_matches_sksurv_on_the_same_resamples(survival):
     target, prediction, _, context = survival
     result = bootstrap_ci(HarrellC(), prediction, target, context, n_resamples=200, random_state=3)
 
-    risk = prediction.loc[target.index, "log_hazard"].to_numpy(np.float64)
-    event, time = target["event"].to_numpy(), target["time"].to_numpy(np.float64)
+    risk = pd.Series(prediction.risk.numpy(), index=prediction.ids).loc[target.ids].to_numpy(np.float64)
+    event, time = target.frame["event"].to_numpy(), target.frame["time"].to_numpy(np.float64)
     rng = np.random.default_rng(3)
     values = []
     for _ in range(200):
-        rows = rng.integers(0, len(target), size=len(target))
+        rows = rng.integers(0, len(target.ids), size=len(target.ids))
         values.append(concordance_index_censored(event[rows], time[rows], risk[rows])[0])
 
     assert result.estimate == pytest.approx(concordance_index_censored(event, time, risk)[0], abs=1e-6)
@@ -85,12 +100,9 @@ def test_paired_interval_is_narrower_than_the_unpaired_one(survival):
 
 def test_undefined_resamples_are_counted_and_warned():
     # One positive among 15 patients: about a third of resamples leave it out, where AUROC is undefined.
-    classes = ("no", "yes")
     ids = _ids(15)
-    target = pd.DataFrame({"label": ["yes"] + ["no"] * 14}, index=ids)
-    score = np.linspace(1, 0, 15)
-    prediction = pd.DataFrame({"probability[no]": 1 - score, "probability[yes]": score}, index=ids)
-    context = EvalContext(train_target=target, classes=classes)
+    target = Classification(pd.Series(["yes"] + ["no"] * 14, index=ids), classes=["no", "yes"])
+    prediction, context = _probabilities(ids, np.linspace(1, 0, 15)), target
     with pytest.warns(UserWarning, match=r"undefined on \d+ of 200 resamples"):
         result = bootstrap_ci(AUROC(positive_class="yes"), prediction, target, context, n_resamples=200)
     assert 30 < result.n_undefined < 120
@@ -106,10 +118,12 @@ def test_no_warning_when_every_resample_is_defined(survival):
 
 def test_misuse_raises_before_resampling(survival):
     target, prediction, _, context = survival
-    with pytest.raises(ValueError, match="ids differ"):
-        bootstrap_ci(HarrellC(), prediction.iloc[1:], target, context)
-    with pytest.raises(ValueError, match="ids differ"):
-        bootstrap_ci(HarrellC(), prediction, target, context, baseline=prediction.iloc[1:])
+    stranger = prediction.select(torch.arange(3))
+    stranger.ids[0] = "stranger"
+    with pytest.raises(ValueError, match="no outcome in the target"):
+        bootstrap_ci(HarrellC(), stranger, target, context)
+    with pytest.raises(ValueError, match="exactly the patients of output"):
+        bootstrap_ci(HarrellC(), prediction, target, context, baseline=prediction.select(torch.arange(5)))
     with pytest.raises(ValueError, match="confidence"):
         bootstrap_ci(HarrellC(), prediction, target, context, confidence=95)
     with pytest.raises(ValueError, match="n_resamples"):
@@ -118,9 +132,8 @@ def test_misuse_raises_before_resampling(survival):
 
 def test_raises_when_undefined_on_every_resample():
     ids = _ids(1)
-    target = pd.DataFrame({"label": ["yes"]}, index=ids)
-    prediction = pd.DataFrame({"probability[no]": [0.2], "probability[yes]": [0.8]}, index=ids)
-    context = EvalContext(train_target=target, classes=("no", "yes"))
+    target = Classification(pd.Series(["yes"], index=ids), classes=["no", "yes"])
+    prediction, context = _probabilities(ids, np.array([0.8])), target
     # Undefined on the patients as given already, so this is the estimate's error, not the resamples'.
     with pytest.raises(ValueError, match="undefined"):
         bootstrap_ci(AUROC(positive_class="yes"), prediction, target, context, n_resamples=5)

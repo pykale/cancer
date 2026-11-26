@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,9 +10,8 @@ import numpy as np
 import pandas as pd
 from sklearn.base import clone
 
-from kalecancer.evaluate.metrics import EvalContext, Metric
+from kalecancer.evaluate.metrics import Metric
 from kalecancer.loaddata.dataset import MultimodalDataset
-from kalecancer.loaddata.targets import Classification
 
 
 @dataclass
@@ -35,20 +34,22 @@ def cross_validate(
     cv: Any,
     metrics: Mapping[str, Metric],
     return_estimators: bool = False,
-    survival_times: Sequence[float] | None = None,
 ) -> CVResult:
     """Fit a clone of ``estimator`` on each training fold of ``cv`` and score it on the held-out patients.
 
     ``estimator`` is a ``Pipeline``. ``cv`` is any sklearn splitter; it receives the patient ids and the target's
     strata (events or labels) as ``y``. Every fold refits everything learned from data: validation carve,
     transforms, fitted encoders and weights. Metrics are reported per fold; they are not pooled over out-of-fold
-    predictions, whose scales differ between folds (Cox log-hazards have an arbitrary offset). ``survival_times`` is
-    passed to each fold's ``predict``, for metrics such as ``IntegratedBrier``.
+    predictions, whose scales differ between folds (Cox log-hazards have an arbitrary offset). Every metric is
+    checked against the model's output type before the first fold, and IPCW metrics estimate censoring from each
+    fold's training patients.
     """
     if data.target is None:
         raise ValueError("cross_validate needs a dataset with a target")
     if not metrics:
         raise ValueError("metrics is empty")
+    for metric in metrics.values():
+        metric.check_output_type(estimator.model.output_type)
     ids = np.array(data.ids, dtype=object)
     strata = data.target.strata(data.ids)
     rows, predictions, estimators = [], [], []
@@ -58,14 +59,10 @@ def cross_validate(
         leaked = (set(fitted.train_ids_) | set(fitted.val_ids_)) & set(test_ids)
         if leaked:
             raise AssertionError(f"fold {fold}: {len(leaked)} test patients were used in fit")
-        prediction = fitted.predict(data.subset(test_ids), survival_times=survival_times)
-        target = data.target.frame.loc[prediction.index]
-        context = EvalContext(
-            train_target=fitted.train_target_,
-            classes=fitted.target_.classes if isinstance(fitted.target_, Classification) else None,
-        )
+        output = fitted.predict_output(data.subset(test_ids))
         test_counts = {f"test {key}": value for key, value in data.target.counts(test_ids).items()}
-        scores = {name: metric(prediction, target, context) for name, metric in metrics.items()}
+        scores = {name: metric(output, data.target, fitted.train_target_) for name, metric in metrics.items()}
+        prediction = output.frame()
         rows.append({"fold": fold, "n_test": len(test_ids), **test_counts, **fitted.fit_report_, **scores})
         predictions.append(prediction.assign(fold=fold))
         if return_estimators:

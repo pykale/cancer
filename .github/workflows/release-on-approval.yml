@@ -1,0 +1,229 @@
+# Merges an approved release pull request, creates its GitHub release and publishes it to PyPI.
+#
+# The release process, after PyKale's 0.2.2 release:
+#   1. Bump __version__ in kalecancer/__init__.py and open a pull request titled "Release X.Y.Z".
+#   2. changelog.yml writes the formatted changelog section to .github/CHANGELOG.md on that branch and runs CI.
+#   3. A maintainer reviews the changelog and approves the pull request.
+#   4. This workflow waits for the checks, merges, tags vX.Y.Z with the changelog section as release notes, builds
+#      the distribution with build-dist.yml and publishes it to PyPI. X.Y.ZaN, bN and rcN versions are marked as
+#      pre-releases on GitHub; PyPI marks them itself. If a maintainer merges the approved pull request by hand
+#      before the run gets there, the run releases that merge commit instead, unless the version is already released.
+#
+# Everything happens in one run because merges and releases made with GITHUB_TOKEN do not trigger other workflows,
+# so GitHub's own auto-merge followed by a separate "release" workflow would never publish.
+#
+# Publishing uses PyPI trusted publishing: pypi.org trusts this workflow file and its GitHub environment, so no API
+# token is stored. The publish job is in this file because trusted publishing cannot run inside a reusable workflow.
+#
+# Trust: GitHub runs this review-triggered workflow from the default branch. It only acts on same-repository pull
+# requests approved at their latest commit by an owner, member or collaborator; scripts come from the base commit.
+
+name: release-on-approval
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+
+# Approvals of the same pull request queue rather than race; a later run finds the version released and stops.
+concurrency:
+  group: release-on-approval-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  merge-and-tag:
+    name: Merge release pull request and create GitHub release
+    # contains() is case-insensitive, so other pull requests skip the job without starting a runner; the version step
+    # does the exact title check.
+    if: >-
+      github.event.review.state == 'approved' &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association) &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == github.event.repository.default_branch &&
+      contains(github.event.pull_request.title, 'release')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.merge.outputs.sha }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPOSITORY: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Require approval of the pull request's latest commit
+        id: state
+        env:
+          REVIEWED_SHA: ${{ github.event.review.commit_id }}
+        run: |
+          # A maintainer may merge the pull request by hand before this run starts. It is still released when the
+          # merged head is the approved commit, from the merge commit, unless that version is already released.
+          fields='[.state, .headRefOid, .mergeCommit.oid // ""] | @tsv'
+          pr=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" --json state,headRefOid,mergeCommit --jq "$fields")
+          read -r state head merged_sha <<< "$pr"
+          if [ "$state" = "CLOSED" ]; then
+            echo "::notice::Pull request #$PR_NUMBER is closed without merging, nothing to release."
+            exit 0
+          fi
+          if [ "$REVIEWED_SHA" != "$HEAD_SHA" ] || [ "$head" != "$HEAD_SHA" ]; then
+            if [ "$state" = "MERGED" ]; then
+              echo "::notice::Pull request #$PR_NUMBER was merged at $head, not the approved $REVIEWED_SHA. Not releasing."
+              exit 0
+            fi
+            echo "::error::The approval is for $REVIEWED_SHA, but the head is $head. Approve the latest commit."
+            exit 1
+          fi
+          if [ "$state" = "MERGED" ]; then
+            echo "::notice::Pull request #$PR_NUMBER was merged by hand as $merged_sha; releasing that commit."
+            echo "merged_sha=$merged_sha" >> "$GITHUB_OUTPUT"
+          fi
+          echo "approved=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the approved commit
+        if: steps.state.outputs.approved == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Checkout release scripts from the base commit
+        if: steps.state.outputs.approved == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted-base
+          sparse-checkout: .github
+          persist-credentials: false
+
+      - name: Load base-commit release scripts
+        if: steps.state.outputs.approved == 'true'
+        run: |
+          cp trusted-base/.github/scripts/release_version.py "$RUNNER_TEMP/release_version.py"
+          cp trusted-base/.github/scripts/release_notes.py "$RUNNER_TEMP/release_notes.py"
+          cp trusted-base/.github/scripts/release_checks.py "$RUNNER_TEMP/release_checks.py"
+
+      - name: Get release version from pull request title
+        id: version
+        if: steps.state.outputs.approved == 'true'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: python3 "$RUNNER_TEMP/release_version.py" kalecancer/__init__.py
+
+      - name: Write release notes from CHANGELOG.md
+        if: steps.version.outputs.version != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python3 "$RUNNER_TEMP/release_notes.py" "$VERSION" .github/CHANGELOG.md "$RUNNER_TEMP/release-notes.md"
+
+      - name: Stop if this version is already released
+        id: unreleased
+        if: steps.version.outputs.version != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" --repo "$REPOSITORY" > /dev/null 2>&1; then
+            echo "::notice::v$VERSION is already released, nothing to release."
+            exit 0
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the other checks on the approved commit
+        if: steps.unreleased.outputs.version != ''
+        env:
+          WORKFLOW_NAME: ${{ github.workflow }}
+        run: |
+          # release_checks.py judges each workflow as a whole: a run waiting for approval, as runs started by the
+          # changelog commit are, keeps the release waiting rather than failing it. See the script for the rules.
+          deadline=$((SECONDS + 90 * 60))
+          while :; do
+            runs=$(gh run list --repo "$REPOSITORY" --commit "$HEAD_SHA" --limit 100 --json workflowName,status,conclusion)
+            if summary=$(python3 "$RUNNER_TEMP/release_checks.py" "$WORKFLOW_NAME" <<< "$runs"); then
+              echo "$summary"
+              break
+            else
+              status=$?
+            fi
+            if [ "$status" -ne 3 ]; then
+              echo "::error::On $HEAD_SHA: $summary"
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::Checks on $HEAD_SHA did not pass within 90 minutes. $summary Then approve again."
+              exit 1
+            fi
+            echo "$summary"
+            sleep 60
+          done
+
+      - name: Merge the release pull request
+        id: merge
+        if: steps.unreleased.outputs.version != ''
+        env:
+          MERGED_SHA: ${{ steps.state.outputs.merged_sha }}
+        run: |
+          if [ -n "$MERGED_SHA" ]; then
+            sha=$MERGED_SHA
+          else
+            # The synchronous endpoint fails if checks or branch rules prevent a merge, or the approved head moved.
+            # Unlike gh pr merge, it cannot enable auto-merge and then leave the release job without a merge commit.
+            merged=$(gh api -X PUT "repos/$REPOSITORY/pulls/$PR_NUMBER/merge" \
+              -f sha="$HEAD_SHA" -f merge_method=merge)
+            sha=$(jq -r 'select(.merged == true) | .sha' <<< "$merged")
+          fi
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::The release pull request did not return a merge commit."
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Create the GitHub release
+        id: release
+        if: steps.merge.outputs.sha != ''
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA: ${{ steps.merge.outputs.sha }}
+        run: |
+          prerelease=false
+          if [[ "$VERSION" =~ (a|b|rc)[0-9]+$ ]]; then
+            prerelease=true
+          fi
+          flags=()
+          if [ "$prerelease" = true ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "v$VERSION" --repo "$REPOSITORY" --target "$SHA" --title "Release $VERSION" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" "${flags[@]}"
+
+  build:
+    name: Build distribution
+    needs: merge-and-tag
+    if: needs.merge-and-tag.outputs.sha != ''
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-dist.yml
+    with:
+      ref: ${{ needs.merge-and-tag.outputs.sha }}
+
+  publish-pypi:
+    name: Publish distribution to PyPI
+    needs: [merge-and-tag, build]
+    if: needs.merge-and-tag.outputs.sha != ''
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/kalecancer
+    permissions:
+      id-token: write # mandatory for trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

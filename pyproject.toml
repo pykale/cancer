@@ -29,7 +29,7 @@ dependencies = [
     "lightning>=2.6,<2.7",
     "numpy>=1.26",
     "pandas>=2.2",
-    "pykale>=0.2.0",
+    "pykale>=0.2.2",
     "pyyaml>=6",
     "scikit-learn>=1.9.1",
     "torch>=2.6",
@@ -55,6 +55,12 @@ interpret = [
     "shap",
     "captum",
     "umap-learn",
+]
+# MOGONET, migrated from PyKale. It also needs the torch_scatter and torch_sparse wheels built for the installed
+# PyTorch, which only the PyG wheel index provides; see CONTRIBUTING.md.
+multiomics = [
+    "torch-geometric>=2.6",
+    "yacs>=0.1.7",
 ]
 
 [dependency-groups]

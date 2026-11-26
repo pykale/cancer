@@ -7,7 +7,7 @@ from torch import nn
 
 from kalecancer.evaluate import AUROC, BalancedAccuracy, HarrellC, cross_validate
 from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures, Tabular, TimeToEvent
-from kalecancer.model import ABMIL, ClassificationHead, Concat, CoxHead, IntermediateFusion
+from kalecancer.model import ABMIL, ClassificationEndpoint, Concat, CoxEndpoint, IntermediateFusion
 from kalecancer.pipeline import Pipeline
 
 
@@ -32,7 +32,9 @@ def small_pipeline(task="survival"):
             "wsi": [ABMIL(in_dim=16, hidden_dim=2, attention_dim=2, dropout=0.0)],
         },
         fusion=Concat(),
-        head=CoxHead(in_dim=4, ties="efron") if task == "survival" else ClassificationHead(in_dim=4, n_classes=2),
+        endpoint=CoxEndpoint(nn.Linear(4, 1, bias=False), "efron")
+        if task == "survival"
+        else ClassificationEndpoint(nn.Linear(4, 2), nn.CrossEntropyLoss()),
     )
     return Pipeline(
         model=model,

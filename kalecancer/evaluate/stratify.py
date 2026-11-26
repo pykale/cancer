@@ -1,4 +1,4 @@
-"""Risk-group stratification: quantile groups by ``log_hazard``, and their Kaplan-Meier survival curves."""
+"""Risk-group stratification: quantile groups by risk score, and their Kaplan-Meier survival curves."""
 
 from __future__ import annotations
 
@@ -7,46 +7,49 @@ from collections.abc import Hashable, Sequence
 import numpy as np
 import pandas as pd
 
-from kalecancer.evaluate.metrics import _event_time, _quantile_groups, _require_columns
+from kalecancer.evaluate.metrics import _event_time, _quantile_groups
+from kalecancer.loaddata.targets import BaseTarget, TimeToEvent
+from kalecancer.model.outputs import BaseOutput, RiskScore
 
 
 def risk_groups(
-    prediction: pd.DataFrame,
+    output: BaseOutput,
     *,
     n_groups: int = 2,
     labels: Sequence[Hashable] | None = None,
 ) -> pd.Series:
-    """Assign each patient to a risk-quantile group by ``log_hazard``, indexed by id.
+    """Assign each patient to a risk-quantile group by risk score, indexed by id.
 
-    Group 0 is the lowest-risk quantile (lowest ``log_hazard``), group ``n_groups - 1`` the highest. Patients with
-    a NaN ``log_hazard`` (``Pipeline.predict`` emits NaN for a patient it could not score) are excluded rather than
-    assigned a group; the excluded count is not silently dropped, it is on the returned Series as
-    ``.attrs["n_excluded"]``.
+    Group 0 is the lowest-risk quantile, group ``n_groups - 1`` the highest. Patients the output does not define (the
+    model could not predict for them) are excluded rather than assigned a group; the excluded count is not silently
+    dropped, it is on the returned Series as ``.attrs["n_excluded"]``.
 
     Args:
-        prediction: Predictions indexed by patient id, with a ``log_hazard`` column, as ``Pipeline.predict`` returns
-            them.
+        output: A ``RiskScore`` output, such as a Cox model's, as ``Pipeline.predict_output`` returns it.
         n_groups: Number of equal-sized risk quantiles. 2 is a median split, 3 tertiles, 4 quartiles.
         labels: Group names, lowest risk first -- any hashable value (strings work, but so do e.g. enum members).
             ``None`` (the default) labels the groups with the plain integers ``0 .. n_groups - 1``.
 
     Returns:
-        Ordered categorical Series named ``"group"``, indexed by the patients with a defined ``log_hazard``.
+        Ordered categorical Series named ``"group"``, indexed by the patients the output defines.
 
     Raises:
+        TypeError: If ``output`` is not a ``RiskScore``.
         ValueError: If ``n_groups < 2``, if ``labels`` does not have ``n_groups`` entries, or if the quantile cuts
-            are not unique (``log_hazard`` is too heavily tied to form ``n_groups`` distinct groups).
+            are not unique (the risk scores are too heavily tied to form ``n_groups`` distinct groups).
     """
-    _require_columns(prediction, ["log_hazard"], "prediction")
+    if not isinstance(output, RiskScore):
+        raise TypeError(f"risk_groups needs a RiskScore output, got {type(output).__name__}")
     if n_groups < 2:
         raise ValueError(f"n_groups must be at least 2, got {n_groups}")
     if labels is not None and len(labels) != n_groups:
         raise ValueError(f"labels must have n_groups={n_groups} entries, got {len(labels)}")
     names: Sequence[Hashable] = list(labels) if labels is not None else list(range(n_groups))
 
-    risk = prediction["log_hazard"]
-    defined = risk[risk.notna()]
-    excluded = int(risk.isna().sum())
+    output = output.detach_cpu()
+    mask = output.defined.numpy()
+    defined = pd.Series(output.risk.double().numpy()[mask], index=pd.Index(output.ids)[mask])
+    excluded = int((~mask).sum())
 
     codes = _quantile_groups(defined.to_numpy(dtype=np.float64), n_groups)
     group = pd.Series(
@@ -114,8 +117,8 @@ def _km_survival_at(time: np.ndarray, event: np.ndarray, horizon: float) -> floa
 
 
 def kaplan_meier(
-    prediction: pd.DataFrame,
-    target: pd.DataFrame,
+    output: BaseOutput,
+    target: BaseTarget,
     *,
     n_groups: int = 2,
     labels: Sequence[Hashable] | None = None,
@@ -127,27 +130,30 @@ def kaplan_meier(
     plus a leading ``time=0, survival=1.0`` row per group (the conventional KM starting point), unless a group's
     own data already has an observation at ``time=0``. ``survival`` only changes at a time with ``events > 0``.
 
-    Groups come from :func:`risk_groups`: patients with a NaN ``log_hazard`` are excluded the same way, and the
+    Groups come from :func:`risk_groups`: patients the output does not define are excluded the same way, and the
     excluded count is on the returned frame's ``.attrs["n_excluded"]``.
 
     Args:
-        prediction: Predictions indexed by patient id, with a ``log_hazard`` column.
-        target: The same patients' ``time``/``event`` columns (or a superset of them).
+        output: A ``RiskScore`` output; see :func:`risk_groups`.
+        target: A ``TimeToEvent`` target with the outcomes of at least the risk-grouped patients.
         n_groups: Number of risk-quantile groups; see :func:`risk_groups`.
         labels: Group names; see :func:`risk_groups`.
 
     Raises:
+        TypeError: If ``output`` is not a ``RiskScore`` or ``target`` not a ``TimeToEvent``.
         ValueError: Under the same conditions as :func:`risk_groups`, or if ``target`` is missing any risk-grouped
             patient.
     """
-    group = risk_groups(prediction, n_groups=n_groups, labels=labels)
+    if not isinstance(target, TimeToEvent):
+        raise TypeError(f"kaplan_meier needs a TimeToEvent target, got {type(target).__name__}")
+    group = risk_groups(output, n_groups=n_groups, labels=labels)
 
-    missing = group.index.difference(target.index)
+    missing = group.index.difference(target.ids)
     if len(missing):
         raise ValueError(
             f"target is missing {len(missing)} of the {len(group)} risk-grouped patients, e.g. {missing[:5].tolist()}"
         )
-    event, time = _event_time(target.loc[group.index], "target")
+    event, time = _event_time(target.frame.loc[group.index])
     event_arr = event.numpy()
     time_arr = time.numpy().astype(np.float64)
 

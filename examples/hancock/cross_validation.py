@@ -18,7 +18,7 @@ from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
 from kalecancer.evaluate import HarrellC, cross_validate
 from kalecancer.loaddata import MultimodalDataset, PatchFeatures, TimeToEvent, Tabular
-from kalecancer.model import ABMIL, Concat, CoxHead, IntermediateFusion, TabICLEncoder
+from kalecancer.model import ABMIL, Concat, CoxEndpoint, IntermediateFusion, TabICLEncoder
 from kalecancer.pipeline import EarlyStopping, Pipeline
 
 DATA = Path(__file__).resolve().parents[2] / "data" / "hancock"
@@ -88,7 +88,7 @@ def build_pipeline() -> Pipeline:
             ],
         },
         fusion=Concat(),
-        head=CoxHead(in_dim=128, ties="efron"),
+        endpoint=CoxEndpoint(torch.nn.Linear(128, 1, bias=False), ties="efron"),
     )
     return Pipeline(
         model=model,

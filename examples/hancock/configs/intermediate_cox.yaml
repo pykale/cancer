@@ -18,7 +18,11 @@ init_args:
           - {class_path: kalecancer.model.ABMIL, init_args: {in_dim: 1024, hidden_dim: 256, attention_dim: 128, dropout: 0.25}}
           - {class_path: torch.nn.Linear, init_args: {in_features: 256, out_features: 64}}
       fusion: {class_path: kalecancer.model.Concat}
-      head: {class_path: kalecancer.model.CoxHead, init_args: {in_dim: 128, ties: efron}}
+      endpoint:
+        class_path: kalecancer.model.CoxEndpoint
+        init_args:
+          head: {class_path: torch.nn.Linear, init_args: {in_features: 128, out_features: 1, bias: false}}
+          ties: efron
   transforms:
     clinical:
       class_path: kalecancer.prepdata.TableTransform

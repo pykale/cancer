@@ -1,8 +1,45 @@
+from collections.abc import Sequence
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 import pytest
+import torch
+from torch import Tensor
 
-from kalecancer.evaluate import CalibrationError, EvalContext, calibration_table
+from kalecancer.evaluate import CalibrationError, calibration_table
+from kalecancer.loaddata import TimeToEvent
+from kalecancer.model import BaseOutput, RiskScore, SurvivalFunction
+
+
+@dataclass(kw_only=True)
+class _Survival(BaseOutput, SurvivalFunction):
+    """Fixed survival probabilities at ``times``, one column each: an output whose calibration a test sets."""
+
+    probabilities: Tensor
+    times: tuple[float, ...]
+
+    def survival(self, times: Sequence[float]) -> Tensor:
+        return self.probabilities[:, [self.times.index(float(t)) for t in times]]
+
+    def frame(self) -> pd.DataFrame:
+        return pd.DataFrame(self.probabilities.numpy(), index=self.ids, columns=list(self.times))
+
+
+def _output(prediction: pd.DataFrame) -> _Survival:
+    """The ``survival[<time>]`` columns of ``prediction`` as an output, every patient defined."""
+    times = tuple(float(str(c)[len("survival[") : -1]) for c in prediction.columns)
+    values = torch.tensor(prediction.to_numpy(np.float64))
+    return _Survival(
+        ids=list(prediction.index),
+        defined=torch.ones(len(prediction), dtype=torch.bool),
+        probabilities=values,
+        times=times,
+    )
+
+
+def _tte(frame: pd.DataFrame) -> TimeToEvent:
+    return TimeToEvent(frame["time"], frame["event"])
 
 
 def _ids(n: int) -> list[str]:
@@ -28,9 +65,8 @@ def _exponential_cohort(n: int, seed: int, censor_scale: float, horizon: float =
 
 def test_perfectly_calibrated_cohort_gives_error_near_zero():
     prediction, target = _exponential_cohort(n=2000, seed=0, censor_scale=1.0 / 0.05)
-    context = EvalContext(train_target=target, classes=None)
 
-    error = CalibrationError()(prediction, target, context)
+    error = CalibrationError([5.0])(_output(prediction), _tte(target), _tte(target))
 
     assert error == pytest.approx(0.0, abs=0.03)
 
@@ -39,9 +75,8 @@ def test_systematically_over_optimistic_model_gives_error_near_the_shift():
     prediction, target = _exponential_cohort(n=2000, seed=0, censor_scale=1.0 / 0.05)
     column = prediction.columns[0]
     over_optimistic = prediction.assign(**{column: (prediction[column] + 0.2).clip(upper=1.0)})
-    context = EvalContext(train_target=target, classes=None)
 
-    error = CalibrationError()(over_optimistic, target, context)
+    error = CalibrationError([5.0])(_output(over_optimistic), _tte(target), _tte(target))
 
     assert error == pytest.approx(0.2, abs=0.03)
 
@@ -57,10 +92,8 @@ def test_heavily_censored_cohort_is_close_to_the_lightly_censored_one():
     assert 1 - light_target["event"].mean() < 0.3  # light censoring, for contrast
     assert 1 - heavy_target["event"].mean() > 0.6  # ~70% censoring
 
-    light_context = EvalContext(train_target=light_target, classes=None)
-    heavy_context = EvalContext(train_target=heavy_target, classes=None)
-    light_error = CalibrationError()(light_prediction, light_target, light_context)
-    heavy_error = CalibrationError()(heavy_prediction, heavy_target, heavy_context)
+    light_error = CalibrationError([5.0])(_output(light_prediction), _tte(light_target), _tte(light_target))
+    heavy_error = CalibrationError([5.0])(_output(heavy_prediction), _tte(heavy_target), _tte(heavy_target))
 
     assert light_error < 0.05
     assert heavy_error < 0.05
@@ -76,7 +109,7 @@ def test_table_has_one_row_per_time_bin_and_bin_sizes_sum_to_the_cohort():
     )
     target = pd.DataFrame({"time": rng.exponential(5.0, n) + 0.5, "event": rng.random(n) < 0.7}, index=ids)
 
-    table = calibration_table(prediction, target, n_bins=5)
+    table = calibration_table(_output(prediction), _tte(target), times=[3.0, 6.0], n_bins=5)
 
     assert len(table) == 2 * 5  # 2 horizons x 5 bins
     for _, group in table.groupby("time"):
@@ -90,9 +123,9 @@ def test_non_unique_quantile_cuts_raise_naming_the_horizon():
     target = pd.DataFrame({"time": np.arange(1.0, 21.0), "event": np.ones(20, dtype=bool)}, index=ids)
 
     with pytest.raises(ValueError, match=r"calibration_table at time=5\.0"):
-        calibration_table(prediction, target, n_bins=2)
+        calibration_table(_output(prediction), _tte(target), times=[5.0], n_bins=2)
     with pytest.raises(ValueError, match="quantile cuts are not unique"):
-        calibration_table(prediction, target, n_bins=2)
+        calibration_table(_output(prediction), _tte(target), times=[5.0], n_bins=2)
 
 
 def test_undefined_bin_is_nan_and_ignored_by_the_metric_rather_than_making_it_nan():
@@ -107,15 +140,26 @@ def test_undefined_bin_is_nan_and_ignored_by_the_metric_rather_than_making_it_na
     event = np.array([True, True, True, True, True, False, False, False, False, False])
     target = pd.DataFrame({"time": time, "event": event}, index=ids)
 
-    table = calibration_table(prediction, target, n_bins=2)
+    table = calibration_table(_output(prediction), _tte(target), times=[horizon], n_bins=2)
 
     bin0 = table[table["bin"] == 0].iloc[0]
     bin1 = table[table["bin"] == 1].iloc[0]
     assert bin0["observed"] == pytest.approx(0.0)
     assert np.isnan(bin1["observed"])
 
-    context = EvalContext(train_target=target, classes=None)
-    error = CalibrationError(n_bins=2)(prediction, target, context)
+    error = CalibrationError([horizon], n_bins=2)(_output(prediction), _tte(target), _tte(target))
 
     assert np.isfinite(error)
     assert error == pytest.approx(abs(0.0 - predicted[:5].mean()))
+
+
+def test_needs_a_survival_function_and_increasing_times():
+    ids = _ids(4)
+    target = _tte(pd.DataFrame({"time": [1.0, 2.0, 3.0, 4.0], "event": [True] * 4}, index=ids))
+    with pytest.raises(ValueError, match="strictly increasing"):
+        CalibrationError([5.0, 3.0])
+    risk = RiskScore(ids=ids, defined=torch.ones(4, dtype=torch.bool), risk=torch.zeros(4))
+    with pytest.raises(TypeError, match="needs a model that outputs SurvivalFunction"):
+        CalibrationError([2.0])(risk, target, target)
+    with pytest.raises(TypeError, match="needs an output with a survival function"):
+        calibration_table(risk, target, times=[2.0])

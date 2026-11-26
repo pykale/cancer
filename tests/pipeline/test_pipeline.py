@@ -18,9 +18,10 @@ from kalecancer.loaddata import Classification, MultimodalDataset, PatchFeatures
 from kalecancer.model import (
     ABMIL,
     BreslowBaseline,
-    ClassificationHead,
+    ClassificationEndpoint,
     Concat,
-    CoxHead,
+    CoxEndpoint,
+    CoxOutput,
     FittedEncoder,
     IntermediateFusion,
     LateFusion,
@@ -72,21 +73,24 @@ def intermediate(fusion=None, head_dim=8):
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.25), nn.Linear(6, 4)],
         },
         fusion=fusion or Concat(),
-        head=CoxHead(in_dim=head_dim, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(head_dim, 1, bias=False), "efron"),
     )
 
 
 def late_classifier():
     return LateFusion(
         branches={
-            "clinical": Unimodal("clinical", [nn.Linear(3, 4)], ClassificationHead(in_dim=4, n_classes=2)),
+            "clinical": Unimodal(
+                "clinical", [nn.Linear(3, 4)], ClassificationEndpoint(nn.Linear(4, 2), nn.CrossEntropyLoss())
+            ),
             "wsi": Unimodal(
                 "wsi",
                 [ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)],
-                ClassificationHead(in_dim=4, n_classes=2),
+                ClassificationEndpoint(nn.Linear(4, 2), nn.CrossEntropyLoss()),
             ),
         },
         fusion=MaskedMean(),
+        endpoint=ClassificationEndpoint(None, nn.CrossEntropyLoss()),
     )
 
 
@@ -146,31 +150,81 @@ def test_widths_are_checked_by_a_dry_run_before_training(cohort):
     # the dry run runs two patients, so a batch of 2 rows shows the error came before training
     with pytest.raises(RuntimeError, match=r"\(2x8 and 7x1\)") as error:
         pipeline(intermediate(head_dim=7)).fit(train)
-    assert error.value.__notes__ == ["in head CoxHead, called on a tensor of shape (2, 8)"]
+    assert error.value.__notes__ == ["in the head of CoxEndpoint (Linear), called on a tensor of shape (2, 8)"]
     unequal = IntermediateFusion(
         encoders={"clinical": [nn.Linear(3, 4)], "wsi": [ABMIL(16, 6, 4, 0.0)]},
         fusion=MaskedMean(),
-        head=CoxHead(in_dim=4, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(4, 1, bias=False), "efron"),
     )
     with pytest.raises(ValueError, match=r"MaskedMean needs inputs of one width, got \{'clinical': 4, 'wsi': 6\}"):
         pipeline(unequal).fit(train)
+
+
+@pytest.mark.parametrize(
+    ("task", "endpoint", "match"),
+    [
+        (
+            "survival",
+            CoxEndpoint(nn.Linear(8, 2, bias=False), "efron"),
+            r"of shape \(2, 2\), but CoxEndpoint expects \(2, 1\)",
+        ),
+        (
+            "classification",
+            ClassificationEndpoint(nn.Linear(8, 3), nn.CrossEntropyLoss()),
+            r"of shape \(2, 3\), but ClassificationEndpoint expects \(2, 2\)",
+        ),
+    ],
+)
+def test_the_dry_run_checks_the_head_against_the_endpoint_width(cohort, task, endpoint, match):
+    model = IntermediateFusion(
+        encoders={"clinical": [nn.Linear(3, 4)], "wsi": [ABMIL(16, 4, 4, 0.0)]}, fusion=Concat(), endpoint=endpoint
+    )
+    with pytest.raises(ValueError, match=match):
+        pipeline(model).fit(split(dataset(cohort, task=task))[0])
 
 
 def test_a_late_fusion_error_names_the_branch(cohort):
     train, _ = split(dataset(cohort, task="classification"))
     model = LateFusion(
         {
-            "clinical": Unimodal("clinical", [nn.Linear(3, 2)], ClassificationHead(2, 2)),
-            "wsi": Unimodal("wsi", [ABMIL(16, 6, 4, 0.0)], ClassificationHead(5, 2)),
+            "clinical": Unimodal(
+                "clinical", [nn.Linear(3, 2)], ClassificationEndpoint(nn.Linear(2, 2), nn.CrossEntropyLoss())
+            ),
+            "wsi": Unimodal(
+                "wsi", [ABMIL(16, 6, 4, 0.0)], ClassificationEndpoint(nn.Linear(5, 2), nn.CrossEntropyLoss())
+            ),
         },
         MaskedMean(),
+        None,
     )
     with pytest.raises(RuntimeError, match=r"\(2x6 and 5x2\)") as error:
         pipeline(model).fit(train)
     assert error.value.__notes__ == [
-        "in head ClassificationHead, called on a tensor of shape (2, 6)",
+        "in the head of ClassificationEndpoint (Linear), called on a tensor of shape (2, 6)",
         "in branch 'wsi' (Unimodal)",
     ]
+
+
+def test_the_dry_run_runs_the_loss_before_training(cohort):
+    class BrokenLoss(nn.Module):
+        def forward(self, logits, labels):
+            raise RuntimeError("this loss cannot read the target")
+
+    built = []
+
+    def optimizer(groups):
+        built.append(True)
+        return torch.optim.AdamW(groups, lr=1e-2)
+
+    model = Unimodal("clinical", [nn.Linear(3, 4)], ClassificationEndpoint(nn.Linear(4, 2), BrokenLoss()))
+    with pytest.raises(RuntimeError, match="cannot read the target"):
+        pipeline(model, optimizer=optimizer).fit(split(dataset(cohort, task="classification"))[0])
+    assert not built
+
+
+def test_models_take_an_endpoint_not_a_head():
+    with pytest.raises(TypeError, match="endpoint must be a BaseEndpoint"):
+        Unimodal("clinical", [nn.Linear(3, 4)], nn.Linear(4, 1))
 
 
 def test_fit_does_not_depend_on_the_global_seed(cohort):
@@ -203,7 +257,7 @@ def test_modules_without_reset_parameters_fit_with_a_random_state(cohort):
     model = IntermediateFusion(
         encoders={"clinical": [Scale(), nn.Linear(3, 4)], "wsi": [ABMIL(16, 4, 4, 0.0)]},
         fusion=Concat(),
-        head=CoxHead(in_dim=8, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(8, 1, bias=False), "efron"),
     )
     pipeline(model, random_state=0).fit(split(dataset(cohort))[0])
 
@@ -356,7 +410,7 @@ def nan_handling_model():
             "wsi": [ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
         },
         fusion=Concat(),
-        head=CoxHead(in_dim=8, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(8, 1, bias=False), "efron"),
     )
 
 
@@ -402,78 +456,137 @@ def inner_times(data, quantiles=(0.2, 0.4, 0.6)):
     return [float(t) for t in np.quantile(data.target.frame.loc[data.ids, "time"], quantiles)]
 
 
-def test_the_baseline_is_fitted_on_the_fused_log_hazards_of_every_patient_used_in_fit(cohort):
+def test_the_baseline_is_fitted_on_the_log_hazards_of_the_training_patients_only(cohort):
     train, test = split(dataset(cohort))
     pipe = pipeline(validation=StratifiedShuffleSplit(n_splits=1, test_size=0.3, random_state=0)).fit(train)
     assert pipe.val_ids_
-    seen = pipe.predict(train)
+    seen = pipe.predict(train.subset(pipe.train_ids_))
     outcome = train.target.frame.loc[seen.index]
     expected = BreslowBaseline().fit(seen["log_hazard"], outcome["time"], outcome["event"].to_numpy())
-    np.testing.assert_allclose(pipe.baseline_.cumulative_hazard_, expected.cumulative_hazard_, rtol=1e-6)
-    np.testing.assert_array_equal(pipe.baseline_.event_times_, expected.event_times_)
-    assert pipe.fit_report_["baseline_events"] == train.target.counts(train.ids)["events"]
+    baseline = pipe.model_.endpoint.baseline_
+    np.testing.assert_allclose(baseline.cumulative_hazard_, expected.cumulative_hazard_, rtol=1e-6)
+    np.testing.assert_array_equal(baseline.event_times_, expected.event_times_)
+    assert pipe.fit_report_["baseline_events"] == train.target.counts(pipe.train_ids_)["events"]
 
 
-def test_survival_times_add_survival_columns_at_prediction(cohort):
+def test_survival_functions_come_from_the_endpoint_baseline(cohort):
     train, test = split(dataset(cohort))
     pipe = pipeline().fit(train)
     times = inner_times(test)
-    plain = pipe.predict(test)
-    prediction = pipe.predict(test, survival_times=times)
-    columns = [f"survival[{t!r}]" for t in times]
-    assert list(plain.columns) == ["log_hazard"] and list(prediction.columns) == ["log_hazard", *columns]
-    pd.testing.assert_frame_equal(prediction[["log_hazard"]], plain)
+    prediction = pipe.predict(test)
+    assert list(prediction.columns) == ["log_hazard"]
+    curves = pipe.predict_survival_function(test, times)
+    assert list(curves.columns) == times and curves.index.equals(prediction.index)
     np.testing.assert_allclose(
-        prediction[columns].to_numpy(), pipe.baseline_.survival(prediction["log_hazard"], times), rtol=1e-12
+        curves.to_numpy(), pipe.model_.endpoint.baseline_.survival(prediction["log_hazard"], times), rtol=1e-12
     )
-    assert (np.diff(prediction[columns].to_numpy(), axis=1) <= 0).all()
-
-    with pytest.raises(ValueError, match=r"at least two 'survival\[<time>\]' columns"):
-        pipe.evaluate(test, metrics={"ibs": IntegratedBrier()})
-    # the same fitted pipeline scores the Brier score once given times, without refitting
-    scores = pipe.evaluate(test, metrics={"ibs": IntegratedBrier(), "c": HarrellC()}, survival_times=times)
+    assert (np.diff(curves.to_numpy(), axis=1) <= 0).all()
+    # the integrated Brier score holds its own times, and asks the output for its survival function
+    scores = pipe.evaluate(test, metrics={"ibs": IntegratedBrier(times), "c": HarrellC()})
     assert 0.0 <= scores["ibs"] <= 1.0
 
 
-def test_a_classifier_has_no_baseline_and_rejects_survival_times(cohort):
+def test_predict_output_is_what_metrics_score(cohort):
+    train, test = split(dataset(cohort))
+    pipe = pipeline().fit(train)
+    output = pipe.predict_output(test)
+    assert isinstance(output, CoxOutput) and output.baseline is pipe.model_.endpoint.baseline_
+    assert HarrellC()(output, test.target, pipe.train_target_) == pipe.evaluate(test, metrics={"c": HarrellC()})["c"]
+    assert list(pipe.train_target_.ids) == pipe.train_ids_
+
+
+def test_metrics_that_cannot_score_the_model_are_refused_before_predicting_or_training(cohort):
+    train, test = split(dataset(cohort))
+    pipe = pipeline().fit(train)
+    with pytest.raises(TypeError, match="AUROC.* needs a model that outputs ClassScores; this one outputs CoxOutput"):
+        pipe.evaluate(test, metrics={"c": HarrellC(), "auroc": AUROC(positive_class="high")})
+    stopping = EarlyStopping(metric=AUROC(positive_class="high"), patience=2, restore_best=True)
+    built = []
+
+    def optimizer(groups):
+        built.append(True)
+        return torch.optim.AdamW(groups, lr=1e-2)
+
+    validation = StratifiedShuffleSplit(n_splits=1, test_size=0.3, random_state=0)
+    with pytest.raises(TypeError, match="needs a model that outputs ClassScores"):
+        pipeline(optimizer=optimizer, validation=validation, early_stopping=stopping).fit(train)
+    assert not built
+
+
+def test_a_classifier_has_no_baseline_and_no_survival_function(cohort):
     train, test = split(dataset(cohort, task="classification"))
     pipe = pipeline(late_classifier()).fit(train)
-    assert pipe.baseline_ is None and "baseline_events" not in pipe.fit_report_
-    with pytest.raises(ValueError, match="survival_times needs a model that predicts a log_hazard"):
-        pipe.predict(test, survival_times=[1.0, 2.0])
+    assert "baseline_events" not in pipe.fit_report_
+    message = "needs a model that outputs SurvivalFunction; this one outputs ClassProbabilities"
+    with pytest.raises(ValueError, match=f"predict_survival_function {message}"):
+        pipe.predict_survival_function(test, [1.0, 2.0])
+
+
+def test_predict_proba_has_a_column_per_class_in_the_target_order(cohort):
+    train, test = split(dataset(cohort, task="classification"))
+    pipe = pipeline(late_classifier()).fit(train)
+    proba = pipe.predict_proba(test)
+    assert list(proba.columns) == ["low", "high"] and proba.index.equals(pipe.predict(test).index)
+    np.testing.assert_array_equal(proba.to_numpy(), pipe.predict(test).to_numpy())
+    assert list(pipe.predict_proba(test, branch="wsi").columns) == ["low", "high"]
+    with pytest.raises(ValueError, match="predict_proba needs a model that outputs ClassProbabilities"):
+        pipeline().fit(split(dataset(cohort))[0]).predict_proba(test)
 
 
 @pytest.mark.parametrize(
     ("times", "match"),
     [([], "finite times >= 0"), ([-1.0, 2.0], "finite times >= 0"), ([np.inf], "finite"), ([5.0, 5.0], "increasing")],
 )
-def test_survival_times_are_checked(cohort, times, match):
+def test_survival_function_times_are_checked(cohort, times, match):
     train, test = split(dataset(cohort))
     pipe = pipeline().fit(train)
     with pytest.raises(ValueError, match=match):
-        pipe.predict(test, survival_times=times)
+        pipe.predict_survival_function(test, times)
 
 
 def test_integrated_brier_cannot_be_monitored():
-    with pytest.raises(ValueError, match="IntegratedBrier cannot be monitored"):
-        EarlyStopping(metric=IntegratedBrier(), patience=2, restore_best=True)
+    with pytest.raises(ValueError, match=r"IntegratedBrier\(times=\[1.0, 2.0\]\) cannot be monitored"):
+        EarlyStopping(metric=IntegratedBrier([1.0, 2.0]), patience=2, restore_best=True)
 
 
-def test_late_fusion_survival_columns_belong_to_the_fused_prediction(cohort):
+def test_late_fusion_branches_and_fused_output_have_their_own_survival_curves(cohort):
     train, test = split(dataset(cohort))
     model = LateFusion(
         branches={
-            "clinical": Unimodal("clinical", [nn.Linear(3, 4)], CoxHead(in_dim=4, ties="efron")),
-            "wsi": Unimodal("wsi", [ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)], CoxHead(4, "efron")),
+            "clinical": Unimodal("clinical", [nn.Linear(3, 4)], CoxEndpoint(nn.Linear(4, 1, bias=False), "efron")),
+            "wsi": Unimodal(
+                "wsi",
+                [ABMIL(in_dim=16, hidden_dim=4, attention_dim=4, dropout=0.0)],
+                CoxEndpoint(nn.Linear(4, 1, bias=False), "efron"),
+            ),
         },
         fusion=MaskedMean(),
+        endpoint=CoxEndpoint(None, "efron"),
     )
     times = inner_times(test)
     pipe = pipeline(model).fit(train)
-    fused = pipe.predict(test, survival_times=times)
-    assert list(fused.columns) == ["log_hazard", *[f"survival[{t!r}]" for t in times]]
-    with pytest.raises(ValueError, match="cannot be used with branch"):
-        pipe.predict(test, branch="wsi", survival_times=times)
+    # each branch and the fused output have their own baseline, fitted on their own log-hazards
+    baselines = [pipe.model_.endpoint.baseline_, *(b.endpoint.baseline_ for b in pipe.model_.branches.values())]
+    assert len({id(b) for b in baselines}) == 3
+    for branch, baseline in ((None, baselines[0]), ("wsi", baselines[2])):
+        log_hazard = pipe.predict(test, branch=branch)["log_hazard"]
+        curves = pipe.predict_survival_function(test, times, branch=branch)
+        np.testing.assert_allclose(curves.to_numpy(), baseline.survival(log_hazard, times), rtol=1e-12)
+
+
+def test_late_fusion_without_a_fused_endpoint_has_no_fused_survival_curve(cohort):
+    train, test = split(dataset(cohort))
+    branches = {
+        "clinical": Unimodal("clinical", [nn.Linear(3, 4)], CoxEndpoint(nn.Linear(4, 1, bias=False), "efron")),
+        "wsi": Unimodal("wsi", [ABMIL(16, 4, 4, 0.0)], CoxEndpoint(nn.Linear(4, 1, bias=False), "efron")),
+    }
+    pipe = pipeline(LateFusion(branches, MaskedMean(), None)).fit(train)
+    assert "baseline_events" not in pipe.fit_report_
+    assert 0.0 <= pipe.evaluate(test, metrics={"c": HarrellC()})["c"] <= 1.0
+    with pytest.raises(ValueError, match="outputs SurvivalFunction; this one outputs RiskScore"):
+        pipe.predict_survival_function(test, inner_times(test))
+    # the branches keep their own endpoints, and so their own survival curves
+    assert pipe.predict_survival_function(test, inner_times(test), branch="wsi").notna().all().all()
 
 
 def test_cross_validation_scores_the_integrated_brier_per_fold(cohort):
@@ -482,8 +595,7 @@ def test_cross_validation_scores_the_integrated_brier_per_fold(cohort):
         pipeline(intermediate(fusion=MaskedMean(), head_dim=4)),
         data,
         StratifiedKFold(n_splits=2, shuffle=True, random_state=0),
-        metrics={"ibs": IntegratedBrier()},
-        survival_times=inner_times(data, quantiles=(0.3, 0.5)),
+        metrics={"ibs": IntegratedBrier(inner_times(data, quantiles=(0.3, 0.5)))},
     )
     assert result.folds["ibs"].between(0.0, 1.0).all()
     assert (result.folds["baseline_events"] > 0).all()
@@ -537,7 +649,7 @@ def test_attention_rejects_an_encoder_that_changes_the_instances(cohort):
             "wsi": [DropFirstInstance(), ABMIL(in_dim=16, hidden_dim=6, attention_dim=4, dropout=0.0), nn.Linear(6, 4)],
         },
         fusion=Concat(),
-        head=CoxHead(in_dim=8, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(8, 1, bias=False), "efron"),
     )
     train, test = split(dataset(cohort))
     pipe = pipeline(model).fit(train)
@@ -558,6 +670,39 @@ def test_gpu_training_with_early_stopping_matches_its_own_bookkeeping(cohort):
     assert pipe.fit_report_["best_epoch"] == int(pipe.history_["val_metric"].idxmax())
     assert next(pipe.model_.parameters()).device.type == "cpu"
     assert np.isfinite(pipe.predict(test).to_numpy()).all()
+
+
+def weighted_classifier():
+    """A classifier whose losses hold class weights, which Lightning moves to the model's device."""
+    weight = torch.tensor([1.0, 3.0])
+    return Unimodal(
+        "clinical", [nn.Linear(3, 4)], ClassificationEndpoint(nn.Linear(4, 2), nn.CrossEntropyLoss(weight=weight))
+    )
+
+
+def test_validation_loss_with_a_weighted_loss(cohort):
+    train, _ = split(dataset(cohort, task="classification"))
+    pipe = pipeline(
+        weighted_classifier(),
+        validation=StratifiedShuffleSplit(n_splits=1, test_size=0.3, random_state=0),
+        early_stopping=EarlyStopping(metric=BalancedAccuracy(), patience=2, restore_best=False),
+    ).fit(train)
+    assert np.isfinite(pipe.history_["val_loss"]).all()
+    assert pipe.history_["val_metric"].between(0.0, 1.0).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_gpu_validation_loss_with_a_weighted_loss(cohort):
+    # the class weights live on the GPU, so the validation loss must be computed there too
+    train, _ = split(dataset(cohort, task="classification"))
+    pipe = pipeline(
+        weighted_classifier(),
+        validation=StratifiedShuffleSplit(n_splits=1, test_size=0.3, random_state=0),
+        early_stopping=EarlyStopping(metric=BalancedAccuracy(), patience=2, restore_best=False),
+        accelerator="gpu",
+    ).fit(train)
+    assert np.isfinite(pipe.history_["val_loss"]).all()
+    assert pipe.history_["val_metric"].between(0.0, 1.0).all()
 
 
 class ContextIds(FittedEncoder):
@@ -585,7 +730,7 @@ def test_restoring_the_best_epoch_keeps_non_tensor_fitted_state(cohort):
     model = IntermediateFusion(
         encoders={"clinical": [ContextIds(), nn.Linear(3, 4)], "wsi": [ABMIL(16, 4, 4, 0.0)]},
         fusion=MaskedMean(),
-        head=CoxHead(in_dim=4, ties="efron"),
+        endpoint=CoxEndpoint(nn.Linear(4, 1, bias=False), "efron"),
     )
     pipe = pipeline(
         model,

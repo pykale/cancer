@@ -9,37 +9,48 @@ badly calibrated for reasons that have nothing to do with the model.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 import pandas as pd
 
-from kalecancer.evaluate.metrics import (
-    _SURVIVAL_COLUMN,
-    EvalContext,
-    Metric,
-    _aligned_values,
-    _defined,
-    _event_time,
-    _quantile_groups,
-)
+from kalecancer.evaluate.metrics import Metric, _defined, _event_time, _outcomes, _quantile_groups
 from kalecancer.evaluate.stratify import _km_survival_at
+from kalecancer.loaddata.targets import BaseTarget, TimeToEvent
+from kalecancer.model.outputs import BaseOutput, SurvivalFunction
+
+
+def _check_times(times: Sequence[float], what: str) -> list[float]:
+    """``times`` as floats, after checking there is at least one and they strictly increase."""
+    checked = [float(t) for t in times]
+    if (
+        not checked
+        or not np.isfinite(checked).all()
+        or any(t < 0 for t in checked)
+        or any(b <= a for a, b in zip(checked, checked[1:], strict=False))
+    ):
+        raise ValueError(f"{what} needs finite times >= 0, strictly increasing, got {times!r}")
+    return checked
 
 
 def calibration_table(
-    prediction: pd.DataFrame,
-    target: pd.DataFrame,
+    output: BaseOutput,
+    target: BaseTarget,
     *,
+    times: Sequence[float],
     n_bins: int = 5,
 ) -> pd.DataFrame:
-    """Observed vs predicted survival per bin, at each ``survival[<time>]`` horizon.
+    """Observed vs predicted survival per bin, at each of ``times``.
 
     At each horizon, patients are binned separately into ``n_bins`` equal-sized quantile bins by their predicted
     survival at that horizon -- a patient's bin can differ horizon to horizon, since calibration asks "do patients
     predicted to survive to p at time t actually do so", not "is this patient always in the same bucket".
 
     Args:
-        prediction: Predictions indexed by patient id, with one or more ``survival[<time>]`` columns, as
-            ``Pipeline.predict`` and ``Pipeline.evaluate`` add when given ``survival_times``.
-        target: The same patients' ``time``/``event`` columns.
+        output: An output with a survival function, such as a Cox model's ``CoxOutput``, as
+            ``Pipeline.predict_output`` returns it. Every patient must be defined.
+        target: A ``TimeToEvent`` target with the outcomes of at least the output's patients.
+        times: The horizons, strictly increasing.
         n_bins: Number of equal-sized predicted-survival bins, per horizon.
 
     Returns:
@@ -51,23 +62,22 @@ def calibration_table(
         past where its data ends.
 
     Raises:
-        ValueError: If there is no ``survival[<time>]`` column, or if a horizon's predicted-survival values are too
-            heavily tied to cut into ``n_bins`` distinct, non-empty bins.
+        TypeError: If ``output`` has no survival function, or ``target`` is not a ``TimeToEvent``.
+        ValueError: If ``times`` is empty or not increasing, if a patient is undefined or has no outcome, or if a
+            horizon's predicted-survival values are too heavily tied to cut into ``n_bins`` distinct, non-empty bins.
     """
-    columns = {float(m[1]): c for c in prediction.columns if (m := _SURVIVAL_COLUMN.fullmatch(str(c)))}
-    if not columns:
-        raise ValueError(
-            f"calibration_table needs at least one 'survival[<time>]' column, got {list(prediction.columns)}; set "
-            "survival_times in Pipeline.predict, evaluate or cross_validate"
-        )
-    times = sorted(columns)
-    event, time = _event_time(target, "target")
+    horizons = _check_times(times, "calibration_table")
+    if not isinstance(output, SurvivalFunction):
+        raise TypeError(f"calibration_table needs an output with a survival function, got {type(output).__name__}")
+    output = output.detach_cpu()
+    event, time = _event_time(_outcomes(output, target, TimeToEvent, "calibration_table"))
     event_arr = event.numpy()
     time_arr = time.numpy().astype(np.float64)
-    survival = _aligned_values(prediction, target, [columns[t] for t in times], np.float64)
+    assert isinstance(output, SurvivalFunction)
+    survival = output.survival(horizons).double().numpy()
 
     rows = []
-    for column, horizon in enumerate(times):
+    for column, horizon in enumerate(horizons):
         predicted = survival[:, column]
         try:
             codes = _quantile_groups(predicted, n_bins)
@@ -101,24 +111,31 @@ class CalibrationError(Metric):
     This measures CALIBRATION only -- not ranking (``HarrellC``, ``UnoC``) or separation between risk groups
     (``LogRank``); a model can rank patients perfectly while being badly calibrated, or the reverse.
 
-    Unlike ``IntegratedBrier``, a single ``survival[<time>]`` column is enough: ``IntegratedBrier`` needs at least
-    two times because it integrates a Brier score *across* them, which needs an interval to integrate over. There is
-    no such integration here -- "do patients predicted to survive to p at time t actually do so" is a complete
-    question for one horizon alone, answered by averaging over that horizon's bins.
+    Unlike ``IntegratedBrier``, a single time is enough: ``IntegratedBrier`` needs at least two times because it
+    integrates a Brier score *across* them, which needs an interval to integrate over. There is no such integration
+    here -- "do patients predicted to survive to p at time t actually do so" is a complete question for one horizon
+    alone, answered by averaging over that horizon's bins.
 
-    This also does not need ``context.train_target``'s censoring distribution the way ``IntegratedBrier`` does:
-    ``observed`` is a plain (non-IPCW) Kaplan-Meier estimate within each bin of the evaluated patients themselves,
-    not a training-fitted censoring weight, so there is no censoring survival G(t) whose positivity needs checking.
+    It also ignores ``train_target``, which ``IntegratedBrier`` reads for its censoring distribution: ``observed`` is
+    a plain (non-IPCW) Kaplan-Meier estimate within each bin of the evaluated patients themselves, not a
+    training-fitted censoring weight, so there is no censoring survival G(t) whose positivity needs checking.
+
+    Args:
+        times: The horizons, strictly increasing.
+        n_bins: Number of equal-sized predicted-survival bins, per horizon.
     """
 
     higher_is_better = False
+    requires = SurvivalFunction
 
-    def __init__(self, n_bins: int = 5):
+    def __init__(self, times: Sequence[float], n_bins: int = 5):
+        _check_times(times, "CalibrationError")
+        self.times = list(times)
         self.n_bins = n_bins
 
-    def __call__(self, prediction: pd.DataFrame, target: pd.DataFrame, context: EvalContext) -> float:
+    def score(self, output: BaseOutput, target: BaseTarget, train_target: BaseTarget) -> float:
         """The mean absolute difference between observed and expected survival, ignoring undefined bins."""
-        table = calibration_table(prediction, target, n_bins=self.n_bins)
+        table = calibration_table(output, target, times=self.times, n_bins=self.n_bins)
         mean_absolute_error = (table["observed"] - table["expected"]).abs().mean()
         return _defined(
             float(mean_absolute_error), f"{self!r} is undefined: every bin's observed survival is undefined"

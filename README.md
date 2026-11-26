@@ -7,16 +7,9 @@
 -----------------------------------------
 
 <!-- Keep badges to just ONE line, i.e. only the most important badges! -->
-[![Built on PyKale](https://img.shields.io/badge/built%20on-PyKale-5699C6)](https://github.com/pykale/pykale)
-[![CI](https://github.com/pykale/cancer/actions/workflows/ci.yml/badge.svg)](https://github.com/pykale/cancer/actions/workflows/ci.yml)
-[![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org)
+[![Built on PyKale](https://img.shields.io/badge/built%20on-PyKale-5699C6)](https://github.com/pykale/pykale) [![CI](https://github.com/pykale/cancer/actions/workflows/ci.yml/badge.svg)](https://github.com/pykale/cancer/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/pykale/cancer/branch/main/graph/badge.svg)](https://codecov.io/gh/pykale/cancer) [![CodeQL](https://github.com/pykale/cancer/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/pykale/cancer/actions/workflows/codeql-analysis.yml) [![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)](https://www.python.org) [![PyPI version](https://img.shields.io/pypi/v/kalecancer?color=blue)](https://pypi.org/project/kalecancer/)
 
-[Getting Started](#how-to-use) |
-[Documentation](docs/) |
-[Examples](examples/) |
-[Contributing](#step-2-building-and-contributing) |
-[Architecture](docs/architecture.md)
+[Getting Started](#how-to-use) | [Documentation](docs/) | [Examples](examples/) | [Contributing](#step-2-building-and-contributing) | [Architecture](docs/architecture.md)
 
 KaleCancer is an oncology library built on [PyKale](https://github.com/pykale/pykale), a library in the [PyTorch ecosystem](https://pytorch.org/ecosystem/), aiming to make cancer machine learning more accessible to interdisciplinary research by bridging gaps between clinical data, software, and end users. Both machine learning experts and clinical researchers can do better research with our accessible, scalable, and sustainable design, guided by green machine learning principles. KaleCancer inherits PyKale's unified *pipeline-based* API and extends it where oncology needs more: [multimodal learning](https://en.wikipedia.org/wiki/Multimodal_learning) across pathology, radiology, and clinical records, and [survival analysis](https://en.wikipedia.org/wiki/Survival_analysis) for time-to-event outcomes such as overall and disease-specific survival.
 
@@ -26,7 +19,7 @@ Cancer prediction is rarely single-modality. A prognosis draws on a whole-slide 
 
 - `loaddata` loads tables and patch features keyed by patient id, with survival and classification targets and patient-level splitting
 - `prepdata` preprocesses clinical tables
-- `model` encodes each modality, fuses them (unimodal, early, intermediate or late) and predicts with a survival or classification head
+- `model` encodes each modality, fuses them (unimodal, early, intermediate or late) and predicts with a survival or classification endpoint
 - `evaluate` computes survival and classification metrics with bootstrap confidence intervals, and cross-validates by patient
 - `interpret` explains predictions, starting with attention weights over patches
 - `pipeline` runs the workflow: one `Pipeline` for every model and target, built in Python or from YAML
@@ -39,19 +32,21 @@ See [architecture](docs/architecture.md) for more details.
 
 KaleCancer supports Python 3.11 or 3.12.
 
-Install `kalecancer` with [uv](https://docs.astral.sh/uv/) into your own project:
+Install `kalecancer` from [PyPI](https://pypi.org/project/kalecancer/) with [uv](https://docs.astral.sh/uv/) into your own project:
 
 ```bash
-uv add "kalecancer @ git+https://github.com/pykale/cancer.git"
+uv add kalecancer
 ```
 
 Or with pip:
 
 ```bash
-pip install "git+https://github.com/pykale/cancer.git"
+pip install kalecancer
 ```
 
-Heavy libraries are kept out of the core install and grouped into extras, so that a pathology workflow does not pull in a radiology stack. Add one with `--extra <name>` in uv, or `".[<name>]"` in pip:
+KaleCancer is in alpha. Once a final release is out, a newer alpha needs `--prerelease allow` in uv or `--pre` in pip. To install the development version from GitHub instead, use `uv add "kalecancer @ git+https://github.com/pykale/cancer.git"` or `pip install "git+https://github.com/pykale/cancer.git"`.
+
+Heavy libraries are kept out of the core install and grouped into extras, so that a pathology workflow does not pull in a radiology stack. Add one with `uv add "kalecancer[<name>]"` or `pip install "kalecancer[<name>]"`:
 
 | Extra | Packages | When to use |
 | --- | --- | --- |
