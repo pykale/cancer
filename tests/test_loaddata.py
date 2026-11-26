@@ -280,9 +280,9 @@ def test_viewing_a_modality_takes_patient_ids_only(cohort):
     with pytest.raises(TypeError, match="must be str"):
         table[[1]]
 
-        def test_datasets_take_modality_instances_only(cohort):
-         with pytest.raises(TypeError, match=r"\['clinical'\] are not Modality instances\. Wrap a DataFrame in Tabular"):
-            MultimodalDataset({"clinical": cohort.clinical}, target=None, required_modalities=[])
+def test_datasets_take_modality_instances_only(cohort):
+    with pytest.raises(TypeError, match=r"\['clinical'\] are not Modality instances\. Wrap a DataFrame in Tabular"):
+        MultimodalDataset({"clinical": cohort.clinical}, target=None, required_modalities=[])
 
 
 def test_modality_subclasses_must_implement_load_and_bags_their_instances():
@@ -327,6 +327,9 @@ def test_a_new_fixed_shape_modality_needs_only_ids_a_view_and_load():
     batch = torch_data.collate([torch_data[i] for i in range(len(torch_data))])
     assert batch["inputs"]["grid"].shape == (2, 2, 3)
     assert batch["inputs"]["grid"][1, 0, 0].item() == 2.0
+
+
+# ---------------------------------------------------------------- dataset
 
 
 def test_required_modalities_define_inclusion_and_summary(cohort):
