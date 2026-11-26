@@ -18,7 +18,6 @@ from kalecancer.loaddata.identifiers import _as_ids, _check_leading_zeros, _NotF
 from kalecancer.loaddata.modalities import Modality
 from kalecancer.loaddata.targets import BaseTarget
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -82,8 +81,7 @@ class MultimodalDataset:
 
         if verbose:
             logger.info(
-                "MultimodalDataset created with %d included and %d excluded patients. "
-                "Exclusion counts: %s",
+                "MultimodalDataset created with %d included and %d excluded patients. Exclusion counts: %s",
                 len(self.ids),
                 len(self._excluded),
                 dict(sorted(exclusion_counts.items())),
@@ -98,7 +96,7 @@ class MultimodalDataset:
         if not any(pid in ids for ids in self._modality_ids.values()):
             return "no modality"
         return None
-    
+
     def _set_ids(self, ids: Iterable[str]) -> None:
         self.ids = _as_ids(ids, "MultimodalDataset").sort_values()
         self._id_set = set(self.ids)
@@ -198,7 +196,7 @@ class MultimodalTorchDataset(Dataset):
             if pid in self.data._modality_ids[name]
         }
         return {"id": pid, "inputs": inputs}
-    
+
     def collate(self, samples: list[dict]) -> dict:
         """Collate samples into a batch, for ``DataLoader(torch_data, collate_fn=torch_data.collate)``.
 
