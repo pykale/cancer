@@ -69,7 +69,7 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       # install uv
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
         if: matrix.installer == 'uv'
         with:
           enable-cache: true
