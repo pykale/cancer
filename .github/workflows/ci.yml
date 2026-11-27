@@ -19,6 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Saved credentials crash the databooks-meta hook with newer actions/checkout versions.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5

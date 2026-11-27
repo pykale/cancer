@@ -621,7 +621,8 @@ def test_build_workflow_only_builds():
     workflow = (WORKFLOWS / "build-dist.yml").read_text(encoding="utf-8")
 
     assert "workflow_call:" in workflow
-    assert "actions/upload-artifact@v4" in workflow
+    # Any version as Dependabot bumps it
+    assert "uses: actions/upload-artifact@" in workflow
     assert "uses: pypa/gh-action-pypi-publish" not in workflow
     assert "id-token: write" not in workflow
 
@@ -755,6 +756,15 @@ def test_project_board_is_kalecancer_and_never_given_to_forks():
     assert workflow.count("project-url: https://github.com/orgs/pykale/projects/14") == 2
     assert "projects/4" not in workflow
     assert "github.event.pull_request.head.repo.full_name == github.repository" in workflow
+
+
+def test_project_board_skips_dependabot_and_runs_once_per_item():
+    """Dependabot's runs have no access to the board token, and label events would add runs sharing the check's name."""
+    workflow = (WORKFLOWS / "project.yml").read_text(encoding="utf-8")
+
+    assert "github.event.pull_request.user.login != 'dependabot[bot]'" in workflow
+    assert "labeled" not in workflow
+    assert workflow.count("types: [opened]") == 2
 
 
 def run(workflow, status="completed", conclusion="success"):
