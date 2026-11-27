@@ -18,7 +18,7 @@ jobs:
     name: Pre-commit checks including linting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Saved credentials crash the databooks-meta hook with newer actions/checkout versions.
           persist-credentials: false
@@ -61,7 +61,7 @@ jobs:
               TORCH=$(python -c "import torch; print(torch.__version__)")
               python -m pip install --only-binary :all: torch_scatter torch_sparse -f "https://data.pyg.org/whl/torch-${TORCH}.html"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # installs pip by default. Only the pip jobs cache pip's downloads: the uv jobs never create ~/.cache/pip,
       # and setup-python fails the job when that folder is missing at the end.

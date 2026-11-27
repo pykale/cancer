@@ -88,14 +88,14 @@ jobs:
 
       - name: Checkout the approved commit
         if: steps.state.outputs.approved == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
       - name: Checkout release scripts from the base commit
         if: steps.state.outputs.approved == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           path: trusted-base

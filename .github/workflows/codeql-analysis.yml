@@ -1,5 +1,5 @@
 # Copied from PyKale (pykale/pykale), .github/workflows/codeql-analysis.yml, and updated:
-# - github/codeql-action v2 is deprecated, so the actions are v4 and actions/checkout is v4.
+# - github/codeql-action v2 is deprecated, so actions/checkout and github/codeql-action have been updated.
 # - Python needs no build, so build-mode is "none" instead of the Autobuild step.
 # - It also runs for the migration/pykale-core integration branch, as ci.yml does.
 # See https://github.com/github/codeql-action
@@ -32,7 +32,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
