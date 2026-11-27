@@ -22,7 +22,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Medical Science Apps.",
 ]
 dependencies = [
-    "certifi>=2026.7.22",
     "h5py>=3.10",
     "huggingface-hub>=0.24",
     "jsonargparse[signatures]==4.52.0",
