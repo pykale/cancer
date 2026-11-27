@@ -81,7 +81,7 @@ jobs:
         run: ${{ matrix.install }}
 
       - name: Cache the TabICL checkpoint
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
           key: hf-${{ env.TABICL_CHECKPOINT }}
