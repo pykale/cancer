@@ -684,6 +684,15 @@ class LateFusion(BaseModel):
         _check_presence(self.fusion, self.stage, covered, pd.Series(True, index=covered.index))
         self.fusion.check_branches(covered, {name: branch.output_type for name, branch in self.branches.items()})
 
+        # every branch must learn from at least one patient: a branch that predicts for nobody fits nothing,
+        # yet later fails (e.g. a Breslow baseline fit on zero patients) with an unclear error, so fail early here
+        uncovered = [name for name, defined in covered.items() if not bool(defined.any())]
+        if uncovered:
+            raise ValueError(
+                f"the following branches predict for none of the patients: {uncovered}; "
+                "remove them or add patients with the missing modality"
+            )
+
     def fit(self, train: MultimodalDataset) -> None:
         """Call ``fit`` on each branch, which binds its endpoint and fits its first encoder if it is fitted.
 
